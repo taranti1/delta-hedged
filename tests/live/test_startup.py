@@ -235,8 +235,13 @@ def test_paper_sim_and_conservative_fees():
 
 
 def test_live_example_config_loads_and_is_paper():
+    from dh.live.config import default_run_dir
+
     cfg = load_live_config(REPO / "config" / "live.example.yaml")
-    assert cfg.mode == "paper" and cfg.paths.kill_file == "/run/dh/KILL" and cfg.metrics.host == "127.0.0.1"
+    assert cfg.mode == "paper" and cfg.paths.kill_file == f"{default_run_dir()}/KILL" and cfg.metrics.host == "127.0.0.1"
+    # the deployment: subaccount 1 of a shared account, restricted keys, shard 2 (RUNBOOK 1.2)
+    assert cfg.venue.sub == 1 and cfg.venue.shared_account and cfg.venue.key_restricted_to_subaccount
+    assert cfg.venue.exchange_indexes == (2,)
     assert cfg.backfill.days >= 2 and cfg.paper.policy == "conservative"
     assert cfg.digest() == load_live_config(REPO / "config" / "live.example.yaml").digest()
 

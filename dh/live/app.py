@@ -10,22 +10,31 @@ Start-up sequence (live and paper; docs/RUNBOOK.md explains each step to operato
      'starting' (paper and live use different heartbeat files)
   3. open the Recorder (raw capture), the JSON log and the metrics registry; the session's
      client_order_id prefix <run_prefix>-<token> (never repeats across restarts)
-  4. REST client with the account's rate limits (GET /account/limits, endpoint costs)
-  5. exchange status (live refuses to start unless exchange_active and trading_active)
-  6. live only: a watchdog cancel-all marker left from before this start is renamed (the
-     runner halts only on markers written after it started); clean-slate cancel-all of
-     leftover resting orders, VERIFIED with the resting-order list, THEN account positions
-     (events already held are excluded from this session; a malformed position row refuses
-     the start); new orders are held for venue.cancel_all_hold_s after that cancel-all
+  4. REST client with the account's rate limits (GET /account/limits, endpoint costs); live:
+     every write must name venue.subaccount (and a shard) or it is refused before sending;
+     paper: read-only. Shared account: rate_limits.account_share must be <= 0.5
+  5. exchange status of the configured shards (live refuses to start unless exchange_active
+     and trading_active there); the exchange schedule's closures (logged, handed to the runner)
+  6. live only: collateral: GET /portfolio/balance?subaccount=<n>&exchange_index=<shard> must
+     cover the worst-case total loss + margin on every configured shard (proves the subaccount
+     exists and is funded on that shard); a key declared restricted to the subaccount is
+     verified (GET /api_keys, else the balance breakdown). A watchdog cancel-all marker left
+     from before this start is renamed (the runner halts only on markers written after it
+     started); clean-slate cancel-all of leftover resting orders, VERIFIED with the
+     resting-order list, THEN account positions (events already held are excluded from this
+     session; positions outside the series are reported and ignored; a malformed position row
+     refuses the start); new orders are held for venue.cancel_all_hold_s after that cancel-all
   7. risk state: today's P&L re-derived from Kalshi (live: the historical cutoff, today's
      fills and settlements, the positions valued at exchange prices; any malformed row or
      failed read refuses the start) and the persisted state -> RiskStateSeed
      (dh.live.riskstate), the first event; recomputed if the UTC day changed meanwhile
-  8. discover open markets of the configured series expiring within the horizon
-     (dh.kalshi.metadata + FeeEngine; unresolved/unsupported fee types stay untradable)
+  8. discover open markets of the configured series expiring within the horizon, on a known
+     exchange shard listed in venue.exchange_indexes (dh.kalshi.metadata + FeeEngine;
+     unresolved/unsupported fee types stay untradable)
   9. back-fill the benchmark history and warm the FairValueModel (dh.live.startup)
  10. construct the MarketMaker (book_includes_own in live mode, the session id prefix)
- 11. paper: KalshiExchangeSim (policy C); live: KalshiVenue + the exchange order group
+ 11. paper: KalshiExchangeSim (policy C); live: KalshiVenue + one exchange order group per
+     shard in use (explicit subaccount and exchange_index)
  12. hedge venue (disabled in M1)
  13. Kalshi WS subscriptions (+ optional external feeds) -> runner sources
  14. 'meta' session_start record (configs, digests, git SHA, universe, warm-up points,
@@ -50,7 +59,7 @@ import orjson
 
 from dh.core.units import NS_PER_MS, NS_PER_S, QTY_SCALE
 from dh.live.clock import AnchoredClock, session_token
-from dh.live.config import LiveConfig, live_config_problems, load_live_config, resolve_mode
+from dh.live.config import LiveConfig, account_share_problem, live_config_problems, load_live_config, resolve_mode
 from dh.live.monitor import JsonLog, KillFile, Metrics, cancel_all_marker_path, git_sha, read_heartbeat, write_heartbeat
 from dh.live.riskstate import (
     RiskBook,
@@ -69,7 +78,11 @@ from dh.live.startup import (
     discover_universe,
     events_with_positions,
     exchange_status,
+    required_balance_usd,
+    schedule_closures,
+    series_of_ticker,
     spec_to_dict,
+    verify_key_restriction,
 )
 from dh.live.venue_hedge import build_hedge_venue
 from dh.live.venue_kalshi import KalshiVenue
@@ -150,6 +163,52 @@ def build_subscriptions(mode: str, tickers: list[str], lcfg: LiveConfig) -> list
     return subs
 
 
+class WsFillProbe:
+    """Raw-frame hook of the live Kalshi WebSocket (records every frame, like the recorder's
+    ``write``) that settles an open question on the FIRST own fill: does the ``fill`` message
+    carry ``subaccount`` (asyncapi: optional)? One ``verify_live`` line + metric
+    (``dh_verify_live{check="ws_fill_subaccount_field"}``): as expected when the field names
+    our subaccount, or, with a subaccount-restricted key, when it is absent (the server scopes
+    the channel; the runner then attributes the message to us)."""
+
+    def __init__(self, write: Callable[[str, int, Any], None], runner: Any, subaccount: int, key_restricted: bool,
+                 id_prefix: str = "") -> None:
+        self.write = write
+        self.runner = runner
+        self.sub = int(subaccount)
+        self.restricted = bool(key_restricted)
+        self.id_prefix = id_prefix  # with a full-account key only fills of our own orders count
+        self.done = False
+
+    def __call__(self, stream: str, ts: int, data: Any) -> None:
+        self.write(stream, ts, data)
+        if self.done:
+            return
+        if (b'"fill"' not in data) if isinstance(data, (bytes, bytearray)) else ('"fill"' not in str(data)):
+            return
+        try:
+            frame = orjson.loads(data)
+        except (orjson.JSONDecodeError, TypeError):
+            return
+        if not isinstance(frame, dict) or frame.get("type") != "fill" or not isinstance(frame.get("msg"), dict):
+            return
+        msg = frame["msg"]
+        coid = str(msg.get("client_order_id") or "")
+        if not self.restricted and not (self.id_prefix and coid.startswith(self.id_prefix + "-")):
+            return  # a full-account key also delivers other subaccounts' fills: only ours settle it
+        self.done = True
+        present = msg.get("subaccount") not in (None, "")
+        value = msg.get("subaccount")
+        try:
+            ours = present and int(value) == self.sub
+        except (TypeError, ValueError):
+            ours = False
+        ok = ours or (not present and (self.restricted or self.sub == 0))
+        self.runner.verify_live("ws_fill_subaccount_field", ok, present=present, value=value, subaccount=self.sub,
+                                key_restricted=self.restricted, exchange_index=msg.get("exchange_index"),
+                                ticker=msg.get("market_ticker"))
+
+
 class InstanceLock:
     """Exclusive, non-blocking flock held for the life of the process (released on exit,
     even on a crash)."""
@@ -193,6 +252,10 @@ def check_runtime_paths(lcfg: LiveConfig, mode: str, *, now_ns: int | None = Non
     from another pid refuses the start); the heartbeat must be writable (the watchdog
     depends on it). Returns the held locks (release them on exit)."""
     kill = _resolve(lcfg.paths.kill_file)
+    if not kill.parent.is_dir() and not Path(lcfg.paths.kill_file).expanduser().is_absolute():
+        # a repository-relative runtime directory (the macOS default data/run): create it
+        kill.parent.mkdir(parents=True, exist_ok=True)
+        log.info("created the runtime directory %s (kill file, heartbeat, locks)", kill.parent)
     if not kill.parent.is_dir():
         raise StartupError(f"kill-file directory {kill.parent} does not exist: "
                            f"sudo mkdir -p {kill.parent} && sudo chown $USER {kill.parent}")
@@ -276,6 +339,10 @@ class LiveApp:
             if problems:
                 raise StartupError("; ".join(problems))
         kc = load_kalshi_config(_resolve(lcfg.kalshi_config) if lcfg.kalshi_config else None, env=lcfg.kalshi_env or None)
+        if mode == "live":
+            share = account_share_problem(lcfg, kc.account_share)
+            if share:
+                raise StartupError(share)
         signer = self.ov.signer if self.ov.signer is not None else kc.signer()
         if signer is None and self.ov.ws_connect is None:
             raise StartupError(f"no Kalshi API credentials ({kc.credentials_hint()}): the WebSocket "
@@ -305,9 +372,12 @@ class LiveApp:
             raise StartupError(str(exc)) from exc
 
         # 3. REST
-        # paper never writes: a non-GET from a paper session raises before it is signed
+        # paper can never send a write (read_only); live refuses, before signing, any write that
+        # does not name this runner's subaccount and a shard explicitly (write_subaccount)
         self.rest = self.ov.rest or KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write,
-                                               clock_ns=self.clock, read_only=(mode != "live"), **kc.rest_kwargs())
+                                               clock_ns=self.clock, read_only=(mode != "live"),
+                                               write_subaccount=lcfg.venue.sub if mode == "live" else None,
+                                               **kc.rest_kwargs())
         try:
             limits = await self.rest.configure_rate_limits()
             self.info["rate_limits"] = limits
@@ -315,17 +385,35 @@ class LiveApp:
             log.warning("could not load account rate limits (%s): conservative defaults in force", exc)
             self.info["rate_limits"] = {"error": str(exc)[:200]}
 
-        # 4. exchange status
+        # 4. exchange status of the shards this runner trades, and the schedule's closures
+        shards = tuple(lcfg.venue.exchange_indexes)
         try:
-            status = await exchange_status(self.rest)
+            status = await exchange_status(self.rest, shards)
         except Exception as exc:  # noqa: BLE001
             status = {"exchange_active": False, "trading_active": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
         self.info["exchange_status"] = status
         if not (status["exchange_active"] and status["trading_active"]):
-            msg = f"exchange not trading: {status}"
+            msg = f"exchange not trading on shard(s) {list(shards)}: {status}"
             if mode == "live":
                 raise StartupError(msg)
             log.warning("%s (paper mode continues: no fills while trading is paused)", msg)
+        closures: list[tuple[int, int, str]] = []
+        if mode == "live":
+            try:
+                now = self.clock()
+                closures, notes = schedule_closures(await self.rest.get_exchange_schedule(), now - 86_400 * NS_PER_S,
+                                                    now + 8 * 86_400 * NS_PER_S)
+                self.info["exchange_schedule"] = {"closures": closures[:20], "notes": notes}
+                nxt = next((c for c in closures if c[1] > now), None)
+                log.info("exchange schedule: %d closure(s) in the next week; next %s", len(closures), nxt)
+            except Exception as exc:  # noqa: BLE001 - the status poll still catches every pause
+                log.warning("GET /exchange/schedule failed (%s): pauses are caught by the status poll only", exc)
+                self.info["exchange_schedule"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+        series = tuple(lcfg.universe.series) or tuple(scfg.quoting.enabled_series)
+        balance_need = required_balance_usd(scfg.risk, lcfg.venue.min_balance_margin_dollars)
+        balances: dict[int, float | None] = {}  # shard -> funds (available + positions at cost + resting)
+        available: dict[int, float | None] = {}
 
         fee_engine = kc.fee_engine()
         venue: KalshiVenue | None = None
@@ -334,7 +422,38 @@ class LiveApp:
         rest_pnl = None
         hold_until = 0
         if mode == "live":
-            venue = self.venue = KalshiVenue(self.rest, sink=lambda ev: None, cfg=lcfg.venue, clock_ns=self.clock)
+            try:
+                venue = self.venue = KalshiVenue(self.rest, sink=lambda ev: None, cfg=lcfg.venue, clock_ns=self.clock)
+            except ValueError as exc:
+                raise StartupError(str(exc)) from exc
+            # 5b. collateral on every traded shard (read-only; before any write): proves the
+            # subaccount exists and is funded where its orders' collateral is checked. Funds =
+            # available balance + open positions at cost + resting orders' collateral (leftovers
+            # of a crashed session or held positions do not make a funded shard look empty)
+            try:
+                funds = await venue.fetch_shard_funds()
+            except Exception as exc:  # noqa: BLE001
+                raise StartupError(f"GET /portfolio/balance?subaccount={venue.sub} failed ({type(exc).__name__}: "
+                                   f"{exc}): the subaccount must exist and be funded on shard(s) {list(shards)}") from exc
+            bodies = {sh: f["body"] for sh, f in funds.items()}
+            balances = {sh: f["funds"] for sh, f in funds.items()}
+            available = {sh: f["available"] for sh, f in funds.items()}
+            self.info["balances"] = {"shards": {str(sh): {k: f[k] for k in ("available", "positions", "resting", "funds")}
+                                                for sh, f in funds.items()}, "required_usd": balance_need}
+            low = {sh: usd for sh, usd in balances.items() if usd is None or usd < balance_need}
+            if low:
+                raise StartupError(f"funds of subaccount {venue.sub} on shard(s) {low} do not cover the worst-case "
+                                   f"loss + margin ${balance_need:.2f} (fund the subaccount on that shard: RUNBOOK 1.2)")
+            log.info("funds of subaccount %d per shard: %s (required $%.2f)", venue.sub, self.info["balances"]["shards"],
+                     balance_need)
+            if lcfg.venue.key_restricted_to_subaccount:
+                ok, why = await verify_key_restriction(self.rest, str(getattr(signer, "key_id", "") or ""), venue.sub,
+                                                       bodies.values())
+                self.info["key_restriction"] = {"ok": ok, "evidence": why}
+                if not ok:
+                    raise StartupError(f"venue.key_restricted_to_subaccount is true but {why}: WS messages without a "
+                                       "subaccount field would be attributed to this runner")
+                log.info("API key restriction verified: %s", why)
             # 6. clean slate FIRST (verified), then positions: an order resting while the
             # positions are read could fill unseen and escape the event exclusion
             try:
@@ -346,19 +465,27 @@ class LiveApp:
                                    f"{[o.get('order_id') for o in left][:10]}")
             hold_until = venue.last_cancel_all_ns + int(lcfg.venue.cancel_all_hold_s * NS_PER_S)
             try:
-                positions = await venue.fetch_positions(strict=True)
+                all_positions = await venue.fetch_positions(strict=True)
             except ValueError as exc:
                 raise StartupError(f"malformed position row ({exc}): not trading with an unknown inventory") from exc
+            positions = {t: q for t, q in all_positions.items() if series_of_ticker(t) in series}
+            foreign = {t: q for t, q in all_positions.items() if t not in positions}
+            if foreign:
+                log.warning("subaccount %d holds positions outside %s (not managed, not counted): %s", venue.sub,
+                            list(series), foreign)
+                self.info["foreign_positions"] = foreign
             excluded = events_with_positions(positions)
             self.info["startup_positions"] = positions
             if positions:
                 log.warning("account holds positions at start-up: %s (events excluded: %s)", positions, sorted(excluded))
             # 7. today's P&L from Kalshi (fills, settlements, positions incl. excluded events, at
             # exchange prices), for the UTC day of the seed (re-derived if midnight passed, N7)
-            rest_pnl, seed_ts = await self._derive_today(positions, venue.sub)
+            rest_pnl, seed_ts = await self._derive_today(positions, venue.sub, series)
             self.info["day_pnl_rest"] = rest_pnl.summary()
             for fb in rest_pnl.fallbacks:
                 log.warning("risk state: %s", fb)
+            if rest_pnl.foreign:
+                log.warning("risk state: fill/settlement rows outside %s skipped: %s", list(series), rest_pnl.foreign)
         else:
             seed_ts = self.clock()  # the seed's decision time AND event time (one UTC day, even at midnight)
         seed = decide_seed(seed_ts, prev_state, rest_pnl, reset=self.reset_daily_halt)
@@ -379,10 +506,10 @@ class LiveApp:
                         seed.overridden.get("halt_reason") or "")
             self._log("risk_reset_by_operator", **self.info["risk_seed"])
 
-        # 6. universe
-        series = tuple(lcfg.universe.series) or tuple(scfg.quoting.enabled_series)
+        # 6. universe (markets on a known, configured exchange shard only)
         now = self.clock()
-        sel = await discover_universe(self.rest, series, fee_engine, now, lcfg.universe.horizon_s, exclude_events=excluded)
+        sel = await discover_universe(self.rest, series, fee_engine, now, lcfg.universe.horizon_s, exclude_events=excluded,
+                                      exchange_indexes=shards)
         for t, why in sorted(sel.skipped.items()):
             log.info("market %s: %s", t, why)
         if not sel.specs:
@@ -416,7 +543,7 @@ class LiveApp:
 
         async def discover(known: dict[str, Any]) -> Any:
             return await discover_universe(self.rest, series, fee_engine, self.clock(), lcfg.universe.horizon_s,
-                                           exclude_events=excluded, known=known)
+                                           exclude_events=excluded, known=known, exchange_indexes=shards)
 
         # what the strategy's equity does not cover: earlier sessions' realized P&L, the excluded
         # positions at their start-up marks (settled during the session -> updated seed)
@@ -435,6 +562,10 @@ class LiveApp:
         store.save(state_from_decision(seed, session=self.session_id, mode=mode, now_ns=self.clock()), fsync=True)
         if hold_until:
             runner.hold(hold_until, "startup_cancel_all")
+        if mode == "live":
+            runner.balance_required_usd = balance_need
+            runner.push_side("balance", {"balances": balances, "available": available})  # metrics from the first second
+            runner.push_side("exchange_schedule", {"closures": closures, "notes": []})
         if venue is not None:
             venue.sink = runner.push_result
             venue.log_fn = lambda k, p: runner.jlog("venue." + k, self.clock(), **p)
@@ -443,15 +574,21 @@ class LiveApp:
             limit = round(scfg.risk.order_group_limit_contracts * QTY_SCALE)
             gid = await venue.ensure_order_group(MarketMaker.ORDER_GROUP_ID, limit)
             if gid is None:
-                raise StartupError("could not create the exchange order group (fill-burst breaker): refusing to trade")
-            self.info["order_group"] = {"logical": MarketMaker.ORDER_GROUP_ID, "id": gid, "limit": limit}
+                raise StartupError(f"could not create the exchange order group (fill-burst breaker) on shard(s) "
+                                   f"{venue.shards_in_use()}: refusing to trade")
+            self.info["order_group"] = {"logical": MarketMaker.ORDER_GROUP_ID, "id": gid, "limit": limit,
+                                        "groups": venue.group_refs()}
 
         # 11. market data
         subs = build_subscriptions(mode, [s.ticker for s in specs], lcfg)
         kw = ws_kwargs(kc.ws)
         connect = self.ov.ws_connect or websockets_connect_factory(ping_interval=kc.ws.get("ping_interval_s", 10),
                                                                    ping_timeout=kc.ws.get("ping_timeout_s", 10))
-        self.ws = KalshiWS(kc.ws_url, signer, subs, on_raw=self.recorder.write, on_event=runner.push,
+        on_raw = self.recorder.write
+        if mode == "live":  # the first own fill settles whether the WS fill names the subaccount
+            on_raw = WsFillProbe(self.recorder.write, runner, lcfg.venue.sub, lcfg.venue.key_restricted_to_subaccount,
+                                 self.id_prefix)
+        self.ws = KalshiWS(kc.ws_url, signer, subs, on_raw=on_raw, on_event=runner.push,
                            connect=connect, clock_ns=self.clock,
                            max_markets_per_subscription=int(lcfg.universe.max_markets_per_subscription), **kw)
         ws = self.ws
@@ -465,20 +602,22 @@ class LiveApp:
                    live_config=lcfg.as_dict(), live_digest=lcfg.digest(), specs=[spec_to_dict(s) for s in specs],
                    skipped=sel.skipped, excluded_events=sorted(excluded), backfill=bf.summary(),
                    paper=asdict(lcfg.paper) if mode == "paper" else None, info=self.info,
-                   id_prefix=self.id_prefix, session_token=self.token, subaccount=lcfg.venue.sub)
+                   id_prefix=self.id_prefix, session_token=self.token, subaccount=lcfg.venue.sub, series=list(series),
+                   exchange_indexes=list(shards), shared_account=lcfg.venue.shared_account,
+                   key_restricted_to_subaccount=lcfg.venue.key_restricted_to_subaccount)
         self._meta("fv_warmup", source=bf.source, points=bf.points)
         self._log("startup", universe=[s.ticker for s in specs], skipped=sel.skipped, backfill=bf.summary(), info=self.info)
         self.runner = runner
         return runner
 
-    async def _derive_today(self, positions: dict[str, int], sub: int) -> tuple[Any, int]:
+    async def _derive_today(self, positions: dict[str, int], sub: int, series: tuple[str, ...] = ()) -> tuple[Any, int]:
         """(today's DayPnl from Kalshi, the seed time), both on the same UTC day: when midnight
         passes during the derivation it is done again for the new day (a restart at 00:00 must
         not seed the new day with yesterday's P&L). Failures refuse the start."""
         for _ in range(3):
             ds = day_start(self.clock())
             try:
-                pnl = await derive_day_pnl(self.rest, ds, positions, subaccount=sub)
+                pnl = await derive_day_pnl(self.rest, ds, positions, subaccount=sub, series=series or None)
             except RiskStateError as exc:
                 raise StartupError(f"risk state: {exc}") from exc
             seed_ts = self.clock()

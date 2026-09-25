@@ -108,7 +108,11 @@ def _fmt(labels: tuple) -> str:
 class KillFile:
     """Manual kill switch: if the file exists, the runner cancels everything and halts."""
 
-    def __init__(self, path: str | Path = "/run/dh/KILL") -> None:
+    def __init__(self, path: str | Path | None = None) -> None:
+        if path is None:
+            from dh.live.config import default_run_dir
+
+            path = f"{default_run_dir()}/KILL"
         self.path = Path(path)
 
     def triggered(self) -> bool:

@@ -14,7 +14,7 @@
 | 8 | Candidate EV | `quoting.evaluate` | v = edge - AS - fee - hedge - inventory; EVrate = intensity x v |
 | 9 | Risk penalties | `scenario` grid | marginal variance/CVaR charge; hard limits via `RiskEngine` |
 | 10 | Rank | `mm` | score = EVrate / collateral, greedy admission under limits and write budget |
-| 11 | Submit passive orders | adapter | post-only V2 orders, `cancel_order_on_pause`, order group, 120 s expiry in M1; exact per-order fee (incl. rounding) priced into v, fee-efficient size |
+| 11 | Submit passive orders | adapter | post-only V2 orders, `cancel_order_on_pause`, the order group of the market's shard, 120 s expiry in M1, explicit `subaccount` (1) and `exchange_index` (2) on every write; exact per-order fee (incl. rounding) priced into v, fee-efficient size |
 | 12 | Monitor queue / external BTC | events + `queue_positions` poll | queue estimator (live: an order joins the queue at its own book delta); requote timer 200 ms; immediate requote on a benchmark move > 2 sigma(1 s) |
 | 13 | Cancel/reprice when EV < 0 | `decide_side` | cancel if v < 0; replace only if EVrate gain > kappa |
 | 14 | Process fills | `OrderManager` | dedupe by trade_id; position, cost basis, fee reconciliation |
@@ -23,7 +23,7 @@
 | 17 | Execute hedge | adapter | post-only at touch, IOC if urgent |
 | 18 | Residual exposure | risk report | CVaR/worst-case per event; limits |
 | 19 | Settle | lifecycle/settlement events | payout, unwind event's hedge, settlement-loss check |
-| 20 | Reconcile | ledger | exchange positions/fills/fees vs internal ledger; mismatch halts |
+| 20 | Reconcile | ledger | exchange positions/fills/fees vs internal ledger; mismatch halts (only on a positions read at least as recent as the last WS fill: `GET /exchange/user_data_timestamp`) |
 
 ## Race conditions and their deterministic handling
 
@@ -51,8 +51,9 @@ strategy is recorded, so a session replays bit for bit.
 | Amend priority | amend may reset queue position | M1 uses cancel/replace; Experiment 4 measures amend semantics via `queue_positions` |
 | Hedge venue rejects or partially fills | margin / connectivity | hedge engine sees the real position only from HedgeFill; a rejected/canceled hedge stops counting as pending; if the venue is down, quoting stops on sides that increase \|D\| (hedging is off in M1) |
 | Settlement while orders rest | market closes at T | orders auto-canceled at close; strategy stops quoting near-strike markets inside T-90 s |
-| Exchange pause | trading paused | `cancel_order_on_pause`; lifecycle `deactivated` -> cancel and no quoting until reactivated |
-| Global cancel-all tail | Kalshi may also cancel orders placed in the minute after a cancel-all | new orders held 60 s after any global cancel-all (start-up, kill, watchdog); strategy CancelAll uses batch cancels of our own orders, never the global endpoint |
-| Process crash | strategy dies with resting orders | watchdog (separate process and key, locked to the runner it armed on) cancels all when the heartbeat is > 2 s stale; 120 s order expiry; order-group limits; restart cancels leftovers first |
+| Exchange pause | trading paused (weekly Thursday 03:00-05:00 ET, maintenance, ad hoc) | the runner polls `GET /exchange/status` (shard 2's entry) every 10 s, reads the schedule hourly and treats pause-like place rejects the same way: new orders blocked, strategy told `kalshi.reconcile` stale (quotes pulled; 60 s ahead of a scheduled closure), re-read of fills / positions / orders before resuming; `cancel_order_on_pause` on every order is the only protection during an EXCHANGE pause (cancels rejected too); lifecycle `deactivated` -> cancel and no quoting until reactivated |
+| Global cancel-all tail | Kalshi may also cancel orders placed in the minute after a cancel-all | every terminal kill first TRIGGERS the order group(s) (scoped, no documented tail), then `DELETE /portfolio/events/orders?subaccount=1`; new orders held 60 s after any global cancel-all (start-up, kill, watchdog); strategy CancelAll uses batch cancels of our own orders, never the global endpoint |
+| Process crash | strategy dies with resting orders | watchdog (separate process and restricted key, locked to the runner it armed on) triggers the runner's order groups then cancels subaccount 1's orders when the heartbeat is > 2 s stale; 120 s order expiry; order-group limits; restart cancels leftovers first |
+| Another system on the same account | System 2 trades subaccount 0 with its own key | System 1 is on subaccount 1 with keys restricted to it; every write names subaccount 1 (the REST client refuses anything else before sending), own-channel events of other subaccounts / series are dropped, collateral is checked per shard |
 | Restart during the day | a new process would forget today's losses and halts | persisted risk state (realized part and mark kept apart) plus the day P&L re-derived from REST fills and settlements, with open positions at exchange prices, seed the strategy (`RiskStateSeed`, first event; re-sent in-session when an excluded event settles or a watchdog cancel-all names this runner). A daily-loss halt holds for its own UTC day; other halts keep their scope across restarts; `--reset-daily-halt` starts a fresh loss budget and keeps the real P&L on record |
-| Clock drift | local clock off or stepped | monotonic receive clock anchored at start; chrony offset recorded; alarm > 5 ms; a persistent offset > 250 ms blocks new orders and sends `runner.clock` stale |
+| Clock drift | local clock off or stepped | monotonic receive clock anchored at start; chrony offset recorded (macOS: query-only `sntp`, ~35-50 ms behind NTP measured); alarm > `clock_alarm_ms`; a persistent offset > 250 ms (or an untrusted sample) blocks new orders and sends `runner.clock` stale |

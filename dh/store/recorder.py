@@ -563,7 +563,8 @@ def sample_clock() -> dict[str, Any]:
     'chronyc' > 'timedatectl' > 'adjtimex' > 'sntp' (macOS: query-only SNTP offset against
     the configured time server; ``synced`` stays None: it measures, it does not tell whether
     the OS disciplines the clock) > 'unknown'. Offsets in seconds, positive = local clock
-    behind. The live runner only trusts 'chronyc'/'timedatectl' (dh.live.runner.CLOCK_SOURCES)."""
+    behind. The live runner trusts 'chronyc'/'timedatectl', and on macOS also 'sntp'
+    (dh.live.runner.trusted_clock_sources)."""
     rec: dict[str, Any] = {"wall_ns": time.time_ns(), "mono_ns": time.monotonic_ns()}
     chrony = _chronyc()
     tdc = None if chrony else _timedatectl()

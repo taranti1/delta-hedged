@@ -17,9 +17,11 @@ paths:
   data_root: data/live         # raw capture of THIS process; never the collector's root.
                                # One runner per data_root (flock on <data_root>/runner.lock)
   log_dir: data/live_logs      # JSON-lines: decisions (Log actions), actions, venue results
-  kill_file: /run/dh/KILL      # `touch /run/dh/KILL` -> cancel all + stop (dir must exist; stops paper too)
-  heartbeat_file: /run/dh/heartbeat.json   # the LIVE runner's; read by scripts/watchdog.py
-  paper_heartbeat_file: ""     # paper runner; '' = /run/dh/heartbeat.paper.json (never the live file)
+  # '' = the platform's runtime dir: /run/dh/... on Linux (tmpfs: `sudo mkdir -p /run/dh` after
+  # every boot), data/run/... under the repository on macOS (created on demand; no /run there)
+  kill_file: ""                # `echo why > <run dir>/KILL` -> group trigger + cancel all + stop (stops paper too)
+  heartbeat_file: ""           # the LIVE runner's (<run dir>/heartbeat.json); read by scripts/watchdog.py
+  paper_heartbeat_file: ""     # paper runner; '' = <run dir>/heartbeat.paper.json (never the live file)
   risk_state_file: ""          # day P&L / carried halt / pause; '' = <data_root>/state/risk_state.<mode>.json
 
 metrics:
@@ -44,23 +46,40 @@ loop:
   yield_ms: 5.0                # and after every item that sent orders
   shutdown_timeout_s: 10.0     # 'stopping' heartbeats stop after this (the watchdog takes over)
   strategy_error: stop         # stop | continue ('continue' is refused in live mode)
-  clock_sample_s: 60.0         # chrony/timedatectl sample -> 'clock' stream + dh_clock_offset_seconds
-                               # (must be > 0 in live mode)
+  clock_sample_s: 60.0         # chrony/timedatectl (macOS: query-only `sntp`) sample -> 'clock' stream +
+                               # dh_clock_offset_seconds (must be > 0 in live mode)
   clock_resample_s: 5.0        # while the last sample was bad or unmeasurable: sample this often
-  clock_alarm_ms: 5.0          # |offset| above this: alarm
+  clock_alarm_ms: 5.0          # |offset| above this: alarm (macOS runs ~35-50 ms off NTP: use ~100 there)
   clock_block_ms: 250.0        # |offset| above this on clock_block_samples checks in a row:
   clock_block_samples: 2       # new orders blocked (restart re-anchors the session clock)
-  clock_max_est_error_ms: 0.0  # live: a sample must come from chronyc/timedatectl, be synchronised and
-                               # have an estimated error <= this (0 = clock_block_ms), else it blocks
-                               # like a large offset (no chronyd reachable = blocked)
+  clock_max_est_error_ms: 0.0  # live: a sample must come from chronyc/timedatectl and be synchronised
+                               # (macOS: `sntp` answered), with an estimated error <= this
+                               # (0 = clock_block_ms), else it blocks like a large offset
   risk_state_interval_s: 2.0   # persist the day's risk state this often (and on every halt)
 
 venue:
-  subaccount: null             # Kalshi subaccount number (null / 0 = primary), sent EXPLICITLY on
+  # Deployment (docs/RUNBOOK.md 1.2): System 1 trades subaccount 1 of an account SHARED with another
+  # live system (which owns subaccount 0 and must never be touched).
+  subaccount: 1                # Kalshi subaccount number (null / 0 = primary), sent EXPLICITLY on
                                # every request (omitted = ALL subaccounts on GET orders/fills and
                                # cancel-all). Use a DEDICATED (sub)account: cancel-all and the
                                # ghost sweep act on all its orders; other subaccounts' WS events
                                # are dropped.
+  shared_account: true         # live refuses subaccount null/0 and rate_limits.account_share > 0.5
+                               # (config/kalshi.yaml); every write must name this subaccount
+  key_restricted_to_subaccount: true  # runner + watchdog keys are restricted to `subaccount`
+                               # (verified at start-up): private WS messages without a subaccount
+                               # field are ours (Kalshi scopes the channels to the key)
+  exchange_indexes: [2]        # shards traded AND funded (every KXBTC* market is on shard 2); markets
+                               # on an unknown / other shard are never traded; one order group per shard
+  min_balance_margin_dollars: 10.0  # each shard's funds (available balance + our positions at cost +
+                               # resting-order collateral) >= worst-case loss (m1: $50) + this, at
+                               # start-up (else exit 2) and every balance_interval_s (else new orders blocked)
+  balance_interval_s: 60.0
+  exchange_status_interval_s: 10.0  # GET /exchange/status (trading / exchange pauses; live: > 0)
+  exchange_schedule_interval_s: 3600.0  # GET /exchange/schedule (maintenance, Thursday 03:00-05:00 ET pause)
+  pause_lead_s: 60.0           # quotes pulled this long before a scheduled closure
+  pause_reject_hold_s: 30.0    # a place rejected for a pause keeps new orders blocked at least this long
   max_batch: 20                # places / cancels per batched request
   max_place_wait_s: 0.5        # quotes that would wait longer for write tokens are dropped
   self_trade_prevention: taker_at_cross
@@ -142,5 +161,5 @@ watchdog:                      # scripts/watchdog.py (locks onto the live runner
   max_repeats: 10
   only_live: true
   stopping_grace_s: 5.0        # a 'stopping' runner older than its shutdown_timeout_s + this: cancel all
-  key_id_env: KALSHI_WATCHDOG_KEY_ID
+  key_id_env: KALSHI_WATCHDOG_KEY_ID   # its own key, restricted to venue.subaccount (RUNBOOK 1.2)
   private_key_path_env: KALSHI_WATCHDOG_PRIVATE_KEY_PATH

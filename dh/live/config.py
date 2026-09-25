@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,16 @@ import yaml
 
 MODES = ("paper", "live")
 LIVE_CONFIRM_FLAG = "--i-understand-this-sends-real-orders"
+# a shared Kalshi account (another live system on subaccount 0): this process may use at most
+# this fraction of the account's REST budget (rate limits are per account)
+SHARED_ACCOUNT_MAX_SHARE = 0.5
+
+
+def default_run_dir(platform: str | None = None) -> str:
+    """Directory of the kill file, the heartbeat and their locks when the config leaves them
+    empty: ``/run/dh`` on Linux (tmpfs, created by the operator after every boot) and
+    ``data/run`` under the repository on macOS (there is no /run; created on demand)."""
+    return "data/run" if (platform or sys.platform) == "darwin" else "/run/dh"
 
 
 @dataclass(frozen=True)
@@ -33,11 +44,19 @@ class PathsCfg:
     # <data_root>/runner.lock (flock) while it runs.
     data_root: str = "data/live"
     log_dir: str = "data/live_logs"  # JSON-lines decision/action logs
-    kill_file: str = "/run/dh/KILL"  # touch it to cancel everything and stop (live AND paper)
-    heartbeat_file: str = "/run/dh/heartbeat.json"  # LIVE runner; read by scripts/watchdog.py
+    # '' = <default_run_dir()>/KILL: /run/dh/KILL (Linux) or data/run/KILL (macOS)
+    kill_file: str = ""  # touch it to cancel everything and stop (live AND paper)
+    heartbeat_file: str = ""  # LIVE runner; read by scripts/watchdog.py ('' = <run dir>/heartbeat.json)
     paper_heartbeat_file: str = ""  # paper runner; '' = <heartbeat_file stem>.paper.json (never the watchdog's file)
     # per-UTC-day risk state (day P&L, carried halt, pause); '' = <data_root>/state/risk_state.<mode>.json
     risk_state_file: str = ""
+
+    def __post_init__(self) -> None:
+        run = default_run_dir()
+        if not self.kill_file:
+            object.__setattr__(self, "kill_file", f"{run}/KILL")
+        if not self.heartbeat_file:
+            object.__setattr__(self, "heartbeat_file", f"{run}/heartbeat.json")
 
     def heartbeat_for(self, mode: str) -> str:
         """The heartbeat file of a runner in ``mode``: paper never writes the live file (a paper
@@ -91,7 +110,8 @@ class LoopCfg:
     clock_block_ms: float = 250.0  # |offset| above this on clock_block_samples samples in a row:
     clock_block_samples: int = 2  # new orders blocked until it recovers
     # live: a sample counts as bad (blocks like an offset) unless it comes from chronyc or
-    # timedatectl, says synchronised, and its estimated error is at most this (0 = clock_block_ms)
+    # timedatectl and says synchronised (macOS: a query-only `sntp` answer; "synchronised" = it
+    # answered), and its estimated error is at most this (0 = clock_block_ms)
     clock_max_est_error_ms: float = 0.0
     risk_state_interval_s: float = 2.0  # persist day P&L / halt / pause this often (0 = off)
 
@@ -113,6 +133,25 @@ class VenueCfg:
     # Kalshi subaccount (null / 0 = primary). ALWAYS sent explicitly (0 for primary): Kalshi
     # reads an omitted subaccount as "all subaccounts" on GET orders/fills and cancel-all.
     subaccount: int | None = None
+    # The Kalshi account is SHARED with another live system (which owns subaccount 0): live mode
+    # refuses subaccount null/0 and rate_limits.account_share > 0.5, and the REST client refuses
+    # any write that does not name this subaccount explicitly.
+    shared_account: bool = False
+    # The API key(s) are restricted to ``subaccount`` (Kalshi scopes the private WebSocket
+    # channels server-side): a fill / user_order / market_position without a subaccount field is
+    # this subaccount's. Verified at live start-up (GET /api_keys, else the balance breakdown).
+    key_restricted_to_subaccount: bool = False
+    # Exchange shards this runner trades and has funded (all KXBTC* markets: shard 2). A market on
+    # an unknown or other shard is never traded; one order group per shard in use; the balance of
+    # every listed shard is checked at start-up and every balance_interval_s.
+    exchange_indexes: tuple[int, ...] = (2,)
+    # funds per shard (available + our positions at cost + resting collateral) >= worst-case loss (m1) + this
+    min_balance_margin_dollars: float = 10.0
+    balance_interval_s: float = 60.0  # GET /portfolio/balance re-read; below the requirement -> new orders blocked
+    exchange_status_interval_s: float = 10.0  # GET /exchange/status poll (trading pauses); live: > 0
+    exchange_schedule_interval_s: float = 3600.0  # GET /exchange/schedule (maintenance, weekly pause)
+    pause_lead_s: float = 60.0  # pull quotes this long before a scheduled closure starts
+    pause_reject_hold_s: float = 30.0  # a place rejected for a pause keeps the pause gate closed this long
     max_batch: int = 20  # places / cancels per batched request (also capped by the write bucket)
     max_place_wait_s: float = 0.5  # never send a quote that would wait longer than this for write tokens
     self_trade_prevention: str = "taker_at_cross"
@@ -301,7 +340,27 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
     if cfg.loop.clock_sample_s <= 0:
         out.append("loop.clock_sample_s must be > 0 in live mode (the clock-offset gate must measure the clock; "
                    "it blocks new orders when it cannot)")
+    v = cfg.venue
+    if v.shared_account and v.sub == 0:
+        out.append("venue.shared_account is true: venue.subaccount must be a dedicated subaccount (1-63), never "
+                   "null/0 (subaccount 0 belongs to the other live system on this account)")
+    if not v.exchange_indexes or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in v.exchange_indexes):
+        out.append("venue.exchange_indexes must list the exchange shard(s) this runner trades and has funded "
+                   "(KXBTC*: [2])")
+    if v.exchange_status_interval_s <= 0:
+        out.append("venue.exchange_status_interval_s must be > 0 in live mode (trading pauses must be detected)")
+    if v.balance_interval_s <= 0:
+        out.append("venue.balance_interval_s must be > 0 in live mode (the shard balance must be re-checked)")
     return out
+
+
+def account_share_problem(cfg: LiveConfig, account_share: float) -> str:
+    """Live refusal of the Kalshi config's rate_limits.account_share on a shared account ('' = ok)."""
+    if cfg.venue.shared_account and float(account_share) > SHARED_ACCOUNT_MAX_SHARE:
+        return (f"venue.shared_account is true: rate_limits.account_share {account_share:g} in the Kalshi config "
+                f"must be <= {SHARED_ACCOUNT_MAX_SHARE:g} (REST budgets are per account; the other system needs "
+                "its share)")
+    return ""
 
 
 def resolve_mode(cli_mode: str | None, config_mode: str, confirmed: bool) -> str:

@@ -57,10 +57,10 @@ def _iso(ns: int) -> str:
 
 def order_row(coid: str, oid: str, ticker: str, *, status: str = "resting", side: str = "bid", px: str = "0.4500",
               filled: str = "0.00", remaining: str = "2.00", initial: str = "2.00", created_ns: int | None = None,
-              subaccount: int | None = None) -> dict[str, Any]:
+              subaccount: int | None = None, exchange_index: int = 2) -> dict[str, Any]:
     """openapi Order object (spec field names). ``created_ns`` None: 2026-09-25T12:00:00Z."""
     row = {
-        "order_id": oid, "user_id": "u-1", "client_order_id": coid, "ticker": ticker,
+        "order_id": oid, "user_id": "u-1", "client_order_id": coid, "ticker": ticker, "exchange_index": exchange_index,
         "outcome_side": "yes" if side == "bid" else "no", "book_side": side, "type": "limit", "status": status,
         "yes_price_dollars": px, "no_price_dollars": f"{1 - float(px):.4f}", "fill_count_fp": filled,
         "remaining_count_fp": remaining, "initial_count_fp": initial, "taker_fees_dollars": "0.000000",
@@ -118,6 +118,7 @@ class FakeRest:
         self.forbid_all_writes = forbid_all_writes
         self.orders: dict[str, dict[str, Any]] = {}  # oid -> order row (exchange view)
         self.positions: dict[str, str] = {}  # ticker -> position_fp
+        self.exposure: dict[str, str] = {}  # ticker -> market_exposure_dollars (position cost)
         self.queue_positions: dict[str, str] = {}  # oid -> queue_position_fp
         self.groups: list[dict[str, Any]] = []
         self.fills: list[dict[str, Any]] = []  # REST Fill rows
@@ -134,6 +135,10 @@ class FakeRest:
         self.series: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
         self.exchange = {"exchange_active": True, "trading_active": True}
+        self.schedule: dict[str, Any] = {"schedule": {"standard_hours": [], "maintenance_windows": []}}
+        self.balances: dict[int, str] = {}  # exchange shard -> balance_dollars ('' / missing: $1000.00)
+        self.user_data_ts: str | None = None  # GET /exchange/user_data_timestamp as_of_time (None: 404)
+        self.api_keys: list[dict[str, Any]] = []  # GET /api_keys rows
         self._n = 0
         self.gate: asyncio.Event | None = None  # when set, writes wait on it (in-flight tests)
 
@@ -175,6 +180,8 @@ class FakeRest:
             oid = self._oid()
             self.orders[oid] = order_row(body["client_order_id"], oid, body["ticker"], side=body["side"], px=body["price"],
                                          remaining=body["count"], initial=body["count"], created_ns=self.clock())
+            if body.get("order_group_id"):
+                self.orders[oid]["order_group_id"] = body["order_group_id"]
             return {"order_id": oid, "client_order_id": body["client_order_id"], "fill_count": "0.00",
                     "remaining_count": body["count"], "ts_ms": 1790300000123}
         return await self._call("create_order", (body,), {}, ok)
@@ -186,6 +193,8 @@ class FakeRest:
                 oid = self._oid()
                 self.orders[oid] = order_row(b["client_order_id"], oid, b["ticker"], side=b["side"], px=b["price"],
                                              remaining=b["count"], initial=b["count"], created_ns=self.clock())
+                if b.get("order_group_id"):
+                    self.orders[oid]["order_group_id"] = b["order_group_id"]
                 out.append({"order_id": oid, "client_order_id": b["client_order_id"], "fill_count": "0.00",
                             "remaining_count": b["count"], "ts_ms": 1790300000123})
             return {"orders": out}
@@ -235,9 +244,19 @@ class FakeRest:
     async def create_order_group(self, contracts_limit: int, **kw: Any) -> Any:
         def ok() -> dict[str, Any]:
             gid = f"og-{len(self.groups) + 1}"
-            self.groups.append({"id": gid, "contracts_limit_fp": f"{contracts_limit / 100:.2f}", "is_auto_cancel_enabled": True})
-            return {"order_group_id": gid, "subaccount": 0}
+            self.groups.append({"id": gid, "contracts_limit_fp": f"{contracts_limit / 100:.2f}", "is_auto_cancel_enabled": True,
+                                "exchange_index": kw.get("exchange_index", 0)})
+            return {"order_group_id": gid, "subaccount": kw.get("subaccount", 0), "exchange_index": kw.get("exchange_index", 0)}
         return await self._call("create_order_group", (contracts_limit,), kw, ok)
+
+    async def trigger_order_group(self, gid: str, **kw: Any) -> Any:
+        def ok() -> dict[str, Any]:
+            for o in self.orders.values():  # the group's resting orders are cancelled
+                if o["status"] == "resting" and o.get("order_group_id") == gid:
+                    o["status"] = "canceled"
+                    o["remaining_count_fp"] = "0.00"
+            return {}
+        return await self._call("trigger_order_group", (gid,), kw, ok)
 
     async def get_order_groups(self, **kw: Any) -> Any:
         return await self._call("get_order_groups", (), kw, lambda: {"order_groups": copy.deepcopy(self.groups)})
@@ -330,12 +349,32 @@ class FakeRest:
 
     async def get_all_positions(self, **kw: Any) -> Any:
         return await self._call("get_all_positions", (), kw, lambda: {"market_positions": [
-            {"ticker": t, "position_fp": p, "market_exposure_dollars": "0", "realized_pnl_dollars": "0",
-             "fees_paid_dollars": "0", "total_traded_dollars": "0", "exchange_index": 0, "last_updated_ts": "x"}
+            {"ticker": t, "position_fp": p, "market_exposure_dollars": self.exposure.get(t, "0"), "realized_pnl_dollars": "0",
+             "fees_paid_dollars": "0", "total_traded_dollars": "0", "exchange_index": 2, "last_updated_ts": "x"}
             for t, p in self.positions.items()], "event_positions": []})
 
     async def get_exchange_status(self) -> Any:
         return await self._call("get_exchange_status", (), {}, lambda: dict(self.exchange))
+
+    async def get_exchange_schedule(self) -> Any:
+        return await self._call("get_exchange_schedule", (), {}, lambda: copy.deepcopy(self.schedule))
+
+    async def get_user_data_timestamp(self) -> Any:
+        def look() -> Any:
+            if self.user_data_ts is None:
+                raise http_error(404, "not_found", "no user data timestamp", "GET", "/exchange/user_data_timestamp")
+            return {"as_of_time": self.user_data_ts}
+        return await self._call("get_user_data_timestamp", (), {}, look)
+
+    async def get_balance(self, **kw: Any) -> Any:
+        def ok() -> Any:
+            usd = self.balances.get(int(kw.get("exchange_index") or 0)) or "1000.00"
+            return {"balance": int(round(float(usd) * 100)), "balance_dollars": usd, "portfolio_value": 0,
+                    "updated_ts": 1790300000}
+        return await self._call("get_balance", (), kw, ok)
+
+    async def get_api_keys(self) -> Any:
+        return await self._call("get_api_keys", (), {}, lambda: {"api_keys": copy.deepcopy(self.api_keys)})
 
     async def configure_rate_limits(self) -> Any:
         return await self._call("configure_rate_limits", (), {}, lambda: {"limits": {}, "endpoint_costs": {}})
@@ -397,13 +436,14 @@ def _loop_running() -> bool:
 
 # ============================================================================ market fixtures
 def kxbtcd_spec(strike: float = 84_000.0, *, hour_ns: int | None = None, ticker: str | None = None,
-                fee_type: str = "quadratic_with_maker_fees") -> MarketSpec:
+                fee_type: str = "quadratic_with_maker_fees", exchange_index: int | None = 2) -> MarketSpec:
+    """A KXBTCD MarketSpec; exchange shard 2 like every KXBTC* market since 2026-08-24."""
     exp = hour_ns if hour_ns is not None else ((T0 // (3600 * NS_PER_S)) + 1) * 3600 * NS_PER_S
     t = ticker or f"KXBTCD-26SEP2513-T{strike:.2f}"
     return MarketSpec(ticker=t, event_ticker=t.rsplit("-", 1)[0], series_ticker="KXBTCD", strike_type="greater",
                       floor_strike=strike, cap_strike=None, open_ts=exp - 86400 * NS_PER_S, close_ts=exp,
                       expiration_ts=exp, price_ranges=(PriceRange(100, 9900, 100),), fee_type=fee_type,
-                      fee_multiplier=1.0, title="test")
+                      fee_multiplier=1.0, title="test", exchange_index=exchange_index)
 
 
 NO_SEQ_CHANNELS = frozenset({"fill", "user_orders", "market_positions"})  # asyncapi: no seq on these payloads

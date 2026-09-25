@@ -128,7 +128,8 @@ async def test_startup_failure_after_side_effects_leaves_nothing_behind(tmp_path
     if failure == "order_group":
         rest.on("create_order_group", http_error(400, "bad", "no groups for you"))
     elif failure == "positions":
-        rest.on("get_all_positions", ConnectionError("network down"))
+        # the first positions read is the read-only funds check (before any write): fail the one after the cancel-all
+        rest.on("get_all_positions", {"market_positions": [], "event_positions": []}, ConnectionError("network down"))
     else:
         rest.orders["o-x"] = order_row("x", "o-x", "KXBTCD-X")
 
@@ -375,7 +376,8 @@ async def test_malformed_rest_data_refuses_the_start(tmp_path, bad):
     elif bad == "cutoff_down":
         rest.on("get_historical_cutoff", ConnectionError("down"))
     else:
-        rest.on("get_all_positions", {"market_positions": [{"ticker": "X", "position_fp": "abc"}], "event_positions": []})
+        rest.on("get_all_positions", {"market_positions": [], "event_positions": []},  # the funds read, then the strict one
+                {"market_positions": [{"ticker": "X", "position_fp": "abc"}], "event_positions": []})
     app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
     assert await app.run(duration_s=1.0) == 2
     names = rest.names()

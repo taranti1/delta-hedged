@@ -224,7 +224,7 @@ async def test_heartbeat_and_metrics_endpoint(tmp_path):
 async def test_order_group_updates_translated_to_logical_id_and_foreign_dropped():
     s = RecordingStrategy()
     r, venue, rest = live_runner(s)
-    venue.groups["dh-main"] = "og-7"
+    venue.groups["dh-main"] = {2: "og-7"}
     r.push(KalshiOrderGroupUpdate(time.time_ns(), 1, "og-7", "triggered"))
     r.push(KalshiOrderGroupUpdate(time.time_ns(), 2, "someone-else", "triggered"))
     r.process_pending()

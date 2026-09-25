@@ -39,6 +39,7 @@ def make(rest: FakeRest | None = None, **cfg) -> tuple[KalshiVenue, FakeRest, li
     clock = FakeClock()
     out: list = []
     v = KalshiVenue(rest, sink=out.append, cfg=VenueCfg(**cfg), clock_ns=clock, monotonic=clock.mono, sleep=_nosleep)
+    v.shard_of.update({TK: 2, TK2: 2})  # every KXBTC* market is on exchange shard 2
     return v, rest, out, clock
 
 
@@ -52,10 +53,10 @@ async def test_single_place_exact_body_and_ack():
     v.submit([a], clock())
     assert await v.wait_idle(1.0)
     (args, _), = rest.of("create_order")
-    assert args[0] == place_order_body(a, subaccount=3)
+    assert args[0] == place_order_body(a, subaccount=3, exchange_index=2)
     assert args[0] == {"ticker": TK, "client_order_id": "dhm1-1", "side": "bid", "count": "2.00", "price": "0.4500",
                        "time_in_force": "good_till_canceled", "self_trade_prevention_type": "taker_at_cross",
-                       "post_only": True, "cancel_order_on_pause": True, "subaccount": 3}
+                       "post_only": True, "cancel_order_on_pause": True, "subaccount": 3, "exchange_index": 2}
     assert len(out) == 1 and isinstance(out[0], OrderAck)
     assert (out[0].client_order_id, out[0].order_id, out[0].remaining_qty, out[0].ts) == ("dhm1-1", "oid-1", 200, clock())
 
@@ -202,13 +203,14 @@ async def test_cancel_single_and_batch():
     v, _, out, clock = make(rest)
     v.submit([CancelOrder("c-1", TK, "o-1")], clock())
     await v.wait_idle(1.0)
-    assert rest.of("cancel_order")[0] == (("o-1",), {"market_ticker": TK, "subaccount": 0})  # explicit primary
+    # explicit primary subaccount AND the market's exchange shard (never auto-routed)
+    assert rest.of("cancel_order")[0] == (("o-1",), {"market_ticker": TK, "subaccount": 0, "exchange_index": 2})
     assert isinstance(out[0], CancelAck) and out[0].canceled_qty == 200
     v.submit([CancelOrder("c-2", TK2, "o-2"), CancelOrder("c-3", TK2, "o-3")], clock())
     await v.wait_idle(1.0)
     (args, _), = rest.of("batch_cancel_orders")
-    assert args[0] == [{"order_id": "o-2", "market_ticker": TK2, "subaccount": 0},
-                       {"order_id": "o-3", "market_ticker": TK2, "subaccount": 0}]
+    assert args[0] == [{"order_id": "o-2", "market_ticker": TK2, "subaccount": 0, "exchange_index": 2},
+                       {"order_id": "o-3", "market_ticker": TK2, "subaccount": 0, "exchange_index": 2}]
     assert sorted(e.client_order_id for e in out[1:] if isinstance(e, CancelAck)) == ["c-2", "c-3"]
 
 

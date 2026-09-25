@@ -17,10 +17,14 @@ Data path
     replays bit-for-bit (dh.live.replay ranks events.live after every other stream: an
     injected event shares the timestamp of the item that caused it and comes after it).
   * Live inbound rules (mirrored by dh.live.replay): events of another Kalshi subaccount are
-    dropped (the private channels are account-wide); order-group ids are translated to the
-    strategy's logical id (foreign groups dropped); WS market_position snapshots go through
-    the same persistence check as the REST positions instead of reaching the strategy; a fill
-    already delivered (WS or REST back-fill, by trade/fill id) is never delivered twice.
+    dropped (with a full-account key the private channels are account-wide; with a key
+    restricted to our subaccount, ``venue.key_restricted_to_subaccount``, Kalshi scopes them
+    server-side, so a message WITHOUT the optional subaccount field, normalized to 0, is ours);
+    own-activity events of markets outside the configured series are dropped; order-group ids
+    are translated to the strategy's logical id (foreign groups dropped); WS market_position
+    snapshots go through the same persistence check as the REST positions instead of reaching
+    the strategy; a fill already delivered (WS or REST back-fill, by trade/fill id) is never
+    delivered twice.
   * The consumer task takes items in order and hands events to ``EventPump`` (dh.live.pump),
     which calls ``strategy.on_event`` synchronously, never concurrently, with ``Timer``
     events synthesized on the grid ``k * period_ns`` exactly as the backtest runner does.
@@ -61,17 +65,31 @@ Safety
     this runner: the runner was unresponsive long enough for the watchdog to act -> Halt(all)
     (a sticky halt: the operator investigates and restarts). A marker about another runner
     (a restart racing a trigger) holds new orders for the cancel-all tail and reconciles.
-  * Clock (live): a sample counts as bad unless chronyc / timedatectl measured it, it is
-    synchronised and its estimated error is small; persistent exchange timestamps from the
-    future prove the local clock behind. Bad samples block new orders like a large offset.
+  * Clock (live): a sample counts as bad unless chronyc / timedatectl measured it (macOS: a
+    query-only ``sntp`` answer) and it is synchronised, and its estimated error is small;
+    persistent exchange timestamps from the future prove the local clock behind. Bad samples
+    block new orders like a large offset.
+  * Exchange pauses (live): GET /exchange/status every ``venue.exchange_status_interval_s``
+    (the entry of our shard in ``exchange_index_statuses``), the schedule's closures (GET
+    /exchange/schedule at start-up and hourly; quotes are pulled ``pause_lead_s`` before one)
+    and place rejects that say "paused": new orders blocked (gate ``exchange_pause``) and the
+    strategy told ``kalshi.reconcile`` stale (it cancels its quotes); once trading is active
+    again, fills / positions / resting orders are re-read before it resumes. During an
+    EXCHANGE pause cancels fail too: only ``cancel_order_on_pause`` protects resting orders.
+  * Collateral (live): the balance of every configured shard is re-read every
+    ``venue.balance_interval_s``; below the requirement (worst-case total loss + margin) new
+    orders are blocked (gate ``balance``) until it recovers.
   * Background loops are supervised: one that dies stops the runner (exit 4).
   * Global CancelAll: with a Halt in the same cycle -> DELETE /portfolio/events/orders (then
     new orders are held ``cancel_all_hold_s``: Kalshi may cancel orders placed during the
     minute after a cancel-all); without one -> the OrderManager's working orders are
     cancelled in batches and every other resting order found on REST is swept (no
-    one-minute tail).
-  * Kill file: checked every ``kill_check_interval_s`` on the consumer loop -> cancel all
-    (REST) and stop.
+    one-minute tail). Every terminal kill (kill file, manual Halt, fee mismatch, the
+    watchdog's cancel-all about this runner, shutdown) first TRIGGERS the order group(s)
+    (``KalshiVenue.latch_kill``: scoped to this runner's quotes on each shard, no trailing
+    tail), then sends the subaccount's cancel-all.
+  * Kill file: checked every ``kill_check_interval_s`` on the consumer loop -> group trigger,
+    cancel all (REST) and stop.
   * Heartbeat file every ``heartbeat_interval_s`` while the consumer is alive (watchdog);
     'stopping' only for ``shutdown_timeout_s`` (a hung shutdown goes stale).
   * Risk state (day P&L split into realized and mark, halt with its scope and UTC day, pause,
@@ -90,6 +108,8 @@ import dataclasses
 import json
 import logging
 import os
+import re
+import sys
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
@@ -140,7 +160,7 @@ from dh.live.config import LiveConfig
 from dh.live.monitor import JsonLog, KillFile, Metrics, MetricsServer, write_heartbeat
 from dh.live.pump import EventPump, OrderingError
 from dh.live.riskstate import CARRIED, RiskBook, day_start, payout_px
-from dh.live.startup import spec_to_dict
+from dh.live.startup import closure_at, spec_to_dict
 
 log = logging.getLogger("dh.live.runner")
 
@@ -160,7 +180,49 @@ OWN_TYPES = (KalshiFill, KalshiOrderUpdate, KalshiPositionSnapshot)
 DAY_NS = 86_400 * NS_PER_S
 # LoopCfg().baseline_cap_ms() (clock_block_ms 250 + 100): a LagMeter built without a cap uses it
 DEFAULT_BASELINE_CAP_NS = 350 * NS_PER_MS
-CLOCK_SOURCES = ("chronyc", "timedatectl")  # samples from anything else cannot measure the offset
+CLOCK_SOURCES = ("chronyc", "timedatectl")  # samples from anything else cannot measure the offset (Linux)
+# macOS has no chronyd: a query-only SNTP exchange (dh.store.recorder._sntp) measures the
+# offset; "synchronised" there means sntp answered with an error bound within the limit
+DARWIN_CLOCK_SOURCES = (*CLOCK_SOURCES, "sntp")
+PAUSE_STREAM_REASON = "exchange_pause"  # reconcile reason + gate reason of an exchange/trading pause
+# place-reject reasons that mean trading is paused (Kalshi's codes are undocumented; never
+# 'market_inactive' / 'market_closed', which follow a market's own close)
+_PAUSE_REJECT = re.compile(r"paus|exchange[_ ](is[_ ])?(closed|inactive|unavailable|not[_ ]active)"
+                           r"|trading[_ ](is[_ ])?(closed|inactive|halted|unavailable|not[_ ]active)|outside[_ ]trading[_ ]hours")
+
+
+def trusted_clock_sources(platform: str | None = None) -> tuple[str, ...]:
+    """Clock-sample sources the live clock gate trusts on ``platform`` (default: this host)."""
+    return DARWIN_CLOCK_SOURCES if (platform or sys.platform) == "darwin" else CLOCK_SOURCES
+
+
+def is_pause_reject(reason: str) -> bool:
+    """An order reject whose reason says the exchange / trading is paused (not a gate reject)."""
+    r = (reason or "").lower()
+    return not r.startswith("gate:") and bool(_PAUSE_REJECT.search(r))
+
+
+def own_subaccount_ok(ev: Any, subaccount: int, *, key_restricted: bool = False) -> bool:
+    """Live inbound rule (shared with dh.live.replay): an own-activity event (fill, order
+    update, position) is ours when its subaccount is. With a key restricted to our non-primary
+    subaccount Kalshi scopes the private channels server-side, so a message WITHOUT the optional
+    subaccount field (normalized to 0) is ours too; an explicit other number never is."""
+    sa = int(getattr(ev, "subaccount", 0) or 0)
+    return sa == subaccount or (key_restricted and subaccount != 0 and sa == 0)
+
+
+def own_series_ok(ev: Any, series: Iterable[str]) -> bool:
+    """Live inbound rule (shared with dh.live.replay): an own-activity event of a market outside
+    the configured series (a manual trade on the subaccount, say) never reaches the strategy
+    (empty ``series`` = no filter)."""
+    ser = tuple(series)
+    tk = str(getattr(ev, "ticker", "") or "")
+    return not ser or not tk or tk.split("-", 1)[0] in ser
+
+
+def own_event_ok(ev: Any, subaccount: int, *, key_restricted: bool = False, series: Iterable[str] = ()) -> bool:
+    """Both live inbound rules for own-activity events (subaccount, then series)."""
+    return own_subaccount_ok(ev, subaccount, key_restricted=key_restricted) and own_series_ok(ev, series)
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +451,23 @@ class LiveRunner:
         self.started_ns = int(started_ns) if started_ns is not None else self._clock()
         self._clock_sampler = clock_sampler
         self.subaccount = int(getattr(self.venue, "sub", 0) or 0) if self.venue is not None else 0
+        self.key_restricted = bool(self.cfg.venue.key_restricted_to_subaccount)
+        self.platform = sys.platform  # the clock gate's trusted sources depend on it (tests override)
+        # exchange pauses: reason -> detail ('status', 'schedule', 'reject'); closures from the schedule
+        self._pause: dict[str, str] = {}
+        self._pause_gen = 0
+        self._pause_since = 0
+        self._pause_reject_until = 0
+        self._last_status: dict[str, Any] = {}
+        self.closures: list[tuple[int, int, str]] = []
+        # collateral: the per-shard balance must cover this (set by the app: worst case + margin)
+        self.balance_required_usd = 0.0
+        self.balances: dict[int, float] = {}
+        self._last_ws_fill_exch_ns = 0  # exchange time of the latest fill delivered by the WebSocket
+        self._verified: dict[str, bool] = {}  # one-time verify_live checks already logged
+        self._clock_alarm_logged = 0.0  # monotonic s of the last clock-alarm warning (rate-limited)
+        if self.venue is not None and hasattr(self.venue, "register_markets"):
+            self.venue.register_markets(self.universe.values())
         self.period_ns = int(period_ns)
         self.pump = EventPump(strategy, self.period_ns, sim=self.sim, on_actions=self._on_actions,
                               on_delivered=self._on_delivered)
@@ -419,6 +498,7 @@ class LiveRunner:
         self._pos_suspect: dict[str, tuple[int, int]] = {}  # ticker -> (exchange - ours, first seen ns)
         self._positions_now = asyncio.Event()
         self._discover_now = asyncio.Event()
+        self._status_now = asyncio.Event()  # poll GET /exchange/status now (a pause-like reject)
         self._fee_acc: dict[str, Any] = {}  # order id -> OrderFeeAccumulator
         self._fee_eff: dict[str, tuple[str, float]] = {}  # ticker -> fee override in force
         self.fills_seen = SeenIds()
@@ -476,8 +556,11 @@ class LiveRunner:
         else:
             self._last_push_ts = ev.ts
         if self.mode == "live":
-            if isinstance(ev, OWN_TYPES) and getattr(ev, "subaccount", 0) != self.subaccount:
+            if isinstance(ev, OWN_TYPES) and not own_subaccount_ok(ev, self.subaccount, key_restricted=self.key_restricted):
                 self.metrics.inc("dh_foreign_subaccount_events_total", type=type(ev).__name__)
+                return
+            if isinstance(ev, OWN_TYPES) and not own_series_ok(ev, self.series):
+                self.metrics.inc("dh_foreign_series_events_total", type=type(ev).__name__)
                 return
             if isinstance(ev, KalshiOrderGroupUpdate):
                 tr = self._translate_group(ev)
@@ -618,6 +701,8 @@ class LiveRunner:
             self.metrics.inc("dh_duplicate_fills_dropped_total")
             self.jlog("fill_duplicate_dropped", ev.ts, ticker=ev.ticker, trade_id=ev.trade_id, order_id=ev.order_id)
             return
+        if live and isinstance(ev, KalshiFill):  # a WebSocket fill (back-filled ones are injected)
+            self._last_ws_fill_exch_ns = max(self._last_ws_fill_exch_ns, int(ev.ts_exch or ev.ts))
         self._last_event_ts = ev.ts
         max_lag = self.cfg.loop.max_lag_s
         lag_after: str = ""
@@ -740,6 +825,9 @@ class LiveRunner:
             self._on_excluded_settlement(ev.ts, ev.ticker, int(ev.settlement_px), "determined")
         elif isinstance(ev, RiskStateSeed):
             self.riskbook.note_seed(ev)
+        elif isinstance(ev, OrderReject) and self.mode == "live" and ev.request in ("create", "amend") \
+                and is_pause_reject(ev.reason):
+            self._pause_reject(ev.ts, ev.ticker, ev.reason)
 
     def _on_excluded_settlement(self, ts: int, ticker: str, payout: int, how: str) -> None:
         """A market of an event excluded from this session (a position held at start-up) was
@@ -928,6 +1016,8 @@ class LiveRunner:
                     if not halts:
                         soft.append(a)
                         continue
+                    if all(not h.until_ts for h in halts):  # a manual halt: this session never quotes again
+                        self._latch_kill(f"halt:{halts[0].reason}")
                     self._note_global_cancel_all(ts)
                 elif isinstance(a, (PlaceOrder, AmendOrder)):
                     why = self.gate.check(a.ticker)
@@ -1131,7 +1221,7 @@ class LiveRunner:
             try:
                 t_fetch = self._clock()
                 rows = await v.fetch_fills(since_ns // NS_PER_S - int(vc.fills_backfill_margin_s))
-                pos = await v.fetch_positions()
+                pos, as_of = await self._read_positions()
                 resting = await v.resting_orders()
             except asyncio.CancelledError:
                 raise
@@ -1148,7 +1238,7 @@ class LiveRunner:
                       resting=len(resting))
             self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": "reconnect",
                                      "since_ns": since_ns - int(vc.fills_backfill_margin_s) * NS_PER_S})
-            self.push_side("positions", pos)
+            self._push_positions(pos, as_of)
             self.push_side("resting_all", resting)
             self.push_side("reconcile_done", {"gen": gen, "reason": "ws_reconnect", "round": 0})
             return
@@ -1164,25 +1254,40 @@ class LiveRunner:
         vc = self.cfg.venue
         return t // NS_PER_S - int(vc.fills_backfill_margin_s + max(0.0, vc.positions_interval_s))
 
-    async def _fills_then_positions(self) -> dict[str, int]:
+    async def _read_positions(self) -> tuple[dict[str, int], int | None]:
+        """(positions, Kalshi's user-data timestamp read just before them, or None)."""
+        v = self.venue
+        checked = getattr(v, "fetch_positions_checked", None)
+        if checked is None:
+            return await v.fetch_positions(), None
+        return await checked()
+
+    def _push_positions(self, pos: dict[str, int], as_of_ns: int | None) -> None:
+        if as_of_ns is None:
+            self.push_side("positions", pos)
+        else:
+            self.push_side("positions_checked", {"positions": pos, "as_of_ns": int(as_of_ns)})
+
+    async def _fills_then_positions(self) -> tuple[dict[str, int], int | None]:
         """A CONFIRMING positions read (review N4): GET /portfolio/fills since the earliest
         suspect (no minimum age) is queued BEFORE the positions, so a fill the WebSocket lost is
-        back-filled before any difference can be confirmed."""
+        back-filled before any difference can be confirmed; the positions come with Kalshi's
+        user-data timestamp (finding 12)."""
         v = self.venue
         t_fetch = self._clock()
         since_s = self._suspect_fills_since_s()
         rows = await v.fetch_fills(since_s)
-        pos = await v.fetch_positions()
+        pos, as_of = await self._read_positions()
         self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "since_ns": since_s * NS_PER_S,
                                  "why": "position_check"})
-        return pos
+        return pos, as_of
 
     async def _confirm_positions(self, gen: int, rnd: int) -> None:
         await asyncio.sleep(max(0.0, self.cfg.venue.position_confirm_s))
         attempt = 0
         while not self._stopping and gen == self._recon_gen:
             try:
-                pos = await self._fills_then_positions()
+                pos, as_of = await self._fills_then_positions()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1190,7 +1295,7 @@ class LiveRunner:
                 self.jlog("reconcile_error", self._clock(), what="positions", error=f"{type(exc).__name__}: {exc}"[:300])
                 await asyncio.sleep(min(self.cfg.venue.reconcile_retry_max_s, 0.5 * 2 ** min(attempt, 8)))
                 continue
-            self.push_side("positions", pos)
+            self._push_positions(pos, as_of)
             self.push_side("reconcile_done", {"gen": gen, "reason": "ws_reconnect", "round": rnd})
             return
 
@@ -1203,6 +1308,189 @@ class LiveRunner:
             return
         self._ws_down_since = 0
         self._recon_end(str(d.get("reason", "ws_reconnect")), ts)
+
+    # ================================================================== exchange pauses / collateral
+    def verify_live(self, check: str, ok: bool, /, **info: Any) -> None:
+        """A one-time live verification of something the Kalshi docs leave open (e.g. whether a
+        restricted key's WS fills carry ``subaccount``, whether queue_positions covers shard 2):
+        logged ONCE per session (``verify_live`` log line and meta record) and kept as the
+        metric ``dh_verify_live{check}`` (1 = as expected / 0 = not)."""
+        self.metrics.set("dh_verify_live", 1.0 if ok else 0.0, check=check)
+        if check in self._verified:
+            return
+        self._verified[check] = ok
+        (log.warning if ok else log.error)("verify_live %s: %s %s", check, "OK" if ok else "UNEXPECTED", info)
+        ts = self._clock()
+        self.jlog("verify_live", ts, check=check, ok=ok, **info)
+        self.meta("verify_live", ts, check=check, ok=ok, **info)
+
+    def _on_exchange_status(self, ts: int, p: dict[str, Any]) -> None:
+        """A GET /exchange/status poll, already reduced to our shards (startup.shard_status)."""
+        st = dict(p.get("status") or {})
+        self._last_status = st
+        ex, tr = bool(st.get("exchange_active")), bool(st.get("trading_active"))
+        self.metrics.set("dh_exchange_active", 1.0 if ex else 0.0)
+        self.metrics.set("dh_trading_active", 1.0 if tr else 0.0)
+        if ex and tr:
+            self._pause.pop("status", None)
+        else:
+            detail = f"{'exchange' if not ex else 'trading'} pause on shard(s) {st.get('shards')}"
+            if self._pause.get("status") != detail:
+                if not ex:
+                    log.critical("EXCHANGE PAUSE (%s): cancels are rejected too, resting orders rely on "
+                                 "cancel_order_on_pause (estimated resume %s)", detail,
+                                 st.get("exchange_estimated_resume_time"))
+                else:
+                    log.warning("TRADING PAUSE (%s): new orders blocked, cancels still work", detail)
+                self.jlog("exchange_status", ts, exchange_active=ex, trading_active=tr, shards=st.get("shards"),
+                          source=st.get("source"), resume=st.get("exchange_estimated_resume_time"))
+            self._pause["status"] = detail
+        self._pause_eval(ts)
+
+    def _on_exchange_schedule(self, ts: int, p: dict[str, Any]) -> None:
+        """Scheduled closures (startup.schedule_closures of GET /exchange/schedule)."""
+        self.closures = sorted((int(a), int(b), str(w)) for a, b, w in (p.get("closures") or []))
+        nxt = next((c for c in self.closures if c[1] > ts), None)
+        self.jlog("exchange_schedule", ts, closures=len(self.closures), next_closure=nxt, notes=p.get("notes") or [])
+        self.metrics.set("dh_next_closure_ts", nxt[0] / NS_PER_S if nxt else 0.0)
+        if nxt:
+            log.info("next scheduled trading closure: %s .. %s (%s), quotes pulled %.0f s before",
+                     time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(nxt[0] // NS_PER_S)),
+                     time.strftime("%H:%M:%SZ", time.gmtime(nxt[1] // NS_PER_S)), nxt[2], self.cfg.venue.pause_lead_s)
+        self._pause_eval(ts)
+
+    def _pause_reject(self, ts: int, ticker: str, reason: str) -> None:
+        """A place / amend rejected because trading is paused: block new orders at once, poll the
+        exchange status now, and hold the pause at least ``pause_reject_hold_s`` (the strategy is
+        told in queue order, after this reject)."""
+        hold = int(self.cfg.venue.pause_reject_hold_s * NS_PER_S)
+        self._pause_reject_until = max(self._pause_reject_until, ts + hold)
+        self.metrics.inc("dh_pause_rejects_total")
+        self.jlog("pause_reject", ts, ticker=ticker, reason=reason[:200], hold_until=self._pause_reject_until)
+        if self.gate.close(PAUSE_STREAM_REASON, ts):
+            self.jlog("gate", ts, action="close", reason=PAUSE_STREAM_REASON, why=f"place rejected: {reason[:120]}")
+        self._status_now.set()
+        self.push_side("call", self._pause_eval)
+
+    def _pause_eval(self, ts: int) -> None:
+        """Combine the pause sources (status poll, schedule, place rejects) into the gate and the
+        strategy's ``kalshi.reconcile`` state."""
+        if self.mode != "live":
+            return
+        lead = int(self.cfg.venue.pause_lead_s * NS_PER_S)
+        c = closure_at(self.closures, ts, lead)
+        if c is not None and c[2] != "maintenance" and ts >= c[0] + max(lead, 60 * NS_PER_S):
+            # a closure read from the ET session times of standard_hours pulls the quotes AHEAD of
+            # it; once it has begun the status poll (authoritative, every 10 s) decides, so a
+            # misread schedule can cost minutes of quoting, never hours
+            c = None
+        if c is not None:
+            self._pause["schedule"] = f"scheduled {c[2]} closure {c[0]}..{c[1]}"
+        else:
+            self._pause.pop("schedule", None)
+        if ts < self._pause_reject_until:
+            self._pause["reject"] = "an order was rejected for a pause"
+        else:
+            self._pause.pop("reject", None)
+        if self._pause:
+            self._pause_begin(ts)
+        elif self._pause_since:
+            self._pause_end(ts)
+        elif self.gate.open(PAUSE_STREAM_REASON):  # closed by a reject the poll did not confirm
+            self.jlog("gate", ts, action="open", reason=PAUSE_STREAM_REASON, note="not confirmed")
+
+    def _pause_begin(self, ts: int) -> None:
+        detail = "; ".join(f"{k}: {v}" for k, v in sorted(self._pause.items()))
+        if not self._pause_since:
+            self._pause_since = ts
+            self._pause_gen += 1
+            self.metrics.set("dh_exchange_paused", 1.0)
+            self.metrics.inc("dh_exchange_pauses_total")
+            log.warning("exchange pause (%s): new orders blocked, the strategy pulls its quotes", detail)
+            self.jlog("exchange_pause", ts, action="begin", detail=detail)
+            self.meta("exchange_pause", ts, action="begin", detail=detail)
+        if self.gate.close(PAUSE_STREAM_REASON, ts):
+            self.jlog("gate", ts, action="close", reason=PAUSE_STREAM_REASON, why=detail)
+        self._recon_begin(PAUSE_STREAM_REASON, ts)
+
+    def _pause_end(self, ts: int) -> None:
+        """Trading is active again: new orders may go out once fills, positions and resting orders
+        were re-read (orders cancelled on the pause, fills around it)."""
+        since, self._pause_since = self._pause_since, 0
+        gen = self._pause_gen
+        self.gate.open(PAUSE_STREAM_REASON)
+        self.metrics.set("dh_exchange_paused", 0.0)
+        log.warning("exchange pause over after %.0f s: reconciling before quoting", (ts - since) / NS_PER_S)
+        self.jlog("exchange_pause", ts, action="end", paused_s=round((ts - since) / NS_PER_S, 3))
+        self.jlog("gate", ts, action="open", reason=PAUSE_STREAM_REASON)
+        self.meta("exchange_pause", ts, action="end")
+        if self.venue is None:
+            self._recon_end(PAUSE_STREAM_REASON, ts)
+            return
+        self._spawn(self._pause_end_reconcile(gen, since), "pause_reconcile")
+
+    async def _pause_end_reconcile(self, gen: int, since_ns: int) -> None:
+        v = self.venue
+        vc = self.cfg.venue
+        attempt = 0
+        while not self._stopping and gen == self._pause_gen and not self._pause_since:
+            try:
+                t_fetch = self._clock()
+                since_s = since_ns // NS_PER_S - int(vc.fills_backfill_margin_s)
+                rows = await v.fetch_fills(since_s)
+                pos, as_of = await self._read_positions()
+                resting = await v.resting_orders()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep trying (quoting stays off)
+                attempt += 1
+                self.metrics.inc("dh_reconcile_errors_total", kind="pause_end")
+                self.jlog("reconcile_error", self._clock(), what="pause_end", attempt=attempt,
+                          error=f"{type(exc).__name__}: {exc}"[:300])
+                await asyncio.sleep(min(vc.reconcile_retry_max_s, 0.5 * 2 ** min(attempt, 8)))
+                continue
+            if gen != self._pause_gen or self._pause_since:
+                return
+            self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": "pause_end", "since_ns": since_s * NS_PER_S})
+            self._push_positions(pos, as_of)
+            self.push_side("resting_all", resting)
+            self.push_side("call", lambda ts, g=gen: self._pause_reconciled(ts, g))
+            return
+
+    def _pause_reconciled(self, ts: int, gen: int) -> None:
+        if gen == self._pause_gen and not self._pause_since:
+            self._recon_end(PAUSE_STREAM_REASON, ts)
+
+    def _on_balance(self, ts: int, p: dict[str, Any]) -> None:
+        """Per-shard funds re-read (``KalshiVenue.fetch_shard_funds``: available balance + our
+        positions at cost + our resting orders' collateral, so our own quoting never looks like
+        a defunded shard): below ``balance_required_usd`` (or unreadable) -> new orders blocked
+        (gate 'balance') until a read shows it covered again. ``dh_balance_dollars`` is the
+        available balance, ``dh_shard_funds_dollars`` the funds compared."""
+        need = float(self.balance_required_usd)
+        self.metrics.set("dh_balance_required_dollars", need)
+        low: list[str] = []
+        got = {int(k): v for k, v in (p.get("balances") or {}).items()}  # shard -> funds (None: unreadable)
+        avail = {int(k): v for k, v in (p.get("available") or {}).items()}
+        for sh, usd in sorted(got.items()):
+            a = avail.get(sh, usd)
+            if a is not None:
+                self.metrics.set("dh_balance_dollars", float(a), exchange_index=str(sh))
+            if usd is None:
+                low.append(f"shard {sh}: balance unreadable")
+                continue
+            self.balances[sh] = float(usd)
+            self.metrics.set("dh_shard_funds_dollars", float(usd), exchange_index=str(sh))
+            if need > 0 and float(usd) < need:
+                low.append(f"shard {sh}: ${float(usd):.2f} < ${need:.2f}")
+        if low:
+            if self.gate.close("balance", ts):
+                log.error("BALANCE below the requirement (%s): new orders blocked", "; ".join(low))
+                self.jlog("gate", ts, action="close", reason="balance", why=low, required_usd=need)
+                self.meta("gate", ts, action="close", reason="balance", why=low)
+        elif got and self.gate.open("balance"):
+            self.jlog("gate", ts, action="open", reason="balance", balances={str(k): v for k, v in self.balances.items()},
+                      required_usd=need)
 
     # ================================================================== side channel
     def _on_side(self, item: Side) -> None:
@@ -1218,6 +1506,15 @@ class LiveRunner:
                 self._block([t], f"spec_changed:{why}", item.ts)
         elif k == "positions":
             self._check_positions(item.ts, dict(item.payload or {}))
+        elif k == "positions_checked":  # {"positions", "as_of_ns"}: a read preceded by the user-data timestamp
+            p = item.payload or {}
+            self._check_positions(item.ts, dict(p.get("positions") or {}), as_of_ns=p.get("as_of_ns"))
+        elif k == "exchange_status":
+            self._on_exchange_status(item.ts, dict(item.payload or {}))
+        elif k == "exchange_schedule":
+            self._on_exchange_schedule(item.ts, dict(item.payload or {}))
+        elif k == "balance":
+            self._on_balance(item.ts, dict(item.payload or {}))
         elif k == "positions_ws":
             self._check_positions(item.ts, dict(item.payload or {}), partial=True)
         elif k == "fills":
@@ -1275,6 +1572,14 @@ class LiveRunner:
             self.universe[s.ticker] = s
             if self.sim is not None:
                 self.sim.register_market(s)
+        v = self.venue
+        if v is not None and hasattr(v, "register_markets"):
+            before = set(v.shards_in_use())
+            new_shards = sorted(set(v.register_markets(new_specs)) - before)
+            for sh in new_shards:  # a market on a shard without our group: create it (places wait)
+                for logical, limit in sorted(v.group_limits.items()):
+                    self.jlog("order_group_new_shard", ts, logical=logical, exchange_index=sh)
+                    self._spawn(v.ensure_order_group(logical, limit, exchange_index=sh), "order_group")
         if self.paper_fees is not None:
             self.paper_fees.add_specs(new_specs)
         if not new_specs:
@@ -1317,16 +1622,22 @@ class LiveRunner:
         back = int(max(0.0, self.cfg.venue.positions_interval_s) * NS_PER_S)
         return fetched >= first_seen and since <= first_seen - back
 
-    def _check_positions(self, ts: int, exch: dict[str, int], *, partial: bool = False) -> None:
+    def _check_positions(self, ts: int, exch: dict[str, int], *, partial: bool = False,
+                         as_of_ns: int | None = None) -> None:
         """Compare exchange positions with the strategy's fill-derived positions for markets
         still trading. A DISCREPANCY (exchange - ours) must persist unchanged for
         ``position_confirm_s`` (a fill may be in flight on the WebSocket) AND a REST fills read
         started after it was first seen must have been processed (a fill the WebSocket lost is
-        back-filled by it) before a KalshiPositionSnapshot is fed, which makes the strategy's
-        OrderManager flag it (-> Halt(all)); new fills that move both sides keep the clock
-        running. ``partial``: ``exch`` holds only the markets it names (a WS market_position
-        message): it can raise or clear a suspicion, never confirm one (the positions loop runs
-        a confirming read at once)."""
+        back-filled by it) AND, when the read carries Kalshi's user-data timestamp
+        (``as_of_ns``, GET /exchange/user_data_timestamp read before the positions), the REST
+        portfolio data must be at least as recent as the last WebSocket fill (finding 12: REST
+        reads lag the exchange) before a KalshiPositionSnapshot is fed, which makes the
+        strategy's OrderManager flag it (-> Halt(all)); new fills that move both sides keep the
+        clock running. ``partial``: ``exch`` holds only the markets it names (a WS
+        market_position message): it can raise or clear a suspicion, never confirm one (the
+        positions loop runs a confirming read at once)."""
+        stale_read = (not partial and as_of_ns is not None and int(as_of_ns) > 0
+                      and int(as_of_ns) < self._last_ws_fill_exch_ns)
         settled = getattr(self.strategy, "settled", {}) or {}
         src = "ws_checked" if partial else "rest"
         ours_nonzero = set() if partial else {t for t in self.universe if self._position_of(t)}
@@ -1350,6 +1661,13 @@ class LiveRunner:
                 self._positions_now.set()  # confirm soon (fills first, then positions)
             elif ts - s[1] >= confirm_ns and (partial or not self._fills_cover(s[1])):
                 self._positions_now.set()  # old enough, but not yet checked against a fills read
+            elif ts - s[1] >= confirm_ns and stale_read:
+                # Kalshi's portfolio data predates the last WebSocket fill: this snapshot may simply
+                # not include it yet -> read again soon instead of halting on it
+                self.metrics.inc("dh_position_reads_stale_total")
+                self.jlog("position_confirm_deferred", ts, ticker=t, exchange=ex, ours=ours, as_of_ns=int(as_of_ns or 0),
+                          last_ws_fill_ns=self._last_ws_fill_exch_ns)
+                self._positions_now.set()
             elif ts - s[1] >= confirm_ns:
                 self._pos_suspect.pop(t, None)
                 self.metrics.inc("dh_position_mismatches_total")
@@ -1459,6 +1777,10 @@ class LiveRunner:
                 continue
             if not row_in_subaccount(row, self.subaccount):
                 self.metrics.inc("dh_foreign_subaccount_events_total", type="RestFill")
+                continue
+            tk = str(row.get("ticker") or row.get("market_ticker") or "")
+            if self.series and tk and tk.split("-", 1)[0] not in self.series:
+                self.metrics.inc("dh_foreign_series_events_total", type="RestFill")
                 continue
             try:
                 ev = rest_fill_to_event(row, ts)
@@ -1653,8 +1975,20 @@ class LiveRunner:
         self._cancel_all_async(f"kill:{reason}")
         self.request_stop(f"kill file: {reason}", code=0)
 
+    def _latch_kill(self, reason: str) -> None:
+        """First, fastest scoped kill step: trigger this session's order group(s) (the venue
+        then refuses to create or reset one). Only for TERMINAL stops of quoting."""
+        latch = getattr(self.venue, "latch_kill", None)
+        if latch is not None and not getattr(self.venue, "kill_latched", ""):
+            self.jlog("kill_switch", self._clock(), reason=reason, groups=self.venue.group_refs())
+            latch(reason)
+            self._dispatched = True
+
     def _cancel_all_async(self, reason: str) -> None:
+        """Terminal cancel-all (kill file, fee mismatch, the watchdog's trigger about this
+        runner): order-group trigger first, then the subaccount's REST cancel-all."""
         if self.venue is not None:
+            self._latch_kill(reason)
             self._note_global_cancel_all(self._clock())
             self.venue.submit([CancelAll(reason=reason)], self._clock())
             self._dispatched = True
@@ -1736,7 +2070,11 @@ class LiveRunner:
     def _heartbeat_payload(self, state: str) -> dict[str, Any]:
         d = {"pid": os.getpid(), "mode": self.mode, "state": state, "session": self.session_id,
              "queue": self.queue.qsize(), "lag_s": round(self._lag_s, 3), "last_event_ts": self._last_event_ts,
-             "gate": sorted(self.gate.reasons), "shutdown_timeout_s": self.cfg.loop.shutdown_timeout_s}
+             "gate": sorted(self.gate.reasons), "shutdown_timeout_s": self.cfg.loop.shutdown_timeout_s,
+             "subaccount": self.subaccount}
+        refs = getattr(self.venue, "group_refs", None)
+        if callable(refs):  # the watchdog triggers these first (scoped kill), then cancels all
+            d["order_groups"] = refs()
         if self._stopping:
             d["stopping_for_s"] = round(self._mono() - self._stopping_since, 3)
         return d
@@ -1785,8 +2123,8 @@ class LiveRunner:
                 return
             try:
                 # a read that may confirm a difference is preceded by a fills read (review N4)
-                pos = await self._fills_then_positions() if self._pos_suspect else await v.fetch_positions()
-                self.push_side("positions", pos)
+                pos, as_of = await self._fills_then_positions() if self._pos_suspect else await self._read_positions()
+                self._push_positions(pos, as_of)
                 if self.cfg.venue.ghost_sweep:
                     self.push_side("resting", await v.resting_orders())
             except asyncio.CancelledError:
@@ -1821,6 +2159,72 @@ class LiveRunner:
             if rows:
                 self.push_side("fills_periodic", rows)
 
+    async def _exchange_loop(self) -> None:
+        """GET /exchange/status every ``exchange_status_interval_s`` (at once after a pause-like
+        reject) and GET /exchange/schedule every ``exchange_schedule_interval_s``; results go
+        through the queue (``_on_exchange_status`` / ``_on_exchange_schedule``)."""
+        from dh.live.startup import schedule_closures, shard_status
+
+        v = self.venue
+        vc = self.cfg.venue
+        iv = vc.exchange_status_interval_s
+        if v is None or iv <= 0:
+            return
+        rest = v.rest
+        sched_iv = float(vc.exchange_schedule_interval_s)
+        next_sched = self._mono() + sched_iv if sched_iv > 0 else float("inf")  # the app read it at start-up
+        while not self._stopping:
+            try:
+                await asyncio.wait_for(self._status_now.wait(), timeout=iv)
+            except TimeoutError:
+                pass
+            self._status_now.clear()
+            if self._stopping:
+                return
+            try:
+                body = await rest.get_exchange_status()
+                self.push_side("exchange_status", {"status": shard_status(body, vc.exchange_indexes)})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - an exchange pause can fail reads too: keep polling
+                self.metrics.inc("dh_exchange_status_errors_total")
+                self.jlog("exchange_status_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300])
+            if self._mono() >= next_sched:
+                next_sched = self._mono() + sched_iv
+                try:
+                    body = await rest.get_exchange_schedule()
+                    now = self._clock()
+                    closures, notes = schedule_closures(body, now - DAY_NS, now + 8 * DAY_NS)
+                    self.push_side("exchange_schedule", {"closures": closures, "notes": notes})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.metrics.inc("dh_exchange_schedule_errors_total")
+                    self.jlog("exchange_schedule_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300])
+
+    async def _balance_loop(self) -> None:
+        """The funds of every configured shard (``KalshiVenue.fetch_shard_funds``: balance,
+        positions at cost, resting-order collateral, all with subaccount and exchange_index)
+        every ``balance_interval_s`` -> ``_on_balance`` (a failed read changes nothing)."""
+        v = self.venue
+        iv = self.cfg.venue.balance_interval_s
+        if v is None or iv <= 0:
+            return
+        while not self._stopping:
+            await asyncio.sleep(iv)
+            if self._stopping:
+                return
+            try:
+                funds = await v.fetch_shard_funds()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.metrics.inc("dh_balance_errors_total")
+                self.jlog("balance_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300])
+                continue
+            self.push_side("balance", {"balances": {sh: f["funds"] for sh, f in funds.items()},
+                                       "available": {sh: f["available"] for sh, f in funds.items()}})
+
     async def _risk_state_loop(self) -> None:
         iv = self.cfg.loop.risk_state_interval_s
         if self.risk_store is None or iv <= 0:
@@ -1844,6 +2248,7 @@ class LiveRunner:
             if not v.read_budget_ok(("/portfolio/orders/queue_positions",)):
                 self.metrics.inc("dh_polls_skipped_total", poll="queue_positions")
                 continue
+            t_fetch = self._clock()
             try:
                 rows = await v.fetch_queue_positions(tickers)
             except asyncio.CancelledError:
@@ -1852,8 +2257,30 @@ class LiveRunner:
                 self.metrics.inc("dh_reconcile_errors_total", kind="queue_positions")
                 self.jlog("reconcile_error", self._clock(), what="queue_positions", error=f"{type(exc).__name__}: {exc}"[:300])
                 continue
+            self._queue_coverage(tickers, rows, t_fetch)
             if rows:
                 self.push_side("queue_positions", rows)
+
+    def _queue_coverage(self, tickers: list[str], rows: list[tuple[str, str, int]], t_fetch: int) -> None:
+        """Finding 13: GET /portfolio/orders/queue_positions has no exchange_index parameter and
+        the docs do not say whether it covers shard-2 orders. Measure it: the share of our resting
+        orders (older than 1 s at the read) that came back (``dh_queue_positions_coverage``), and
+        one ``verify_live`` line the first time there were any."""
+        om = getattr(self.strategy, "om", None)
+        if om is None:
+            return
+        ts = set(tickers)
+        expected = {w.order_id for w in om.working() if w.order_id and w.state.name == "RESTING" and w.ticker in ts
+                    and int(getattr(w, "created_ns", 0) or 0) < t_fetch - NS_PER_S}
+        if not expected:
+            return
+        got = {oid for oid, _t, _q in rows}
+        cov = len(expected & got) / len(expected)
+        self.metrics.set("dh_queue_positions_coverage", cov)
+        shard_of = getattr(self.venue, "shard_of", {}) or {}
+        shards = sorted({shard_of[t] for t in ts if t in shard_of})
+        self.verify_live("queue_positions_covers_shard", cov > 0, resting=len(expected), returned=len(expected & got),
+                         exchange_indexes=shards, subaccount=self.subaccount)
 
     def clock_offset_s(self, chrony_offset_s: float | None) -> float:
         """Offset of the receive clock from true time: the anchored clock's drift from the
@@ -1873,7 +2300,10 @@ class LiveRunner:
         ms = abs(eff_s) * 1000
         if ms > lc.clock_alarm_ms:
             self.metrics.inc("dh_clock_alarms_total")
-            log.warning("clock offset %.1f ms > %.1f ms", eff_s * 1000, lc.clock_alarm_ms)
+            mono = self._mono()
+            if mono - self._clock_alarm_logged >= 60.0:  # a steady offset (macOS: ~35-50 ms) must not flood the log
+                self._clock_alarm_logged = mono
+                log.warning("clock offset %.1f ms > %.1f ms", eff_s * 1000, lc.clock_alarm_ms)
         off_ms = round(eff_s * 1000, 3)
         if ms > lc.clock_block_ms or problem:
             self._clock_bad += 1
@@ -1893,18 +2323,31 @@ class LiveRunner:
     def clock_sample_problem(self, rec: dict[str, Any]) -> str:
         """Why a clock sample cannot vouch for the clock in LIVE mode ('' = it can): it must
         come from chronyc or timedatectl, say synchronised, carry an offset and an estimated
-        error within loop.max_est_error_ms() (review N5: the gate must not fail open)."""
+        error within loop.max_est_error_ms() (review N5: the gate must not fail open).
+
+        macOS (no chronyd): a query-only ``sntp`` answer is trusted too; "synchronised" there
+        means sntp answered with an offset AND an error bound within the limit (sntp measures
+        the clock, it cannot tell whether the OS disciplines it; the offset gate still applies)."""
         if self.mode != "live":
             return ""
         src = str(rec.get("src") or "unknown")
-        if src not in CLOCK_SOURCES:
-            return f"unmeasurable (source {src}: neither chronyc nor timedatectl answered)"
+        trusted = trusted_clock_sources(self.platform)
+        if src not in trusted:
+            return f"unmeasurable (source {src}: none of {'/'.join(trusted)} answered)"
+        est = rec.get("est_error_s")
+        lim = self.cfg.loop.max_est_error_ms()
+        if src == "sntp":
+            if not isinstance(rec.get("offset_s"), (int, float)):
+                return "no offset from sntp"
+            if not isinstance(est, (int, float)):
+                return "not synchronised (sntp gave no error bound)"
+            if est * 1000 > lim:
+                return f"not synchronised: sntp error bound {est * 1000:.1f} ms > {lim:.0f} ms"
+            return ""
         if rec.get("synced") is not True:
             return f"not synchronised ({src})"
         if not isinstance(rec.get("offset_s"), (int, float)):
             return f"no offset from {src}"
-        est = rec.get("est_error_s")
-        lim = self.cfg.loop.max_est_error_ms()
         if isinstance(est, (int, float)) and est * 1000 > lim:
             return f"estimated error {est * 1000:.1f} ms > {lim:.0f} ms ({src})"
         return ""
@@ -1965,7 +2408,7 @@ class LiveRunner:
         m.set("dh_pump_timers", float(st.timers))
         m.set("dh_pump_sim_events", float(st.sim_events))
         m.set("dh_gate_closed", 1.0 if self.gate.closed else 0.0)
-        for r in ("lag", "reconciling", "cancel_all_hold", "clock"):
+        for r in ("lag", "reconciling", "cancel_all_hold", "clock", PAUSE_STREAM_REASON, "balance"):
             m.set("dh_gate_reason", 1.0 if r in self.gate.reasons else 0.0, reason=r)
         m.set("dh_blocked_markets", float(len(self.gate.tickers)))
         m.set("dh_universe_markets", float(len(self.universe)))
@@ -2016,7 +2459,9 @@ class LiveRunner:
                 "blocked_markets": len(self.gate.tickers), "universe": len(self.universe),
                 "fv_ready": bool(getattr(fv, "ready", False)) if fv is not None else None,
                 "reconciling": sorted(self._recon), "stuck_cancels": list(getattr(self.venue, "stuck_orders", []) or []),
-                "halts": [h.reason for h in self._halts], "stopping": self._stopping}
+                "halts": [h.reason for h in self._halts], "stopping": self._stopping,
+                "exchange_pause": dict(self._pause), "balances": {str(k): v for k, v in self.balances.items()},
+                "kill_latched": getattr(self.venue, "kill_latched", "") or ""}
 
     # ================================================================== lifecycle
     async def run(self, *, duration_s: float | None = None) -> int:
@@ -2040,6 +2485,9 @@ class LiveRunner:
             ("runner:queue_positions", v is not None and vc.queue_positions_interval_s > 0
              and getattr(self.strategy, "om", None) is not None, self._queue_positions_loop),
             ("runner:fills", v is not None and vc.fills_backfill_interval_s > 0, self._fills_loop),
+            ("runner:exchange", v is not None and vc.exchange_status_interval_s > 0, self._exchange_loop),
+            ("runner:balance", v is not None and vc.balance_interval_s > 0 and hasattr(v, "fetch_shard_funds"),
+             self._balance_loop),
         ]
         for name, enabled, fn in loops:
             if enabled:
@@ -2124,6 +2572,7 @@ class LiveRunner:
         if self.venue is not None:
             try:
                 await self.venue.wait_idle(tmo / 2)
+                self._latch_kill(f"shutdown:{reason}")  # group trigger first (no-op when already latched)
                 try:
                     left = await self.venue.cancel_all_verified(f"shutdown:{reason}", wait_s=tmo / 4)
                 except RuntimeError:  # the cancel-all itself failed: cancel what we can see
@@ -2236,5 +2685,7 @@ def _action_fields(a: Action) -> dict[str, Any]:
     return d
 
 
-__all__ = ["LAG_STREAM", "META_STREAM", "PAPER_STREAM", "RECONCILE_STREAM", "RESULT_STREAM", "LagMeter", "LiveRunner",
-           "OrderGate", "Result", "SeenIds", "Side", "Timer", "Wake", "effective_fee"]
+__all__ = ["CLOCK_SOURCES", "DARWIN_CLOCK_SOURCES", "LAG_STREAM", "META_STREAM", "PAPER_STREAM", "PAUSE_STREAM_REASON",
+           "RECONCILE_STREAM", "RESULT_STREAM", "LagMeter", "LiveRunner", "OrderGate", "Result", "SeenIds", "Side", "Timer",
+           "Wake", "effective_fee", "is_pause_reject", "own_event_ok", "own_series_ok", "own_subaccount_ok",
+           "trusted_clock_sources"]

@@ -455,7 +455,7 @@ async def test_hung_shutdown_lets_the_heartbeat_go_stale_and_the_watchdog_trigge
     await asyncio.sleep(0.6)  # > shutdown_timeout_s: no more 'stopping' beats
     h = read_heartbeat(hb)
     assert h["state"] == "stopping" and time.time_ns() - h["t"] > 0.3 * NS_PER_S
-    w = Watchdog(hb, rest_cancel_all(FakeRest()), WatchdogCfg(stale_s=0.25), arm_on_start=True)
+    w = Watchdog(hb, rest_cancel_all(FakeRest(), 0), WatchdogCfg(stale_s=0.25), arm_on_start=True)
     assert await w.step() == "TRIGGERED"
     rest.gate.set()
     await asyncio.wait_for(task, 10)

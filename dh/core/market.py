@@ -115,6 +115,10 @@ class MarketSpec:
     # metadata only: Kalshi's expected_expiration_time (close + 5 min on KXBTC*), 0 = unknown.
     # NEVER the settlement reference time (that is expiration_ts).
     expected_expiration_ts: int = 0
+    # Kalshi exchange shard (openapi Market/EventData/Series ``exchange_index``; all KXBTC* markets
+    # are on shard 2 since 2026-08-24). None = unknown: the live runner never trades such a market
+    # (order groups, collateral and every order write are per shard).
+    exchange_index: int | None = None
 
     @property
     def base_fee(self) -> tuple[str, float]:
