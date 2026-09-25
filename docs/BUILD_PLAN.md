@@ -179,6 +179,9 @@ Each item follows its own evidence gate.
 - **Automated monthly refits** of vol, tails and flow models.
 - **Rust feed-to-cancel hot path:** only if the latency rule in C triggers.
 - **Multi-account / FCM routing:** only if capacity is exhausted.
+- **Direct membership** (if available to us): the balance precision drops from $0.01 to
+  $0.0001, which removes nearly all per-order fee rounding. That is worth 0.05-0.3c per
+  contract on maker-fee series at 5-10 lots.
 - **Richer ensembles:** only with out-of-sample net P&L improvement (never on forecast metrics
   alone).
 
@@ -223,9 +226,9 @@ Unit economics per filled contract (cents):
 |---|---|---|---|---|
 | Gross edge vs fair at fill | 0.6 | 1.2 | 2.0 | [ESTIMATE] 1c tick near the money, 2-5c spreads on wings |
 | Adverse selection (60 s markout) | -0.8 | -0.6 | -0.5 | [ESTIMATE]; E3 measures it |
-| Kalshi maker fee | -0.30 | -0.20 | 0.00 | [VERIFIED formula]: 0.0175 x P(1-P) if the series charges makers (0.44c at 50c, 0.08c at 5c); 0 for `quadratic`. Some KXBTC series are `quadratic` (other repo's 2026-09-16 fee map); KXBTCD unknown |
+| Kalshi maker fee, incl. per-order rounding | -0.50 | -0.30 | 0.00 | [VERIFIED formula] 0.0175 x P(1-P) per contract if the series charges makers, then each order's cash is rounded to $0.01, so an order pays its exact fee rounded up to the cent: 0.50-0.60c per contract near 50c, 0.10-0.30c on the wings at 5-10 lots, >= 0.50c for any 2-lot (`docs/MODELS.md` s.3). 0 for `quadratic` series. Some KXBTC series are `quadratic` (other repo's 2026-09-16 fee map); KXBTCD unknown |
 | Hedge cost | 0 | 0 | -0.05 | [VERIFIED] no hedge at M1/M2 size |
-| **Net per contract** | **-0.5** | **0.4** | **1.45** | Target >= 0.15c; > 0.75c triggers a fill-model audit before belief |
+| **Net per contract** | **-0.7** | **0.3** | **1.45** | Target >= 0.15c; > 0.75c triggers a fill-model audit before belief |
 
 Scale (taker flow is the binding resource, not capital):
 
@@ -235,8 +238,8 @@ Scale (taker flow is the binding resource, not capital):
 | Share of volume in segments with edge | 20% | 30% | 40% |
 | Our capture share of that flow | 1% | 3% | 5% |
 | Our contracts/day | 2,000 | 45,000 | 300,000 |
-| Net $/day | -10 | 180 | 4,350 |
-| Annualized net $ | < 0 (stop) | ~65k | ~1.6M |
+| Net $/day | -14 | 135 | 4,350 |
+| Annualized net $ | < 0 (stop) | ~50k | ~1.6M |
 | Peak collateral (about 10x average deployed) | $2k | $5k | $30k |
 | Risk capital for drawdowns (about 20x daily P&L s.d.) | $5k | $15k | $60k |
 

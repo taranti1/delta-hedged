@@ -105,3 +105,16 @@ def test_paused_market_is_not_requoted_until_reactivated():
     assert places == []
     d.feed(KalshiMarketLifecycle(d.now + 1, 0, TICK, "activated", is_deactivated=False))
     assert _places(d.advance(d.now + 3 * NS_PER_S))
+
+
+def test_fee_override_reprices_the_cached_order_fee():
+    """The exact per-order fee (trade fee + balance rounding) is cached per (ticker, px, size,
+    side); a fee override must invalidate it."""
+    import pytest
+
+    d = Driver([spec()])
+    _ready(d)
+    assert d.mm._order_fee(TICK, 5000, 5.0, "bid") == pytest.approx(0.006)  # ceil(2.19c) / 5
+    assert d.mm._order_fee(TICK, 5000, 4.0, "bid") == pytest.approx(0.005)  # ceil(1.75c) / 4
+    d.feed(KalshiFeeUpdate(T0, 0, "KXBTCD-TEST", "quadratic", "1"))  # makers no longer pay
+    assert d.mm._order_fee(TICK, 5000, 5.0, "bid") == 0.0

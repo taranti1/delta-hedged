@@ -9,6 +9,7 @@ See docs/MODELS.md section 3. Pure functions of the provided context; no I/O, no
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -59,6 +60,10 @@ class MarketQuoteContext:
     price_floor_px: int = 100
     price_cap_px: int = 9900
     rounding_per_order: float = 0.0  # $ expected balance-rounding fee per order (audit M8)
+    # exact net fee $ per contract of an order (px, size contracts, side) filled in one fill:
+    # trade fee + balance rounding (dh.kalshi.fees.single_fill_fees). When set it replaces
+    # maker_fee + rounding_per_order / size; the per-order carry keeps partial fills close to it.
+    order_fee: Callable[[int, float, str], float] | None = None
 
 
 @dataclass
@@ -147,7 +152,10 @@ def evaluate(
     key = segment_key(ctx.tau_s, abs(ctx.z), side)
     adverse_move = -ctx.dF_recent if side == "bid" else ctx.dF_recent
     as_cost = adverse.expected(key=key, adverse_recent_move=adverse_move, tau_s=ctx.tau_s, position=position)
-    fee = ctx.maker_fee(px) + ctx.rounding_per_order / max(size, 1e-9)
+    if ctx.order_fee is not None:
+        fee = ctx.order_fee(px, size, side)
+    else:
+        fee = ctx.maker_fee(px) + ctx.rounding_per_order / max(size, 1e-9)
     dq = sgn * size
     d_new = ctx.D_btc + dq * ctx.delta_btc
     hedge_cost = ctx.hedge_cost_frac * ctx.spot * ctx.rho_hedged * (abs(d_new) - abs(ctx.D_btc)) / size
@@ -218,9 +226,10 @@ def decide_side(
     if size > 1e-9:
         for px, pos in _candidate_prices(ctx, side):
             queue = ctx.book.bid_qty(px) / QTY_SCALE if side == "bid" else ctx.book.ask_qty(px) / QTY_SCALE
-            c = evaluate(ctx, side, flow, adverse, px, pos, queue, size)
-            if c.value >= v_min and (best is None or c.ev_rate > best.ev_rate):
-                best = c
+            for sz in _sizes_for(ctx, side, px, size):
+                c = evaluate(ctx, side, flow, adverse, px, pos, queue, sz)
+                if c.value >= v_min and (best is None or c.ev_rate > best.ev_rate):
+                    best = c
     place: QuoteCandidate | None = None
     if top is not None:
         age = next((o.age_ns for o in existing if o.client_order_id == top.existing_id), 10**18)
@@ -234,6 +243,22 @@ def decide_side(
     elif best is not None:
         place = best
     return SideDecision(side, keep, cancel, place, best, ex_evals)
+
+
+def _sizes_for(ctx: MarketQuoteContext, side: str, px: int, size: float) -> list[float]:
+    """Sizes to evaluate at px: the size limit, plus the whole-contract size in [size/2, size)
+    with the lowest exact fee per contract when that is strictly cheaper. Kalshi rounds each
+    order's cash to the balance precision, so the maker fee per contract depends on the order
+    size (at 50c: a 4-lot pays 0.50c per contract, a 5-lot 0.60c); EV rate then decides."""
+    if ctx.order_fee is None or size < 2.0:
+        return [size]
+    best_s, best_f = size, ctx.order_fee(px, size, side)
+    lo = max(1, math.ceil(size / 2.0))
+    for n in range(math.ceil(size) - 1, lo - 1, -1):
+        f = ctx.order_fee(px, float(n), side)
+        if f < best_f - 1e-12:
+            best_s, best_f = float(n), f
+    return [size] if best_s == size else [size, best_s]
 
 
 def _position_of(ctx: MarketQuoteContext, side: str, px: int) -> str:

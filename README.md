@@ -19,6 +19,7 @@ verification pending) or [ESTIMATE].
 | Gaussian tails understate 3-sd outcomes ~4-5x, so the naive "sell longshots" edge largely disappears | same |
 | Ignoring the 60-print settlement average misprices a 1-sd strike by 4.8c at 2 min and 12c at window open | same |
 | Kalshi streams the settlement benchmark (BRTI, 1 Hz and 5 Hz) on its own WebSocket, with REST history | `docs/kalshi_specs/asyncapi.yaml`, `docs/DATA_SOURCES.md` |
+| With maker fees, each order pays its exact fee rounded up to the cent, so the cost per contract depends on order size: 0.50-0.60c near 50c, and at least 0.50c for any 2-lot. The quoter prices the exact per-order fee and picks fee-efficient sizes (formula from the fee rules; to be confirmed on live fills in M1.3) | `docs/MODELS.md` s.3, `dh/kalshi/fees.py` |
 
 **Not yet established: whether net edge exists after fills.** That requires Kalshi data, which
 this build environment could not reach. `docs/BUILD_PLAN.md` sections F and K give the

@@ -139,6 +139,7 @@ class MarketMaker:
             fee_engine = FeeEngine.from_config()
         self.fee_engine = fee_engine
         self.fee_sched: dict[str, object] = {}
+        self._fee_cache: dict[tuple[str, int, int, str], float] = {}  # cleared on fee changes
         for t, s in self.specs.items():
             self._resolve_fee(t, s)
         self.om = OrderManager()
@@ -213,6 +214,21 @@ class MarketMaker:
             return
         if getattr(sched, "supported", True):
             self.fee_sched[ticker] = sched
+            self._fee_cache.clear()
+
+    def _order_fee(self, ticker: str, px: int, size: float, side: str) -> float:
+        """Exact net fee $ per contract of a maker order of ``size`` contracts filled in one
+        fill: trade fee plus Kalshi's balance rounding (zero for a fee-free maker fill at a
+        whole-cent price and whole contracts; up to 1c per order otherwise; audit M8)."""
+        qty = int(round(size * QTY_SCALE))
+        if qty <= 0:
+            return float("inf")
+        key = (ticker, px, qty, side)
+        v = self._fee_cache.get(key)
+        if v is None:
+            fb = self.fee_sched[ticker].single_fill_fees(px, qty, False, side)
+            v = self._fee_cache[key] = fb.net_micros / 1e6 / (qty / QTY_SCALE)
+        return v
 
     def _level_qty(self, ticker: str, book: str, px: int) -> int:
         b = self.books.get(ticker)
@@ -402,6 +418,7 @@ class MarketMaker:
             ftype = ev.fee_type_override if ev.fee_type_override is not None else base_type
             mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else base_mult
             self.fee_sched.pop(t, None)
+            self._fee_cache.clear()
             if ftype:
                 try:
                     sched = self.fee_engine.schedule_for_spec(ftype, mult)
@@ -674,6 +691,7 @@ class MarketMaker:
             clip_contracts=q.clip_contracts, capacity_contracts=cap, existing=existing,
             max_ticks_from_touch=q.max_ticks_from_touch, price_floor_px=q.price_floor_px,
             price_cap_px=q.price_cap_px, rounding_per_order=q.expected_rounding_per_order,
+            order_fee=lambda px, size, side, tk=t: self._order_fee(tk, px, size, side),
         )
         for side in ("bid", "ask"):
             d = decide_side(ctx, side, self.flow, self.adverse, q.v_min_dollars, q.kappa_replace_per_s,

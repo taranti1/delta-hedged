@@ -51,9 +51,9 @@ For market k and side s in {bid, ask}, candidate price p on the tick grid (up to
 the touch, never crossing), and size z:
 
     edge(p)    = F_lo - p                          (bid)      p - F_hi   (ask)
-    fee(p, z)  = expected maker fee per contract (dh.kalshi.fees, exact schedule incl. type)
-                 + r / z, r = expected balance-rounding fee per order (~$0.005: each order's
-                 cash is rounded to the $0.01 balance precision with carry; audit M8)
+    fee(p, z)  = exact net fee per contract of a z-lot filled in one fill: maker trade fee
+                 (exact schedule incl. fee type) + balance rounding (dh.kalshi.fees
+                 single_fill_fees; audit M8)
     AS(p, x)   = E[F_{t+h} - F_t | our fill, features x]  signed against us (adverse selection)
     hedge(p)   = c_h * S * rho * (|D + delta_k| - |D|)     marginal expected hedge cost
     inv(p, z)  = [R(q_k + z*sgn) - R(q_k)] / z             marginal risk charge per contract
@@ -71,8 +71,24 @@ The same rule covers the explicit decision between joining the best price (long 
 edge), improving by one tick (first in queue, one tick less edge) and stepping behind the best
 (fills only on sweeps).
 
-The rounding term makes small clips expensive: at z = 2 it costs 0.25c per contract (about
-the whole "viable" band of 0.15-0.30c), at z = 5 0.10c and at z = 10 0.05c, so M1 quotes 5-lots.
+**Fee rounding makes the fee depend on order size.** Kalshi floors each fill's cash (premium
+minus trade fee) to the balance precision ($0.01 for non-direct members) and carries the
+excess per order, so an order's maker fee is in effect its exact fee rounded up to the next
+cent. Net maker fee per contract with maker fees on (`quadratic_with_maker_fees`):
+
+| YES price | exact | 2-lot | 3-lot | 4-lot | 5-lot | 7-lot | 10-lot |
+|---|---|---|---|---|---|---|---|
+| 50c | 0.44c | 0.50c | 0.67c | 0.50c | 0.60c | 0.57c | 0.50c |
+| 20c / 80c | 0.28c | 0.50c | 0.33c | 0.50c | 0.40c | 0.29c | 0.30c |
+| 10c / 90c | 0.16c | 0.50c | 0.33c | 0.25c | 0.20c | 0.29c | 0.20c |
+| 3c / 97c | 0.05c | 0.50c | 0.33c | 0.25c | 0.20c | 0.14c | 0.10c |
+
+With no maker fee (`quadratic`), whole-cent prices and whole contracts there is no rounding
+at all. The quoter therefore evaluates, at every price, both the clip size and the cheapest
+whole-contract size in [clip/2, clip) (`quoting._sizes_for`), and EV rate picks between them.
+M1 quotes 5-lots: whenever makers pay any fee, a 2-lot pays at least 0.50c per contract.
+Partial fills follow the same rule: the per-order carry makes an order's total fee its
+cumulative exact fee rounded up to the cent.
 
 Across markets, candidates are ranked by EVrate per unit of capital:
 

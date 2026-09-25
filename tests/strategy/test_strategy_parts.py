@@ -130,3 +130,38 @@ def test_existing_order_canceled_when_capacity_shrinks_and_zero_remaining_skippe
     d = decide_side(ctx, "bid", fm, am, v_min=0.001, kappa_replace=0.0)
     assert "c1" in d.cancel and "c0" not in d.cancel and d.keep == []
     assert d.place is None or d.place.size <= 3.0
+
+
+def _exact_order_fee(fee_type):
+    from dh.core.units import QTY_SCALE
+    from dh.kalshi.fees import FeeEngine
+
+    sched = FeeEngine.from_config().schedule(fee_type, 1)
+
+    def fee(px, size, side):
+        qty = int(round(size * QTY_SCALE))
+        return sched.single_fill_fees(px, qty, False, side).net_micros / 1e6 / (qty / QTY_SCALE)
+
+    return fee
+
+
+def test_size_choice_accounts_for_per_order_fee_rounding():
+    """At 50c with maker fees a 5-lot pays ceil(2.19c) = 3c (0.60c/ct) and a 4-lot 2c
+    (0.50c/ct): the quoter evaluates the cheaper 4-lot too and picks it when its EV rate is
+    higher. Without maker fees there is no rounding and the full clip is used."""
+    from dh.strategy.quoting import _sizes_for
+
+    ctx = _ctx(F=0.55, bb=4900, ba=5100)
+    ctx.order_fee = _exact_order_fee("quadratic_with_maker_fees")
+    assert _sizes_for(ctx, "bid", 5000, 5.0) == [5.0, 4.0]
+    assert ctx.order_fee(5000, 5.0, "bid") == pytest.approx(0.006)
+    assert ctx.order_fee(5000, 4.0, "bid") == pytest.approx(0.005)
+    fm, am = FillIntensityModel(FillModelCfg()), AdverseSelectionModel(AdverseSelCfg())
+    d = decide_side(ctx, "bid", fm, am, v_min=0.001, kappa_replace=0.0)
+    assert d.place is not None and d.place.size in (4.0, 5.0)
+    assert d.place.fee == pytest.approx(ctx.order_fee(d.place.px, d.place.size, "bid"))
+    ctx0 = _ctx(F=0.55, bb=4900, ba=5100)
+    ctx0.order_fee = _exact_order_fee("quadratic")
+    assert _sizes_for(ctx0, "bid", 5000, 5.0) == [5.0] and ctx0.order_fee(5000, 5.0, "bid") == 0.0
+    d0 = decide_side(ctx0, "bid", fm, am, v_min=0.001, kappa_replace=0.0)
+    assert d0.place is not None and d0.place.size == 5.0
