@@ -1,0 +1,3 @@
+synthetic,policy,threshold,fills_base,fills_guard,fill_loss_pct,net_c_base,net_c_guard,d_net_c,d_net_lo_c,d_net_hi_c,markout_10s_base_c,markout_10s_guard_c,usd_day_base,usd_day_guard,contracts_day_base,contracts_day_guard,profitable_ct_day_base,profitable_ct_day_guard,events,d_day_lo_c,d_day_hi_c,day_blocks,holds_only_under_A
+True,B,0.562093,77,59,20.3627,5.37846,4.97462,-0.403836,-3.53442e+07,17.3769,0.847371,0.178563,670.56,493.92,12467.5,9928.8,9735.36,8541.12,2,,,1,False
+True,C,0.562093,73,49,31.087,6.10435,4.41009,-1.69425,-23.5046,20.1161,0.33088,0.106128,673.92,335.52,11040,7608,8976,6888,2,,,1,False

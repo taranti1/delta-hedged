@@ -1,0 +1,17 @@
+synthetic,policy,family,regime,fills,contracts,events,mean,lo,hi
+True,B,tau_bucket,1-5m,17,59.5,4,10.9872,-37.7424,21.1309
+True,B,tau_bucket,10-30m,97,321.69,4,1.80608,-0.104497,3.63367
+True,B,tau_bucket,5-10m,24,78.99,4,2.44667,-1.4056,10.1967
+True,B,vol_tercile,high,33,98.98,3,4.16185,-11.8564,55.598
+True,B,vol_tercile,low,43,142.91,2,3.49353,-89.4038,4.47389e+07
+True,B,vol_tercile,mid,34,121.82,3,3.03478,-1.61841,1.55494e+08
+True,B,vol_tercile,n/a,28,96.47,1,1.52484,,
+True,B,weekday,weekday,138,460.18,4,3.10313,2.10556,4.33109
+True,C,tau_bucket,1-5m,7,20.5,3,5.29402,-9.43847,1.65609e+07
+True,C,tau_bucket,10-30m,98,317,4,1.84688,-0.584064,6.25526
+True,C,tau_bucket,5-10m,24,76,4,1.84684,0.594904,7.67352
+True,C,vol_tercile,high,34,102,3,2.36021,-4.62223,9.34264
+True,C,vol_tercile,low,39,122,1,1.99244,,
+True,C,vol_tercile,mid,28,95,2,2.23239,-1.37349,5.83827
+True,C,vol_tercile,n/a,28,94.5,1,1.4651,,
+True,C,weekday,weekday,129,413.5,4,2.01777,1.4968,2.53874

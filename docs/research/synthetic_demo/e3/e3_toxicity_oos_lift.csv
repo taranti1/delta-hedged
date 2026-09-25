@@ -1,0 +1,5 @@
+synthetic,policy,model,n_oos,brier_lift,lift_lo,lift_hi,events
+True,B,logistic,106,-0.0250216,-1.00355e+06,0.00240212,3
+True,B,gbm_cls,106,-0.0104126,-0.0283296,84339,3
+True,C,logistic,100,-0.040786,-0.131504,0.049932,3
+True,C,gbm_cls,100,-0.0231215,-0.0640778,0.0187365,3

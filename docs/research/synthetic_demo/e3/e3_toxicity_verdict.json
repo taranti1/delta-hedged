@@ -1,0 +1,17 @@
+{
+ "experiment": "e3_toxicity",
+ "verdict": "INCONCLUSIVE (cancel-rule lift not established under B and C)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "INCONCLUSIVE (cancel-rule lift not established under B and C)",
+ "guards": [],
+ "decision_events": 2,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept if the toxicity-aware cancel policy raises net c/contract by >= 0.1c (CI > 0) at <= 20% fill loss with $/day and profitable contracts/day not lower, under both B and C; reject if there is no OOS lift or the lift vanishes under policy C"
+}
