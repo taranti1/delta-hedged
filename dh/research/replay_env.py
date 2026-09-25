@@ -952,8 +952,8 @@ def fv_params_status(cfg: Mapping[str, Any], source: str, t0: int, synthetic: bo
     return info, warn
 
 
-def flow_status(seg: Mapping[Any, Any] | None, meta: Mapping[str, Any], source: str, t0: int,
-                synthetic: bool = False) -> tuple[dict[str, Any], str | None]:
+def flow_status(seg: Mapping[Any, Any] | None, meta: Mapping[str, Any], source: str,
+                t0: int) -> tuple[dict[str, Any], str | None]:
     """Same check for taker-flow segments (``meta.fit_end_ms``: every training datum precedes it)."""
     if not seg:
         return {"flow_segments": "config defaults (cfg.fill)", "flow_in_sample": None}, None
@@ -980,7 +980,7 @@ def inputs_meta(uni: Universe, t0: int) -> tuple[dict[str, Any], list[str]]:
     """Report metadata + warnings for the fitted inputs of a window's replays (FV parameters and
     taker-flow segments; in-sample = fitted on data not strictly before t0)."""
     fv_info, fv_warn = fv_label_for(uni, t0)
-    fl_info, fl_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0, uni.synthetic)
+    fl_info, fl_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
     return ({"FV parameters": fv_info["fv_params"], "taker flow": fl_info["flow_segments"]},
             [w for w in (fv_warn, fl_warn) if w])
 
@@ -1464,7 +1464,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         uni = bind_replay_inputs(dataclasses.replace(uni), fv_config=fv_config, flow_segments=flow_segments)
     fv_cfg = uni.fv_config or resolve_fv_config(None)[0]
     fv_info, fv_warn = fv_label_for(uni, t0)
-    flow_info, flow_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0, uni.synthetic)
+    flow_info, flow_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
     fv = FairValueModel.from_config(fv_cfg)
     winfo = warm_fair_value(fv, root, t0, warm, fv_warm_s=fv_warm_s, gbm_vol_ann=gbm_vol_ann, seed=seed,
                             cache=uni.cache, fv_config=fv_cfg)

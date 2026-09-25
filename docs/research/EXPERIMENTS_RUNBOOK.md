@@ -240,6 +240,9 @@ with informed flow on the same price path. E1 on the recording path recovers the
 * **Fair-value markouts** use the strategy's logged fair value (logged every <= 1 s or on a
   0.2c change): markouts at 0.1–0.5 s partly reflect logging granularity. They are only as
   out-of-sample as the FV parameters (section 2a).
+* **E6/E7 bucket recommendations** are selected and reported on the same window (a segment table,
+  not a fitted model): confirm a quote/disable decision by rerunning `e67` on a LATER window before
+  changing `quoting` limits.
 * **Flow calibration from recordings** counts recorder downtime inside the window as exposure
   without trades (rates biased low); fit across outages only after checking the session records.
   |z| segments use a fixed 40 % vol (calibrate_flow convention), not the strategy's live sigma.
