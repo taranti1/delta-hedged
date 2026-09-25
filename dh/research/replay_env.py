@@ -667,10 +667,31 @@ def build_universe(root: str | Path, t0: int, t1: int, *, lookback_s: float = 6 
     u.markets = mk
 
     # ---------------------------------------------------------------- fees (as of availability)
-    # A market is available only once BOTH its spec and its fee are known from records received
-    # by then (audit m4): if the fee resolves only later, availability moves to that time.
+    shifted = resolve_fee_availability(u, t0, hi)
+    if shifted:
+        u.notes.append(f"{shifted} market(s) became available only when their fee was first known (fee record "
+                       "received after the spec)")
+
+    # ---------------------------------------------------------------- session metadata
+    if "meta" in list_streams(root):
+        for recv, _s, m in _iter_json_records(root, ["meta"], lo, t1):
+            if isinstance(m, dict):
+                u.meta.append(m)
+                if m.get("synthetic"):
+                    u.synthetic = True
+    if own_fill_scan and ws:
+        u.own_fills = prescan_own_fills(root, t0 - _ns(state_warm_s), t1)
+    for c in u.fee_changes_in_window():
+        u.notes.append(f"fee change inside the window (replay uses the fee in force at availability): {c}")
+    return u
+
+
+def resolve_fee_availability(u: Universe, t0: int, hi: int) -> int:
+    """Set every spec's fee as of max(availability, t0) from records RECEIVED by then (audit m4).
+    A market is available only once BOTH its spec and its fee are known: if the fee resolves only
+    later (before ``hi``), availability moves to that time. Returns the number of shifted markets."""
     shifted = 0
-    for t, rec in mk.items():
+    for t, rec in u.markets.items():
         if rec.spec is None:
             continue
         t_ref = max(rec.avail_ns, t0)
@@ -689,22 +710,7 @@ def build_universe(root: str | Path, t0: int, t1: int, *, lookback_s: float = 6 
         rec.spec = dataclasses.replace(rec.spec, fee_type=ftype, fee_multiplier=mult)
         if not ftype:
             rec.reject = "fee_unresolved (no series/event fee record): MarketMaker will not quote it"
-    if shifted:
-        u.notes.append(f"{shifted} market(s) became available only when their fee was first known (fee record "
-                       "received after the spec)")
-
-    # ---------------------------------------------------------------- session metadata
-    if "meta" in list_streams(root):
-        for recv, _s, m in _iter_json_records(root, ["meta"], lo, t1):
-            if isinstance(m, dict):
-                u.meta.append(m)
-                if m.get("synthetic"):
-                    u.synthetic = True
-    if own_fill_scan and ws:
-        u.own_fills = prescan_own_fills(root, t0 - _ns(state_warm_s), t1)
-    for c in u.fee_changes_in_window():
-        u.notes.append(f"fee change inside the window (replay uses the fee in force at availability): {c}")
-    return u
+    return shifted
 
 
 def _px_or_none(v: Any) -> int | None:

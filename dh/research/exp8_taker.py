@@ -53,6 +53,7 @@ from dh.research.exp_common import (
     add_regimes,
     cluster_mean_ci,
     day_block_ok,
+    flag_only_A,
     fmt_ns,
     policy_letter,
     regime_table,
@@ -437,7 +438,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
         tables.append(s)
         if p == "B" and thr == 0.5:
             stale = by_staleness(r)
-    summ = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+    summ = flag_only_A(pd.concat(tables, ignore_index=True), ["threshold_c"], lo_col="net_settle_lo_c") \
+        if tables else pd.DataFrame()
     verdict, have, events = e8_verdict(summ)
     any_r = next(iter(res_by.values()), None)
     rep = Report("e8_taker", "E8 — Selective taking of stale Kalshi quotes", Path(out), synthetic=uni.synthetic,

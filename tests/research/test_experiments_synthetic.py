@@ -102,16 +102,17 @@ def _load_cli():
 @pytest.mark.slow
 def test_every_experiment_runs_end_to_end_on_the_synthetic_recording(tiny_rec, tmp_path):
     cli = _load_cli()
-    base = ["--root", tiny_rec.root, "--config", "synthetic", "--policies", "B", "--jobs", "2"]
+    base = ["--root", tiny_rec.root, "--config", "synthetic"]
+    pol = ["--policies", "B", "--jobs", "2"]
     runs = {
         "e1": [],
-        "e2": ["--no-pnl"],
-        "e3": [],
-        "e4": ["--grid", '{"config": {}}'],
-        "e67": [],
-        "e8": [],
-        "e9": ["--strikes", "1,0"],
-        "e10": ["--multipliers", "1,4"],
+        "e2": ["--no-pnl", *pol],
+        "e3": pol,
+        "e4": ["--grid", '{"config": {}}', *pol],
+        "e67": pol,
+        "e8": pol,
+        "e9": ["--strikes", "1,0", *pol],
+        "e10": ["--multipliers", "1,4", *pol],
     }
     for name, extra in runs.items():
         assert cli.main([name, *base, "--out", str(tmp_path / name), *extra]) == 0
@@ -119,7 +120,11 @@ def test_every_experiment_runs_end_to_end_on_the_synthetic_recording(tiny_rec, t
     assert set(reports) == set(runs)
     for name, md in reports.items():
         assert SYNTHETIC_BANNER in md and "**Verdict:**" in md and "**Decision rule" in md, name
+        assert "**Verdict:** ACCEPT" not in md, name  # synthetic data, policy B only: never an ACCEPT
     assert "recenter_always" in reports["e4"] and "nearest_1" in reports["e9"] and "x4" in reports["e10"]
+    for name in ("e3", "e4", "e8", "e9", "e10"):  # regime splits (audit m8)
+        reg = next((tmp_path / name).glob("*regimes.csv"), None)
+        assert reg is not None, name
     for p in tmp_path.glob("*/*.csv"):
         assert p.read_text().startswith("synthetic"), p  # leading synthetic column (header only if empty)
 

@@ -111,6 +111,24 @@ def _fmt(x: Any, nd: int = 2) -> str:
     return "nan" if not math.isfinite(f) else f"{f:.{nd}f}"
 
 
+def _e1_best(tab: pd.DataFrame) -> float:
+    if tab is None or not len(tab) or "response_ticks" not in tab:
+        return math.nan
+    d = tab[tab["horizon_s"] <= 1.0]
+    return float(d["response_ticks"].max()) if len(d) else math.nan
+
+
+def _verdict_rows(out: Path) -> list[str]:
+    def cut(x: str) -> str:
+        return ((x[:160] + "...") if len(x) > 160 else x).replace("|", "/")
+
+    rows = []
+    for p in sorted(out.rglob("*_verdict.json")):
+        v = json.loads(p.read_text())
+        rows.append(f"| {v['experiment']} | {cut(v['verdict'])} | {cut(v['rule_outcome'])} |")
+    return rows
+
+
 def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[str, float], cfg, n_jobs: int) -> None:
     r = results
     e2 = r["e2"]["forecast"]
@@ -166,8 +184,9 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         f"{_fmt(fm.loc['in_sample', 'ratio_ct'])} (WAPE {_fmt(fm.loc['in_sample', 'wape_ct'])}), out of sample "
         f"{_fmt(fm.loc['out_of_sample', 'ratio_ct'])} (WAPE {_fmt(fm.loc['out_of_sample', 'wape_ct'])}) | "
         f"{timings['flow']:.0f} s |",
-        f"| E1 staleness | `e1/e1_staleness.md` | gap-closure half-life {_fmt(r['e1']['half_life_s'])} s "
-        f"(injected maker lag {info.config['injected']['mm_lag_s']} s) | {timings['e1']:.0f} s |",
+        f"| E1 staleness | `e1/e1_staleness.md` | lag coefficient on the past external move: largest response "
+        f"{_fmt(_e1_best(r['e1']['lead_lag']))} tick within 1 s beyond the receive latency (injected maker lag "
+        f"{info.config['injected']['mm_lag_s']} s) | {timings['e1']:.0f} s |",
         f"| E2 nowcast | `e2/e2_nowcast.md` | ridge RMSE gain {', '.join(f'{h}: {_fmt(v, 1)}%' for h, v in e2s.items())} | {timings['e2']:.0f} s |",
         f"| E3 toxicity | `e3/e3_toxicity.md` | {len(r['e3']['fills'].get('B', []))} B fills; net 10 s markout B "
         f"{_fmt(e3m[(e3m.policy == 'B') & (e3m.horizon == '10s')].net_markout_c.iloc[0]) if len(e3m) else 'n/a'} c | {timings['e3']:.0f} s |",
@@ -177,6 +196,9 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         f"| E9 multi-strike | `e9/e9_multistrike.md` | nearest 1 / 3 / all strikes | {timings['e9']:.0f} s |",
         "| E10 capacity | `e10/e10_capacity.md` | breakeven clip multiple "
         + ", ".join(f"{x.policy}: {_fmt(x.max_clip_multiple, 1)}" for x in bk.itertuples()) + f" | {timings['e10']:.0f} s |",
+        "", "## Verdicts (evidence guards applied; the rule's own outcome in the second column)", "",
+        "| experiment | reported verdict | rule outcome on this sample |", "|---|---|---|",
+        *_verdict_rows(out),
         "", f"Recording written in {timings['write_recording']:.0f} s; {n_jobs} worker processes.", "",
         "Per-fill tables (ledgers, E3 fills, E8 takes) are not committed; rerun the demo to regenerate them.",
     ]

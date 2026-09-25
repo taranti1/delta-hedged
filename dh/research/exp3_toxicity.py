@@ -62,6 +62,7 @@ from dh.research.exp_common import (
     add_regimes,
     cluster_mean_ci,
     day_block_ok,
+    flag_only_A,
     fmt_ns,
     n_events,
     paired_diff_ci,
@@ -608,6 +609,15 @@ class _DayCI:
     clusters: int
 
 
+def rule_training_fills(fills: dict[str, pd.DataFrame], t_split: int, label_h_s: float = RULE_LABEL_H_S) -> pd.DataFrame:
+    """Training fills of the cancel rule: policy B only (audit C2), and only fills whose label
+    (net markout at label_h_s) ended before t_split, where the scored half starts (audit m2)."""
+    b = fills.get("B")
+    if b is None or not len(b):
+        return pd.DataFrame()
+    return b[b["ts"] + int(label_h_s * NS_PER_S) <= t_split]
+
+
 def e3_verdict(cancel: pd.DataFrame, lift: pd.DataFrame, rule: ToxicityRule | None) -> str:
     """Rule outcome on the sample (docs/TEST_MATRIX.md E3; B and C both required)."""
     no_lift = bool(len(lift)) and bool((lift["lift_hi"] <= 0).all())
@@ -666,8 +676,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
             metrics.append(m)
     # cancel rule: fitted on POLICY-B shadow fills of [t0, t_split) whose 60 s label ended before
     # t_split (audit C2/m2), replayed on [t_split, t1) under every policy
-    train_src = fills.get("B", pd.DataFrame())
-    train = train_src[train_src["ts"] + int(RULE_LABEL_H_S * NS_PER_S) <= t_split] if len(train_src) else train_src
+    train = rule_training_fills(fills, t_split)
     rule = fit_rule(train) if len(train) else None
     if rule is not None and rule.threshold <= 1.0:
         ev_runs = run_variants(root, t_split, t1, [Variant("base", cfg),
@@ -705,7 +714,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                     regimes.append(rt)
             if len(a) and len(b) and math.isfinite(row["d_net_c"]):
                 cancel_rows.append(row)
-    cancel = pd.DataFrame(cancel_rows)
+    cancel = flag_only_A(pd.DataFrame(cancel_rows), [], lo_col="d_net_lo_c")
     lift = pd.concat(lifts, ignore_index=True) if lifts else pd.DataFrame()
     met = pd.concat(metrics, ignore_index=True) if metrics else pd.DataFrame()
     unit = pd.concat(uni_tabs, ignore_index=True) if uni_tabs else pd.DataFrame()

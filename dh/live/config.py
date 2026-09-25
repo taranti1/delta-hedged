@@ -77,19 +77,35 @@ class LoopCfg:
     lag_resume_s: float = 2.0
     lag_window_s: float = 600.0  # trailing window of the exchange-time latency baseline
     lag_confirm_s: float = 0.5  # exchange-time lag = the SMALLEST excess age over this window
+    # The latency baseline never exceeds this cap (0 = clock_block_ms + 100): a backlog present
+    # since start-up, or lasting longer than lag_window_s, cannot become "normal latency".
+    # A source whose smallest age exceeds the cap raises an alarm (dh_lag_baseline_seconds).
+    lag_baseline_cap_ms: float = 0.0
     yield_items: int = 64  # the consumer yields to the event loop at least every N items ...
     yield_ms: float = 5.0  # ... or N ms of work, and always after dispatching orders
     shutdown_timeout_s: float = 10.0
     strategy_error: str = "stop"  # stop (fail safe) | continue (paper debugging only; refused live)
-    clock_sample_s: float = 60.0  # chrony/adjtimex sample to the 'clock' stream; 0 = off
+    clock_sample_s: float = 60.0  # chrony/timedatectl sample to the 'clock' stream; 0 = off (refused live)
+    clock_resample_s: float = 5.0  # while the last sample was bad or unmeasurable: sample this often
     clock_alarm_ms: float = 5.0  # |offset| above this: alarm (metric + log)
     clock_block_ms: float = 250.0  # |offset| above this on clock_block_samples samples in a row:
     clock_block_samples: int = 2  # new orders blocked until it recovers
+    # live: a sample counts as bad (blocks like an offset) unless it comes from chronyc or
+    # timedatectl, says synchronised, and its estimated error is at most this (0 = clock_block_ms)
+    clock_max_est_error_ms: float = 0.0
     risk_state_interval_s: float = 2.0  # persist day P&L / halt / pause this often (0 = off)
 
     def __post_init__(self) -> None:
         if self.strategy_error not in ("stop", "continue"):
             raise ValueError(f"loop.strategy_error must be 'stop' or 'continue', got {self.strategy_error!r}")
+
+    def baseline_cap_ms(self) -> float:
+        """Cap of the exchange-time latency baseline (ms)."""
+        return self.lag_baseline_cap_ms if self.lag_baseline_cap_ms > 0 else self.clock_block_ms + 100.0
+
+    def max_est_error_ms(self) -> float:
+        """Largest acceptable estimated clock error of a sample (ms)."""
+        return self.clock_max_est_error_ms if self.clock_max_est_error_ms > 0 else self.clock_block_ms
 
 
 @dataclass(frozen=True)
@@ -272,6 +288,9 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
     if not cfg.venue.startup_cancel_all:
         out.append("venue.startup_cancel_all must be true in live mode (leftover orders must be cancelled "
                    "before positions are read)")
+    if cfg.loop.clock_sample_s <= 0:
+        out.append("loop.clock_sample_s must be > 0 in live mode (the clock-offset gate must measure the clock; "
+                   "it blocks new orders when it cannot)")
     return out
 
 

@@ -600,12 +600,20 @@ def flag_only_A(table: pd.DataFrame, keys: Sequence[str], lo_col: str = "net_lo_
 
 
 # ----------------------------------------------------------------------------- reports
-def write_csv(df: pd.DataFrame, path: str | Path, synthetic: bool) -> None:
-    """CSV with a leading ``synthetic`` column when the source recording is synthetic."""
+def _lead_synthetic(df: pd.DataFrame, synthetic: bool) -> pd.DataFrame:
+    """Copy with a leading ``synthetic`` column when the source is synthetic (a status column of
+    that name, e.g. in replay ledgers, is moved to the front)."""
     d = df.copy()
     if synthetic:
+        if "synthetic" in d:
+            d = d.drop(columns=["synthetic"])
         d.insert(0, "synthetic", True)
-    d.to_csv(path, index=False, float_format="%.6g")
+    return d
+
+
+def write_csv(df: pd.DataFrame, path: str | Path, synthetic: bool) -> None:
+    """CSV with a leading ``synthetic`` column when the source recording is synthetic."""
+    _lead_synthetic(df, synthetic).to_csv(path, index=False, float_format="%.6g")
 
 
 def git_commit() -> str:
@@ -751,10 +759,7 @@ class Report:
         out = Path(self.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         for key, df, _ in self.tables:
-            d = df.copy()
-            if self.synthetic:
-                d.insert(0, "synthetic", True)
-            d.to_csv(out / f"{self.name}_{key}.csv", index=False, float_format="%.6g")
+            _lead_synthetic(df, self.synthetic).to_csv(out / f"{self.name}_{key}.csv", index=False, float_format="%.6g")
         md = [f"# {self.title}", ""]
         if self.synthetic:
             md += [SYNTHETIC_NOTE, ""]

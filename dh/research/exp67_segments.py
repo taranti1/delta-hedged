@@ -227,8 +227,12 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
     imeta: dict[str, Any] = {"FV parameters": "as recorded in the ledgers' status columns"}
     conf_dfs: dict[str, pd.DataFrame] = {}
     lat = None
-    if confirm_t0 is not None and confirm_t1 is not None and confirm_t0 < t1:
+    if (confirm_t0 is None) != (confirm_t1 is None):
+        raise ValueError("give both --confirm-t0 and --confirm-t1 (or neither: built-in chronological split)")
+    if confirm_t0 is not None and confirm_t0 < t1:
         raise ValueError("the confirmation window must start at or after the selection window's end (disjoint, later)")
+    if ledgers and confirm_t0 is not None:
+        raise ValueError("a confirmation window needs replays: with --ledger the built-in chronological split is used")
     if ledgers:
         dfs = load_ledgers(ledgers)
         synthetic, in_sample, why = ledger_status(dfs)

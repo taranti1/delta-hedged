@@ -93,8 +93,11 @@ def run_variants(root: str | Path, t0: int, t1: int, variants: Sequence[Variant]
 
 def prime_cache(uni: Universe, t0: int, warm: str, variants: Sequence[Variant] = (),
                 fv_warm_s: float = 1.5 * 86400) -> None:
-    """Scan the recorded BRTI ticks needed by every job once, before forking the workers."""
-    from dh.research.replay_env import NearestStrikes, _ns, brti_ticks, parse_warm
+    """Scan the recorded BRTI ticks and the market-data latency needed by every job once, before
+    forking the workers."""
+    from dh.research.replay_env import NearestStrikes, _ns, brti_ticks, measure_md_latency_ms, parse_warm
+
+    measure_md_latency_ms(uni.root, uni.t0, cache=uni.cache)
 
     if "recorded" in parse_warm(warm):
         brti_ticks(uni.root, t0 - _ns(fv_warm_s), t0, cache=uni.cache)

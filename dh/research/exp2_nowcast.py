@@ -57,6 +57,7 @@ from dh.research.exp_common import (
     Report,
     add_regimes,
     day_block_ok,
+    flag_only_A,
     fmt_ns,
     n_events,
     paired_diff_ci,
@@ -471,7 +472,7 @@ def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta:
         row["events"] = n_events(a, b)
         row["warnings"] = "; ".join(warns)
         rows.append(row)
-    return pd.DataFrame(rows)
+    return flag_only_A(pd.DataFrame(rows), [], lo_col="d_net_lo_c")
 
 
 @dataclass
