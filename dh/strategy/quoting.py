@@ -208,8 +208,11 @@ def decide_side(
             top = e
         else:
             cancel.append(e.existing_id)  # duplicates, or no longer within capacity
-    kept_qty = top.size if top is not None else 0.0
-    size = min(ctx.clip_contracts, cap_total - kept_qty if top is None else cap_total)
+    # orders being canceled can still fill until the cancel is acknowledged, so their size
+    # stays reserved against capacity (audit M1): a replacement must fit beside them
+    canceling = sum(e.size for e in ex_evals if e.existing_id in cancel)
+    reserved = canceling + (top.size if top is not None else 0.0)
+    size = min(ctx.clip_contracts, cap_total - reserved)
     best: QuoteCandidate | None = None
     if size > 1e-9:
         for px, pos in _candidate_prices(ctx, side):

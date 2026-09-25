@@ -133,7 +133,7 @@ async def test_gap_requests_snapshot_suppresses_deltas_and_resyncs():
     assert snaps == [{"id": 3, "cmd": "update_subscription",
                       "params": {"sid": ob_sid, "market_tickers": ["A", "B"], "action": "get_snapshot"}}]
     st = [(e.stream, e.status) for e in rec.events if isinstance(e, FeedStatus)]
-    assert ("kalshi.ws", "gap") in st and ("kalshi.book:A", "gap") in st and ("kalshi.book:B", "gap") in st
+    assert ("kalshi.ws:orderbook_delta", "gap") in st and ("kalshi.book:A", "gap") in st and ("kalshi.book:B", "gap") in st
     assert st.index(("kalshi.book:B", "resynced")) > st.index(("kalshi.book:B", "gap"))
     assert ("kalshi.ws", "resynced") in st
     deltas = [e for e in rec.events if isinstance(e, KalshiBookDelta)]

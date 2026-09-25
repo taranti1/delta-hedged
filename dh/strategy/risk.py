@@ -27,6 +27,10 @@ class RiskEngine:
     """Feed-status routing is by EXACT stream name (never by prefix):
 
       cfg.kalshi_stream ('kalshi.ws')      connection: disconnected/stale/gap -> not ready + CancelAll;
+      'kalshi.ws:<channel>'                per-channel sequence gaps: own-activity channels (fill,
+                                           user_orders, market_positions, order_group_updates) ->
+                                           CancelAll + pause own_gap_pause_s + reconcile; others
+                                           (trade, cfbenchmarks, lifecycle) are informational
                                            connected/resynced -> ready after book_resume_after_s;
                                            'error' (bad frame, command error) is logged only
       'kalshi.book:<ticker>'               per-market book validity (gap/disconnected -> invalid;
@@ -86,6 +90,15 @@ class RiskEngine:
                 self.kalshi_resume_ns = ev.ts + int(c.book_resume_after_s * NS_PER_S)
             else:  # 'error': malformed frame / command error -> informational
                 self.log.append((ev.ts, f"kalshi error: {ev.detail}"))
+        elif st.startswith(c.kalshi_stream + ":"):
+            channel = st.split(":", 1)[1]
+            if ev.status == "gap" and channel in ("fill", "user_orders", "market_positions", "order_group_updates"):
+                # own-activity messages lost: our position/order view may be wrong until reconciled
+                self.pause_until_ns = max(self.pause_until_ns, ev.ts + int(c.own_gap_pause_s * NS_PER_S))
+                out.append(CancelAll(reason=f"own_channel_gap:{channel}"))
+                out.append(Log("risk", {"event": "reconcile_requested", "channel": channel, "detail": ev.detail}))
+            else:
+                self.log.append((ev.ts, f"channel {channel} {ev.status}: {ev.detail}"))
         elif st.startswith("kalshi.book:"):
             ticker = st.split(":", 1)[1]
             if ev.status in ("gap", "disconnected", "stale", "error"):

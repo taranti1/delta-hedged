@@ -245,11 +245,15 @@ def _gap(state: KalshiWsState, st: SidState, sid: int, seq: int, recv_ns: int, o
     missed = seq - st.last_seq - 1
     state.counters["gaps"] += 1
     state.counters["missed_msgs"] += missed
+    # Gaps are reported per CHANNEL ('kalshi.ws:<channel>'), never on the connection stream:
+    # a lost trade / benchmark / lifecycle message must not mark the whole connection down
+    # (nothing would ever clear it). Book gaps additionally invalidate the affected books
+    # below and are resynced with snapshots (audit M3).
     out.append(
         FeedStatus(
             ts=recv_ns,
             ts_exch=0,
-            stream=WS_STREAM,
+            stream=f"{WS_STREAM}:{st.channel or 'unknown'}",
             status="gap",
             detail=f"sid={sid} channel={st.channel} expected={st.last_seq + 1} got={seq} missed={missed}",
         )

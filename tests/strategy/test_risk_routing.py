@@ -89,3 +89,22 @@ def test_external_venue_disconnect_counts_as_stale():
     assert r.health(t).quoting_allowed
     r.on_feed_status(fs(t, "kraken.ws", "disconnected"))
     assert not r.health(t).quoting_allowed
+
+
+def test_non_book_channel_gap_does_not_stop_quoting_forever():
+    """Audit M3: a lost trade/benchmark message must not disable quoting permanently."""
+    r, t = ready_engine()
+    r.on_feed_status(fs(t, "kalshi.ws:cfbenchmarks_value_5hz", "gap", "missed=1"))
+    r.on_feed_status(fs(t, "kalshi.ws:trade", "gap", "missed=3"))
+    for k in range(1, 5):
+        r.note_brti(t + k * S)
+    assert r.health(t + 4 * S).quoting_allowed
+
+
+def test_own_fill_channel_gap_pauses_and_requests_reconcile():
+    r, t = ready_engine()
+    acts = r.on_feed_status(fs(t, "kalshi.ws:fill", "gap", "missed=1"))
+    assert any(isinstance(a, CancelAll) for a in acts)
+    for k in range(1, 40):
+        r.note_brti(t + k * S)
+    assert not r.health(t + 10 * S).quoting_allowed and r.health(t + 31 * S).quoting_allowed

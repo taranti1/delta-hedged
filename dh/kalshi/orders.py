@@ -42,17 +42,25 @@ def expiration_seconds(expiration_ns: int) -> int:
     return expiration_ns // NS_PER_S
 
 
+TIF_FROM_ACTION = {"gtc": "good_till_canceled", "ioc": "immediate_or_cancel", "fok": "fill_or_kill"}
+
+
 def place_order_body(
     a: PlaceOrder,
     *,
     self_trade_prevention: str = "taker_at_cross",
-    time_in_force: str = "good_till_canceled",
+    time_in_force: str | None = None,
     subaccount: int | None = None,
     exchange_index: int | None = None,
     reduce_only: bool | None = None,
 ) -> dict[str, Any]:
-    """CreateOrderV2Request for a PlaceOrder (px 1e-4 $, qty 0.01 contracts)."""
+    """CreateOrderV2Request for a PlaceOrder (px 1e-4 $, qty 0.01 contracts).
+
+    time_in_force defaults to the action's own PlaceOrder.time_in_force ('gtc' | 'ioc' |
+    'fok' mapped to the API values); an explicit argument overrides it (audit m6)."""
     _check_px_qty(a.px, a.qty)
+    if time_in_force is None:
+        time_in_force = TIF_FROM_ACTION.get(a.time_in_force, a.time_in_force)
     if self_trade_prevention not in SELF_TRADE_PREVENTION:
         raise ValueError(f"self_trade_prevention_type {self_trade_prevention!r}")
     if time_in_force not in TIME_IN_FORCE:
@@ -115,9 +123,35 @@ def cancel_order_kwargs(a: CancelOrder) -> dict[str, Any]:
     return {"order_id": a.order_id, "market_ticker": a.ticker}
 
 
+def canonical_reason(err: KalshiHTTPError) -> str:
+    """Map a Kalshi error to the OrderManager's reject vocabulary (audit M5).
+
+    not_found | already_filled | already_canceled | expired | rate_limited | http_5xx
+    | post_only_cross | <lower-cased error code> | http_<status>.  The full error body is kept
+    in the recorded REST stream; the reason must be a bare token so state logic matches it.
+    """
+    code = (err.code or "").lower()
+    text = f"{code} {(err.message or '').lower()}"
+    if "already_filled" in text or "executed" in text or "fully filled" in text or "order_filled" in text:
+        return "already_filled"
+    if "cancel" in text and ("already" in text or code in ("order_canceled", "order_cancelled", "canceled")):
+        return "already_canceled"
+    if "expired" in text:
+        return "expired"
+    if err.status == 404 or "not_found" in text or "not found" in text:
+        return "not_found"
+    if err.status == 429:
+        return "rate_limited"
+    if err.status >= 500:
+        return "http_5xx"
+    if "post_only" in text or "would cross" in text or "cross" in code:
+        return "post_only_cross"
+    return code or f"http_{err.status}"
+
+
 def _reject(err: KalshiHTTPError, coid: str, ticker: str, recv_ns: int, request: str) -> OrderReject:
-    reason = f"{err.code}: {err.message}".strip(": ") or f"HTTP {err.status}"
-    return OrderReject(ts=recv_ns, ts_exch=0, client_order_id=coid, ticker=ticker, reason=reason, http_status=err.status, request=request)
+    return OrderReject(ts=recv_ns, ts_exch=0, client_order_id=coid, ticker=ticker, reason=canonical_reason(err),
+                       http_status=err.status, request=request)
 
 
 def create_result_to_events(res: dict[str, Any] | UnknownOutcome | KalshiHTTPError, a: PlaceOrder, recv_ns: int) -> list[Event]:

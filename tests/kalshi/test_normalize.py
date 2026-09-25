@@ -225,8 +225,8 @@ def test_cfbenchmarks_5hz_example(asyncapi_examples):
 
 def test_control_and_ignored_messages(asyncapi_examples):
     for name in ("subscribedResponse", "unsubscribedResponse", "okResponse", "listSubscriptionsResponse",
-                 "cfbenchmarksIndexList", "cfbenchmarks5HzIndexList", "marketPosition", "eventLifecycle",
-                 "pythValue", "rfqCreated", "quoteExecuted", "orderGroupUpdates"):
+                 "cfbenchmarksIndexList", "cfbenchmarks5HzIndexList", "eventLifecycle",
+                 "pythValue", "rfqCreated", "quoteExecuted"):
         for p in asyncapi_examples[name]:
             assert ws_message_to_events(copy.deepcopy(p), R) == [], name
     for p in asyncapi_examples["errorResponse"]:
@@ -234,14 +234,21 @@ def test_control_and_ignored_messages(asyncapi_examples):
         assert fs.stream == "kalshi.ws" and fs.status == "error" and f"code={p['msg']['code']}" in fs.detail
 
 
-def test_order_group_trigger_and_reset_statuses(asyncapi_examples):
+def test_order_group_updates_become_core_events(asyncapi_examples):
+    """Audit M4: live order-group updates use the same core event as the simulator."""
+    from dh.core.events import KalshiOrderGroupUpdate, KalshiPositionSnapshot
+
     m = ex(asyncapi_examples, "orderGroupUpdates")
+    (lu,) = ws_message_to_events(copy.deepcopy(m), R)
+    assert isinstance(lu, KalshiOrderGroupUpdate) and lu.event_type == "limit_updated" and lu.contracts_limit == 15000
     m["msg"]["event_type"] = "triggered"
-    (fs,) = ws_message_to_events(m, R)
-    assert fs.stream == "kalshi.order_group:og_123" and fs.status == "error"
-    assert fs.ts_exch == 1733047200000 * NS_PER_MS
+    (tg,) = ws_message_to_events(m, R)
+    assert isinstance(tg, KalshiOrderGroupUpdate) and tg.order_group_id == "og_123" and tg.event_type == "triggered"
+    assert tg.ts_exch == 1733047200000 * NS_PER_MS
     m["msg"]["event_type"] = "reset"
-    assert ws_message_to_events(m, R)[0].status == "resynced"
+    assert ws_message_to_events(m, R)[0].event_type == "reset"
+    (ps,) = ws_message_to_events(ex(asyncapi_examples, "marketPosition"), R)
+    assert isinstance(ps, KalshiPositionSnapshot) and ps.position == 10000 and ps.cost_micros == 50_000_000
     g = order_group_update(ex(asyncapi_examples, "orderGroupUpdates")["msg"])
     assert g.contracts_limit == 15000 and g.event_type == "limit_updated"
 
@@ -375,3 +382,14 @@ def test_spec_rejections():
                                settlement=SettlementSpec(index_id="ETHUSD_RTI"))
     assert spec.settlement.index_id == "ETHUSD_RTI"
     assert Decimal(str(spec.floor_strike)) == Decimal("114999.99")
+
+
+def test_lifecycle_created_carries_strike_fields(asyncapi_examples):
+    """Audit m5: 'created' lifecycle events carry strike and time fields for replay."""
+    for p in asyncapi_examples["marketLifecycleV2"]:
+        if p["msg"].get("event_type") != "created":
+            continue
+        (lc,) = ws_message_to_events(copy.deepcopy(p), R)
+        md = p["msg"]["additional_metadata"]
+        assert lc.strike_type == md["strike_type"] and lc.floor_strike == float(md["floor_strike"])
+        assert lc.event_ticker == md["event_ticker"] and lc.expected_expiration_ts == md["expected_expiration_ts"] * 10**9

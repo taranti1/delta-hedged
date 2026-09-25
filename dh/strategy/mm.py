@@ -529,7 +529,17 @@ class MarketMaker:
             acts, props = self._quote_market(now, s, f, grid, ev, base, S, D, c_h, health)
             out += acts
             proposals += props
-        out += self._admit(now, proposals, event_wc, total_wc, D)
+        d_up, d_dn = D, D
+        for w in working_all:
+            fw = self.fvc.get(w.ticker)
+            if fw is None:
+                continue
+            c = (1 if w.book_side == "bid" else -1) * (w.remaining_qty + w.inflight_fill_qty) / QTY_SCALE * fw.delta
+            if c > 0:
+                d_up += c
+            else:
+                d_dn += c
+        out += self._admit(now, proposals, event_wc, total_wc, d_up, d_dn)
         # ---------------------------------------------------- hedge
         if cfg.hedge.enabled and health.hedging_allowed:
             out += self._hedge(now, S, D)
@@ -570,8 +580,17 @@ class MarketMaker:
             existing[w.book_side].append(ExistingOrder(w.client_order_id, w.px, w.remaining_qty,
                                                        (qa if qa is not None else 0) / QTY_SCALE,
                                                        age_ns=now - w.created_ns))
-        cap = {side: self.risk.market_capacity(side=side, position=pos, working_bid=0.0, working_ask=0.0, tau_s=tau)
-               for side in ("bid", "ask")}
+        # capacity = limit minus everything that could still fill on that side EXCEPT the kept
+        # orders passed to decide_side (pending cancels and in-flight fills count: audit M1)
+        ex_rem = {sd: sum(o.remaining_qty for o in existing[sd]) for sd in ("bid", "ask")}
+        other_bid = (self.om.worst_case_exposure(t, "bid") - self.om.position(t) - ex_rem["bid"]) / QTY_SCALE
+        other_ask = (self.om.position(t) - self.om.worst_case_exposure(t, "ask") - ex_rem["ask"]) / QTY_SCALE
+        cap = {
+            "bid": self.risk.market_capacity(side="bid", position=pos, working_bid=max(0.0, other_bid),
+                                             working_ask=0.0, tau_s=tau),
+            "ask": self.risk.market_capacity(side="ask", position=pos, working_bid=0.0,
+                                             working_ask=max(0.0, other_ask), tau_s=tau),
+        }
         dF = 0.0
         h = self.fv_hist[t]
         if len(h) > 1:
@@ -599,16 +618,19 @@ class MarketMaker:
                 props.append((d.place.score, s, side, d.place, f))
         return out, props
 
-    def _admit(self, now: int, proposals, event_wc: dict[str, float], total_wc: float, D: float) -> list[Action]:
+    def _admit(self, now: int, proposals, event_wc: dict[str, float], total_wc: float, d_up: float,
+               d_dn: float) -> list[Action]:
         """Greedy cross-market admission by score (EV rate per $ of collateral) under the
         event/total worst-case loss limits and the portfolio delta limit. Each admitted order
-        adds its maximum loss (bid: px * n, ask: (1 - px) * n) to the headroom accounting."""
+        adds its maximum loss (bid: px * n, ask: (1 - px) * n) to the headroom accounting.
+        The delta limit is checked against one-sided worst cases that already include every
+        working order (d_up: all delta-increasing orders fill; d_dn: all decreasing ones),
+        so orders blocked in one cycle cannot slip in on the next (audit M2)."""
         cfg = self.cfg
         q = cfg.quoting
         out: list[Action] = []
         ewc = dict(event_wc)
         twc = total_wc
-        d_now = D
         for score, s, side, cand, f in sorted(proposals, key=lambda p: (-p[0], p[1].ticker, p[2])):
             px = cand.px / PX_SCALE
             n = cand.size
@@ -617,13 +639,17 @@ class MarketMaker:
             if not self.risk.loss_limits_ok(event_worst_loss=ewc.get(e, 0.0) + add, total_worst_loss=twc + add):
                 self.stats.bump("blocked:loss_limit")
                 continue
-            new_d = d_now + (1 if side == "bid" else -1) * n * f.delta
-            if not self.risk.delta_ok(abs(new_d), abs(d_now)):
+            c = (1 if side == "bid" else -1) * n * f.delta
+            base = d_up if c >= 0 else d_dn
+            if not self.risk.delta_ok(abs(base + c), abs(base)):
                 self.stats.bump("blocked:delta")
                 continue
             ewc[e] = ewc.get(e, 0.0) + add
             twc += add
-            d_now = new_d
+            if c >= 0:
+                d_up += c
+            else:
+                d_dn += c
             self.last_place[(s.ticker, side)] = now
             a = PlaceOrder(
                 client_order_id=self.ids.next(), ticker=s.ticker, book_side=side, px=cand.px,

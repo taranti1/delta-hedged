@@ -79,7 +79,7 @@ def test_create_results():
     err = KalshiHTTPError("POST", "/portfolio/events/orders", 400, {"code": "post_only_cross", "message": "would cross"})
     (rej,) = create_result_to_events(err, PLACE, R)
     assert rej == OrderReject(ts=R, ts_exch=0, client_order_id="dhA-1", ticker="KXBTCD-X",
-                              reason="post_only_cross: would cross", http_status=400, request="create")
+                              reason="post_only_cross", http_status=400, request="create")
     assert create_result_to_events(UnknownOutcome("POST", "/p", {}, "timeout"), PLACE, R) == []
 
 
@@ -110,3 +110,26 @@ def test_amend_decrease_cancel_results():
     ]
     (rej,) = cancel_result_to_events(KalshiHTTPError("DELETE", "/x", 404, {"code": "not_found", "message": ""}), c, R)
     assert rej.request == "cancel" and rej.http_status == 404
+
+
+def test_rejects_use_order_manager_vocabulary():
+    """Audit M5: a rejected cancel must not bring the order back to RESTING."""
+    from dh.core.actions import CancelOrder, PlaceOrder
+    from dh.core.events import OrderAck
+    from dh.execution.order_manager import OrderManager, OrderState
+    from dh.kalshi.orders import cancel_result_to_events
+
+    for body, st, final in [({"error": {"code": "not_found", "message": "order not found"}}, 404, OrderState.CANCELED),
+                            ({"error": {"code": "order_already_filled", "message": "x"}}, 400, OrderState.FILLED),
+                            ({"error": {"code": "order_already_canceled", "message": "already canceled"}}, 400,
+                             OrderState.CANCELED)]:
+        om = OrderManager()
+        p = PlaceOrder("c1", "T", "bid", 5000, 500)
+        om.request_place(p, 1)
+        om.on_event(OrderAck(ts=2, ts_exch=0, client_order_id="c1", order_id="o1", ticker="T", fill_qty=0,
+                             remaining_qty=500))
+        c = CancelOrder("c1", "T", order_id="o1")
+        om.request_cancel(c, 3)
+        (rej,) = cancel_result_to_events(KalshiHTTPError("DELETE", "/x", st, body), c, 4)
+        om.on_event(rej)
+        assert om.order("c1").state == final, (body, om.order("c1").state)

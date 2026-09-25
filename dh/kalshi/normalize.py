@@ -28,7 +28,7 @@ WebSocket message types (asyncapi 2.0.0) and their mapping:
                                (full payload: ``order_group_update()``).
   cfbenchmarks_value        -> IndexTick(feed='1hz') incl. avg60 / quarter-hour averages
   cfbenchmarks_value_5hz    -> IndexTick(feed='5hz')
-  market_position           -> [] : a derived position snapshot, not an event the strategy
+  market_position           -> KalshiPositionSnapshot (reconciliation; was [] before audit M4); the
                                may act on (positions come from fills; the live runner
                                reconciles with ``market_position()`` / REST positions).
   event_lifecycle           -> [] : event creation is picked up by metadata discovery (REST).
@@ -58,7 +58,9 @@ from dh.core.events import (
     KalshiFeeUpdate,
     KalshiFill,
     KalshiMarketLifecycle,
+    KalshiOrderGroupUpdate,
     KalshiOrderUpdate,
+    KalshiPositionSnapshot,
     KalshiTicker,
     KalshiTrade,
     Settlement,
@@ -361,11 +363,32 @@ def price_ranges_to_tuples(raw: Any) -> tuple[tuple[int, int, int], ...]:
     return tuple(out)
 
 
+def _strike_fields(m: dict) -> dict:
+    """Strike/metadata fields from a lifecycle message (in `additional_metadata` on
+    'created', possibly top-level on 'metadata_updated'); absent fields stay default."""
+    md = as_dict(m.get("additional_metadata"))
+    src = {**m, **md}
+    out: dict = {}
+    if src.get("event_ticker"):
+        out["event_ticker"] = str(src["event_ticker"])
+    if src.get("strike_type"):
+        out["strike_type"] = str(src["strike_type"])
+    for k in ("floor_strike", "cap_strike"):
+        v = src.get(k)
+        if v not in (None, ""):
+            out[k] = float(v)
+    if src.get("expected_expiration_ts") not in (None, ""):
+        out["expected_expiration_ts"] = s_to_ns(src.get("expected_expiration_ts"))
+    if m.get("open_ts") not in (None, ""):
+        out["open_ts"] = s_to_ns(m.get("open_ts"))
+    return out
+
+
 def _lifecycle(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
     ticker = str(m["market_ticker"])
     et = str(m.get("event_type") or "")
     if et == "metadata_updated":
-        return [KalshiMarketLifecycle(ts=recv_ns, ts_exch=0, ticker=ticker, event_type=et)]
+        return [KalshiMarketLifecycle(ts=recv_ns, ts_exch=0, ticker=ticker, event_type=et, **_strike_fields(m))]
     det_ns = s_to_ns(m.get("determination_ts"))
     set_ns = s_to_ns(m.get("settled_ts"))
     ts_exch = det_ns if et == "determined" else set_ns if et == "settled" else 0
@@ -386,6 +409,7 @@ def _lifecycle(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
             is_deactivated=None if is_deact is None else bool(is_deact),
             price_level_structure=str(m.get("price_level_structure") or ""),
             price_ranges=price_ranges_to_tuples(m.get("price_ranges")),
+            **_strike_fields(m),
         )
     ]
     if et == "determined":
@@ -422,23 +446,31 @@ def _fee_update(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
 
 
 def _order_group(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
-    et = str(m.get("event_type") or "")
-    gid = str(m.get("order_group_id") or "")
-    ts_exch = ms_to_ns(m.get("ts_ms"))
-    stream = f"kalshi.order_group:{gid}"
-    if et == "triggered":
-        return [
-            FeedStatus(
-                ts=recv_ns,
-                ts_exch=ts_exch,
-                stream=stream,
-                status="error",
-                detail="order group triggered: its orders were canceled; entry blocked until reset",
-            )
-        ]
-    if et == "reset":
-        return [FeedStatus(ts=recv_ns, ts_exch=ts_exch, stream=stream, status="resynced", detail="order group reset")]
-    return []
+    """order_group_updates -> core KalshiOrderGroupUpdate (created|triggered|reset|deleted|
+    limit_updated), the same event the simulator emits, so live and replay take the same
+    path through the OrderManager and the strategy (audit M4)."""
+    lim = m.get("contracts_limit_fp")
+    return [
+        KalshiOrderGroupUpdate(
+            ts=recv_ns,
+            ts_exch=ms_to_ns(m.get("ts_ms")),
+            order_group_id=str(m.get("order_group_id") or ""),
+            event_type=str(m.get("event_type") or ""),
+            contracts_limit=opt_qty(lim) if lim not in (None, "") else -1,
+        )
+    ]
+
+
+def _market_position(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
+    """market_positions -> core KalshiPositionSnapshot (reconciliation input)."""
+    snap = market_position(m)
+    return [
+        KalshiPositionSnapshot(
+            ts=recv_ns, ts_exch=0, ticker=snap.ticker, position=snap.position,
+            cost_micros=snap.position_cost_micros, realized_pnl_micros=snap.realized_pnl_micros,
+            fees_paid_micros=snap.fees_paid_micros, source="ws",
+        )
+    ]
 
 
 def cf_frame(data: Any) -> dict:
@@ -532,7 +564,7 @@ _WS_HANDLERS = {
     "order_group_updates": _order_group,
     "cfbenchmarks_value": _cf_1hz,
     "cfbenchmarks_value_5hz": _cf_5hz,
-    "market_position": _ignore,
+    "market_position": _market_position,
     "event_lifecycle": _ignore,
 }
 

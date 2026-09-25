@@ -75,8 +75,8 @@ def test_gap_invalidates_books_requests_resync_and_recovers():
               snap(1, 11, "B"), delta(1, 12, "B")]
     st = KalshiWsState()
     evs, _ = run(frames[:5], st)
-    assert statuses(evs) == [("kalshi.ws", "gap"), ("kalshi.book:A", "gap"), ("kalshi.book:B", "gap")]
-    gap = [e for e in evs if isinstance(e, FeedStatus) and e.stream == "kalshi.ws"][0]
+    assert statuses(evs) == [("kalshi.ws:orderbook_delta", "gap"), ("kalshi.book:A", "gap"), ("kalshi.book:B", "gap")]
+    gap = [e for e in evs if isinstance(e, FeedStatus) and e.stream == "kalshi.ws:orderbook_delta"][0]
     assert "expected=4 got=6 missed=2" in gap.detail
     assert st.take_resync_requests() == [(1, ("A", "B"))]
     assert st.take_resync_requests() == []
@@ -101,7 +101,7 @@ def test_delta_before_snapshot_triggers_resync():
 
 def test_gap_on_trade_channel_keeps_the_message():
     evs, st = run([subscribed(2, "trade", 5), trade(5, 1, "t1"), trade(5, 4, "t4")])
-    assert statuses(evs) == [("kalshi.ws", "gap")]
+    assert statuses(evs) == [("kalshi.ws:trade", "gap")]
     assert [e.trade_id for e in evs if isinstance(e, KalshiTrade)] == ["t1", "t4"]
     assert st.take_resync_requests() == []
 
