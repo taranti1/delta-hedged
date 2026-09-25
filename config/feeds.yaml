@@ -20,6 +20,18 @@ recorder:
   fsync_interval_s: 30.0    # also fsync'ed on hourly rotation and on shutdown
   zstd_level: 3
   rotation: hourly_utc      # informational: fixed by the on-disk format
+  # Low-disk guard (dh.store.recorder.DiskGuard). The disk is SHARED with another system that
+  # fills it at ~12 GB/h; this recorder writes ~0.13-0.25 GB/h. Free space (decimal GB, space
+  # available to this user) of the data root's filesystem is checked at start-up and every
+  # disk_check_interval_s. A threshold of 0 disables that level.
+  disk_check_interval_s: 60
+  min_free_gb_shed: 30      # below: stop recording shed_streams ('meta' disk_shed record) ...
+  shed_hysteresis_gb: 5     # ... until free >= min_free_gb_shed + this ('meta' disk_unshed)
+  min_free_gb_stop: 8       # below: flush + fsync + close, 'meta' disk_stop + session_end, exit 5;
+                            # start-up is refused (exit 5) below it
+  # Non-essential for M1. kalshi.*, meta, clock and status are NEVER shed (ignored if listed);
+  # coinbase.ws, kraken.ws and bitstamp.ws (largest BRTI constituents) are kept by leaving them out.
+  shed_streams: [deribit.options, deribit.ws, okx.ws, hyperliquid.ws, gemini.ws, cryptocom.ws]
 
 clock:
   sample_interval_s: 60     # chronyc / timedatectl / adjtimex offset -> stream 'clock'

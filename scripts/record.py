@@ -18,15 +18,24 @@ What runs (each in its own supervised asyncio task: one venue crashing never sto
     (dh.research.replay_env). (dh.kalshi is imported lazily.)
   * clock-health sampler -> stream 'clock'; a 'meta' record with the session configuration.
   * a status line every ``status_interval_s``: msgs/s per stream, last message age, gaps,
-    reconnects, stale events.
+    reconnects, stale events, free disk space and shed streams.
+  * a low-disk guard (dh.store.recorder.DiskGuard, config ``recorder.*``) every
+    ``disk_check_interval_s`` (and right after a disk-full write error): below
+    ``min_free_gb_shed`` the non-essential ``shed_streams`` stop being recorded (``meta``
+    records mark it; Kalshi, coinbase/kraken/bitstamp, clock and meta keep recording), back
+    above it + ``shed_hysteresis_gb`` they resume (their feeds reconnect for a fresh snapshot);
+    below ``min_free_gb_stop`` the collector shuts down cleanly and exits 5. It also refuses to
+    start (exit 5) below ``min_free_gb_stop``.
 
 Status recording: venue clients write connection markers into their own streams and the
 Kalshi client writes synthetic status frames into 'kalshi.ws', so replay reproduces outages
 from those streams. The 'status' stream only carries what nothing else records: supervisor
 restarts of crashed tasks and Kalshi start-up failures.
 
-Shutdown (SIGINT/SIGTERM or --duration): stop clients, cancel tasks, flush + fsync + write
-segment indexes (Recorder.close()).
+Shutdown (SIGINT/SIGTERM, --duration, or low disk): stop clients, cancel tasks, flush, fsync
+and write segment indexes (Recorder.close()). Exit status: 0 normal, 2 another recorder holds
+the store lock or the recorder config is invalid, 5 (EXIT_LOW_DISK) free space below
+``min_free_gb_stop`` (at start-up or while running).
 """
 
 from __future__ import annotations
@@ -52,9 +61,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from dh.core.events import Event, FeedStatus, KalshiMarketLifecycle  # noqa: E402
-from dh.feeds.base import FeedClient, parse_rfc3339_ns  # noqa: E402
+from dh.feeds.base import FeedClient, make_marker, parse_rfc3339_ns  # noqa: E402
 from dh.feeds.registry import build_feeds, load_feeds_config  # noqa: E402
-from dh.store.recorder import ClockSampler, Recorder  # noqa: E402
+from dh.store.recorder import EXIT_LOW_DISK, ClockSampler, DiskGuard, Recorder  # noqa: E402
 
 log = logging.getLogger("record")
 
@@ -92,6 +101,7 @@ class Monitor:
         self._last_time = now
         rows = []
         streams = {k: (v.count, v.last_t) for k, v in self.recorder.stream_stats().items()}
+        shed = self.recorder.shed_streams
         by_stream = {f.name: f for f in self.feeds.values()}
         for s in sorted(streams):
             count, last_t = streams[s]
@@ -106,9 +116,16 @@ class Monitor:
             elif s == "kalshi.ws" and self.kalshi_ws is not None:
                 st = self.kalshi_ws.state.counters
                 extra = f" gaps={st.get('gaps', 0)} dups={st.get('dups', 0)} connects={self.kalshi_ws.connects}"
+            if s in shed:
+                extra += " SHED (not recorded: low disk)"
             rows.append(f"{s:<22} {rate:8.1f}/s age={age:6.1f}s n={count}{extra}")
         rs = self.recorder.stats
         head = f"recorder records={rs.records} MB={rs.bytes / 1e6:.1f} frames={rs.frames} write_errors={rs.write_errors}"
+        head += f" free_GB={rs.free_gb:.1f}" if rs.free_gb is not None else " free_GB=?"
+        if rs.shed_streams:
+            head += f" LOW-DISK SHED {','.join(rs.shed_streams)} not_recorded={rs.shed_records}"
+        if rs.dropped_records or rs.disk_full_errors:
+            head += f" dropped={rs.dropped_records} disk_full_errors={rs.disk_full_errors}"
         if self.restarts:
             head += f" restarts={self.restarts}"
         return head + "\n  " + "\n  ".join(rows)
@@ -414,15 +431,42 @@ def acquire_single_instance_lock(root: Path) -> Any:
     return f
 
 
-def session_meta(args: argparse.Namespace, cfg: dict[str, Any]) -> bytes:
+def session_meta(args: argparse.Namespace, cfg: dict[str, Any], disk: dict[str, Any] | None = None) -> bytes:
     try:
         commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         commit = ""
     return orjson.dumps({
         "kind": "session_start", "pid": os.getpid(), "host": socket.gethostname(), "argv": sys.argv,
-        "python": platform.python_version(), "git_commit": commit, "config": cfg,
+        "python": platform.python_version(), "git_commit": commit, "config": cfg, "disk": disk,
     }, default=str)
+
+
+def feed_shed_hooks(recorder: Recorder, feeds: dict[str, FeedClient]) -> tuple[Any, Any]:
+    """DiskGuard callbacks keeping shed venue streams self-describing for replay.
+
+    before_shed: a 'disconnected' status marker (dh.feeds.base) into each shed stream whose feed
+    is connected, so replay of that stream alone invalidates its books at the shed (no delta
+    is ever applied across the unrecorded interval). after_unshed: reconnect those feeds, so
+    the resumed recording starts with 'connected' + a fresh snapshot."""
+    by_stream = {f.name: f for f in feeds.values()}
+
+    def before_shed(streams: tuple[str, ...], info: dict[str, Any]) -> None:
+        now = time.time_ns()
+        detail = (f"recorder shed stream: low disk ({info['free_gb']:.1f} GB free < "
+                  f"min_free_gb_shed {info['min_free_gb_shed']:g} GB)")
+        for s in streams:
+            f = by_stream.get(s)
+            if f is not None and f.metrics.connects > f.metrics.disconnects:
+                recorder.write(s, now, make_marker("status", f.conn_id, status="disconnected", detail=detail))
+
+    def after_unshed(streams: tuple[str, ...], info: dict[str, Any]) -> None:
+        for s in streams:
+            f = by_stream.get(s)
+            if f is not None:
+                f.request_reconnect("recording resumed after low-disk shed: fresh snapshot")
+
+    return before_shed, after_unshed
 
 
 async def amain(args: argparse.Namespace) -> int:
@@ -430,14 +474,36 @@ async def amain(args: argparse.Namespace) -> int:
     root = Path(args.root or cfg.get("root") or "data")
     if not root.is_absolute() and not args.root:
         root = REPO / root  # config paths are relative to the repository
+    rcfg = cfg.get("recorder") or {}
+    try:
+        guard = DiskGuard.from_config(rcfg, root)
+    except (ValueError, TypeError) as exc:
+        log.error("invalid recorder disk-guard config: %s", exc)
+        return 2
+    # Low-disk start-up refusal, before anything is created or written under the root. The
+    # filesystem is shared with another system: a full disk must never corrupt this store.
+    disk: dict[str, Any] | None = None
+    try:
+        free_gb, total_gb = guard.measure()
+    except OSError as exc:
+        log.warning("disk: cannot measure free space of %s (%s): guard retries every %g s", guard.path(), exc,
+                    guard.interval_s)
+    else:
+        disk = guard.info(free_gb, total_gb)
+        log.info("disk: %.1f GB free of %.1f GB on %s (%s)", free_gb, total_gb, guard.path(), guard.describe())
+        if guard.below_stop(free_gb):
+            log.error("disk: only %.1f GB free on %s, below min_free_gb_stop %g GB: refusing to start (exit %d). "
+                      "Archive or move data/raw off this disk (docs/RUNBOOK.md section 3), then restart.",
+                      free_gb, guard.path(), guard.min_free_gb_stop, EXIT_LOW_DISK)
+            return EXIT_LOW_DISK
     lock = acquire_single_instance_lock(root)
     if lock is None:
         log.error("another recorder already holds %s: refusing to start (stop it first)", root / "recorder.lock")
         return 2
-    rcfg = cfg.get("recorder") or {}
     recorder = Recorder(root, flush_interval_s=float(rcfg.get("flush_interval_s", 1.0)),
                         fsync_interval_s=float(rcfg.get("fsync_interval_s", 30.0)), zstd_level=int(rcfg.get("zstd_level", 3)))
-    recorder.write("meta", time.time_ns(), session_meta(args, cfg))
+    recorder.write("meta", time.time_ns(), session_meta(args, cfg, disk))
+    guard.recorder = recorder
     monitor = Monitor(recorder)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -450,6 +516,12 @@ async def amain(args: argparse.Namespace) -> int:
     only = [s for s in args.only.split(",") if s] if args.only else None
     feeds = build_feeds(cfg, only=only, status_cb=monitor.on_feed_status)
     monitor.feeds = feeds
+    guard.before_shed, guard.after_unshed = feed_shed_hooks(recorder, feeds)
+    exit_code = 0
+    # first check before any feed starts: sheds at once when already below min_free_gb_shed
+    if guard.check().action == "stop":  # (or fell below min_free_gb_stop since the measure above)
+        exit_code = EXIT_LOW_DISK
+        stop.set()
     sup = cfg.get("supervisor") or {}
     b0, bmax = float(sup.get("restart_backoff_initial_s", 1)), float(sup.get("restart_backoff_max_s", 60))
     tasks: list[asyncio.Task[Any]] = []
@@ -476,7 +548,28 @@ async def amain(args: argparse.Namespace) -> int:
             if sampler.last:
                 log.info("clock src=%s offset_s=%s synced=%s", sampler.last.get("src"), sampler.last.get("offset_s"), sampler.last.get("synced"))
 
+    async def disk_loop() -> None:
+        """DiskGuard every disk_check_interval_s, and at once after a disk-full write error."""
+        nonlocal exit_code
+        last, seen_full = time.monotonic(), recorder.stats.disk_full_errors
+        while True:
+            await asyncio.sleep(min(1.0, guard.interval_s))
+            full = recorder.stats.disk_full_errors
+            if time.monotonic() - last < guard.interval_s and full == seen_full:
+                continue
+            last, seen_full = time.monotonic(), full
+            try:
+                res = guard.check()
+            except Exception:  # noqa: BLE001 - the guard must keep running
+                log.exception("disk guard check failed")
+                continue
+            if res.action == "stop":
+                exit_code = EXIT_LOW_DISK
+                stop.set()
+                return
+
     tasks.append(asyncio.create_task(status_loop(), name="status"))
+    tasks.append(asyncio.create_task(disk_loop(), name="disk"))
     log.info("recording %d feeds%s to %s", len(feeds), " + kalshi" if run_kalshi else "", root / "raw")
     try:
         if args.duration:
@@ -495,10 +588,18 @@ async def amain(args: argparse.Namespace) -> int:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        recorder.write("meta", time.time_ns(), orjson.dumps({"kind": "session_end", "pid": os.getpid()}))
+        end: dict[str, Any] = {"kind": "session_end", "pid": os.getpid()}
+        if exit_code == EXIT_LOW_DISK:
+            end.update(reason="low_disk", exit_code=exit_code, free_gb=recorder.stats.free_gb,
+                       min_free_gb_stop=guard.min_free_gb_stop)
+        recorder.write("meta", time.time_ns(), orjson.dumps(end))  # the final record, then close
         recorder.close()
         log.info("final\n%s", monitor.status_line())
-    return 0
+        if exit_code == EXIT_LOW_DISK:
+            log.error("disk: STOPPED: %.1f GB free on %s < min_free_gb_stop %g GB. Store flushed, fsync'ed and "
+                      "closed cleanly; exit %d. Archive or move data/raw off this disk (docs/RUNBOOK.md section 3), "
+                      "then restart.", recorder.stats.free_gb or 0.0, guard.path(), guard.min_free_gb_stop, EXIT_LOW_DISK)
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:

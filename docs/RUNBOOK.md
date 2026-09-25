@@ -288,7 +288,8 @@ Run it as a service for at least 7 days before trusting any analysis (BUILD_PLAN
 than 0.1% sequence gaps). It writes `data/raw/<stream>/<date>/<hour>.jsonl.zst` and never
 trades (its Kalshi REST client is `read_only`). The runner records its own session store
 separately (`paths.data_root`). One recorder per store: it holds an exclusive `flock` on
-`<root>/recorder.lock` and a second instance exits with status 2.
+`<root>/recorder.lock` and a second instance exits with status 2. Exit status 5 means low
+disk (see "Low disk" below).
 
 **What it records** (default `config/feeds.yaml`, verified live 2026-09-25):
 * Kalshi, ONE WebSocket: `orderbook_delta` + `trade` + `ticker` for **every open KXBTCD, KXBTC
@@ -327,9 +328,12 @@ separately (`paths.data_root`). One recorder per store: it holds an exclusive `f
 | kalshi.rest.* | <1 | ~15-45 | ~1-2 |
 | **total** | | **~1.0-2.4 GB/h** | **~120-250 MB/h = 3-6 GB/day** |
 
-Ranges are quiet vs busy periods (the minutes around an hourly expiry are the busiest). With
-~200 GB free that is roughly 5-8 weeks; plan to move `data/raw` off the machine or prune old
-hours before then (the store is append-only; nothing prunes it automatically). Reduced on
+Ranges are quiet vs busy periods (the minutes around an hourly expiry are the busiest). The
+recorder alone would need 5-8 weeks to fill ~200 GB, but this Mac's disk is SHARED with another
+trading system that writes ~12 GB/h (its data must never be touched): at ~180 GB free
+(2026-09-25) the low-disk guard below starts shedding after about 12 h and stops the recorder
+about 2 h later unless space is freed. The store is append-only and nothing prunes it
+automatically: move `data/raw` off the machine regularly (see "Low disk"). Reduced on
 2026-09-25: Deribit options narrowed from +/-10% to +/-5% moneyness (near-ATM IV is what M1
 needs; `agg2` is not sparser than `100ms`). Kept on purpose: Coinbase full-depth `level2`
 (largest BRTI constituent; the BRTI methodology uses order-book depth) and all Kalshi books.
@@ -348,7 +352,49 @@ permanent setup is the launchd agent in `deploy/launchd/` (KeepAlive, caffeinate
 
 **Health**: a status line every 60 s in the log: per stream msgs/s, age of the last message,
 gaps / resyncs / reconnects / stale / errors (Kalshi: gaps, dups, connects), recorder MB and
-write errors, and the clock sample. `python scripts/replay_inspect.py --root data list | gaps | clock` inspects the store.
+write errors, free disk space (`free_GB=`) and shed streams, and the clock sample.
+`python scripts/replay_inspect.py --root data list | gaps | clock` inspects the store.
+
+**Low disk (shared disk guard, `recorder:` in `config/feeds.yaml`)**. Free space of the
+filesystem holding `data/raw` (decimal GB, `df -H`; space available to this user) is checked
+at start-up and every `disk_check_interval_s` (60 s), and at once after a disk-full write error:
+
+| Free space | What the recorder does | `meta` record |
+|---|---|---|
+| < `min_free_gb_stop` (8 GB) at start-up | refuses to start, writes nothing, **exit 5** | none |
+| < `min_free_gb_shed` (30 GB) | stops writing `shed_streams`: `deribit.options`, `deribit.ws`, `okx.ws`, `hyperliquid.ws`, `gemini.ws`, `cryptocom.ws` (WARNING in the log, `LOW-DISK SHED` in the status line). Kalshi (`kalshi.*`), `coinbase.ws`, `kraken.ws`, `bitstamp.ws`, `clock`, `meta` keep recording; `kalshi.*`, `meta`, `clock`, `status` are never shed even if listed | `disk_shed` (streams, free GB, each stream's last record time) |
+| back >= 30 + `shed_hysteresis_gb` (5) = 35 GB | resumes the shed streams (their feeds reconnect for a fresh book snapshot); no restart needed | `disk_unshed` (records not recorded) |
+| < 8 GB while running | stops the feeds, flushes, fsyncs, writes segment indexes, ERROR in the log, **exit 5** | `disk_stop`, then `session_end` with `reason: low_disk` |
+
+A shed interval is deliberate, not a feed gap: each shed venue stream also gets a
+`disconnected` marker (detail `recorder shed stream: low disk ...`), so replay invalidates its
+books there, and `replay_inspect gaps` shows the interval as an outage. The `meta` records say
+why. A full disk cannot corrupt the store: a frame that cannot be written in full is cut back
+off its segment, so a segment always ends on a complete frame (the status line then shows
+`dropped=` / `disk_full_errors=`).
+
+What to do (never delete or move the other system's files: free space only from OUR `data/`):
+1. Check: `df -H /Users/thomast/Desktop/delta-hedged/data/raw` and
+   `grep -E "disk:|LOW-DISK|DISK FULL" data/logs/record.out | tail`.
+2. Archive closed days of our store to another volume (external disk or NAS). This is safe while
+   the recorder runs, because it only writes the current UTC hour and never reopens old files:
+   ```sh
+   cd /Users/thomast/Desktop/delta-hedged
+   ARCH=/Volumes/<archive>/dh-data; TODAY=$(date -u +%F); mkdir -p "$ARCH/raw"
+   rsync -a --exclude "*/$TODAY/" data/raw/ "$ARCH/raw/"      # every day but today (-n = dry run first)
+   .venv/bin/python scripts/replay_inspect.py --root "$ARCH" list   # the copy reads back, segments indexed
+   ```
+   After checking the copy, remove the copied days (`data/raw/<stream>/<date>`). Never remove
+   today's directory, and wait until a few minutes after 00:00 UTC before archiving yesterday,
+   because its last hour closes shortly after midnight. The `kalshi.ws` and `deribit.options`
+   days are the largest. Another option: stop the
+   recorder, move all of `data/raw` to the other volume and symlink it back
+   (`ln -s /Volumes/<archive>/dh-data/raw data/raw`). The guard then measures that volume.
+3. If it stopped (exit 5), restart it with the `nohup caffeinate ...` command above. The launchd
+   agent (when installed) retries every 30 s by itself. Each refused start logs one ERROR line
+   and writes nothing, and recording starts again once more than 8 GB is free. A start between
+   8 and 30 GB records with the shed streams off. Free space above 35 GB to get them back
+   without a restart.
 
 ---------------------------------------------------------------------------------------------
 ## 4. Paper trading (M1.4): the strategy against the live book, no orders
