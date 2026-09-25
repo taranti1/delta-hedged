@@ -10,9 +10,16 @@ follow from vector operations. The approach is exact for any mix of strike types
 (greater/less/between) and any tail model with a density, and it captures cross-strike netting
 without approximation.
 
+Hedge leg: a perp position H held for the event is modeled as paying H * (R - spot), where
+R = (n*A - sum_fixed)/m is the average of the REMAINING prints. This is exact when the hedge is
+unwound as a TWAP across the remaining settlement prints (the hedge engine's unwind rule) and
+it keeps the hedge mean-zero. Inside the window (m < n) using A instead of R would overstate the
+BTC delta by n/m and give the perp a spurious drift (audit finding M2).
+
 Cross-event (different expirations) risk uses a common-factor approximation: each event's P&L
-is regressed on its own A; with Brownian increments Cov(A_e, A_f) ~= sigma_S^2 * min(tau_e,
-tau_f), so Cov(PnL_e, PnL_f) ~= D_e D_f sigma_S^2 min(tau_e, tau_f), D_e = Cov(PnL_e, A_e)/Var(A_e).
+is regressed on its own R; with Brownian increments Cov(R_e, R_f) ~= sigma_S^2 * min(tau_e,
+tau_f), so Cov(PnL_e, PnL_f) ~= D_e D_f sigma_S^2 min(tau_e, tau_f), D_e = Cov(PnL_e, R_e)/Var(R_e)
+(the BTC delta of the event book).
 """
 
 from __future__ import annotations
@@ -36,8 +43,9 @@ def tail_pdf(x: np.ndarray, tail: str = "gauss", nu: float = 5.0, cv: float = 0.
     gauss        standard normal
     student_t    Student-t with nu > 2 dof, scaled to unit variance
     vol_mixture  Gaussian scale mixture: eps = s * Z, log s ~ N(mu, sd^2) with E[s^2] = 1 and
-                 sd = sqrt(log(1 + cv^2)) (cv = coefficient of variation of s^2... approx of sigma
-                 uncertainty); integrated with 21-node Gauss-Hermite quadrature (deterministic).
+                 sd = sqrt(log(1 + cv^2)) (cv = coefficient of variation of the scale s);
+                 integrated with 21-node Gauss-Hermite quadrature (deterministic). Legacy path:
+                 production code passes dh.models.tails objects instead.
     """
     x = np.asarray(x, dtype=float)
     if tail == "gauss":
@@ -118,6 +126,26 @@ class EventGrid:
     mean_A: float
     var_A: float
     spot: float
+    n_obs: int = 60
+    sum_fixed: float = 0.0
+    m_remaining: int = 60
+
+    @property
+    def R(self) -> np.ndarray:
+        """Average of the remaining (unfixed) prints at each grid point."""
+        if self.m_remaining <= 0:
+            return np.full(self.A.shape, self.spot)
+        return (self.n_obs * self.A - self.sum_fixed) / self.m_remaining
+
+    @property
+    def mean_R(self) -> float:
+        return float(np.dot(self.w, self.R))
+
+    @property
+    def var_R(self) -> float:
+        r = self.R
+        mr = float(np.dot(self.w, r))
+        return float(np.dot(self.w, (r - mr) ** 2))
 
     @classmethod
     def build(
@@ -144,9 +172,10 @@ class EventGrid:
         Cell masses are exact CDF differences; the tails beyond +/-eps_max are folded into the
         end cells.
         """
+        sp = spot if spot is not None else mu_R
         if m_remaining <= 0 or sd_R <= 0:
             a = (sum_fixed + m_remaining * mu_R) / n_obs
-            return cls(np.array([a]), np.array([1.0]), a, 0.0, spot if spot is not None else mu_R)
+            return cls(np.array([a]), np.array([1.0]), a, 0.0, sp, n_obs, sum_fixed, m_remaining)
         edges = np.linspace(-eps_max, eps_max, n_points + 1)
         if breakpoints_A:
             be = (np.asarray(breakpoints_A, dtype=float) * n_obs - sum_fixed) / m_remaining
@@ -163,7 +192,7 @@ class EventGrid:
         A = (sum_fixed + m_remaining * (mu_R + sd_R * mid)) / n_obs
         mean_A = float(np.dot(w, A))
         var_A = float(np.dot(w, (A - mean_A) ** 2))
-        return cls(A, w, mean_A, var_A, spot if spot is not None else mu_R)
+        return cls(A, w, mean_A, var_A, sp, n_obs, sum_fixed, m_remaining)
 
     def prob(self, spec: MarketSpec) -> float:
         return float(np.dot(self.w, payoff_vector(spec, self.A)))
@@ -185,16 +214,17 @@ def book_pnl(
     cost_basis: dict[str, float],
     hedge_btc: float = 0.0,
 ) -> np.ndarray:
-    """P&L ($) at each grid point: sum_i q_i (payoff_i - c_i) + hedge_btc * (A - spot).
+    """P&L ($) at each grid point: sum_i q_i (payoff_i - c_i) + hedge_btc * (R - spot).
 
     positions in contracts (signed YES), cost_basis in $ per contract (YES price paid, average).
+    The hedge leg uses R (remaining-print average), see module docstring.
     """
     pnl = np.full(grid.A.shape, 0.0)
     for t, q in positions.items():
         if q:
             pnl += q * (payoffs[t] - cost_basis.get(t, 0.0))
     if hedge_btc:
-        pnl += hedge_btc * (grid.A - grid.spot)
+        pnl += hedge_btc * (grid.R - grid.spot)
     return pnl
 
 
@@ -220,8 +250,14 @@ def worst_case_loss(
     spot: float,
     hedge_btc: float = 0.0,
     stress_frac: float = 0.15,
+    n_obs: int = 60,
+    sum_fixed: float = 0.0,
+    m_remaining: int = 60,
 ) -> float:
-    """Exact worst-case loss over A in [spot(1-x), spot(1+x)] (piecewise-constant + linear)."""
+    """Exact worst-case loss over A in [spot(1-x), spot(1+x)] (piecewise-constant + linear).
+
+    The hedge leg pays hedge_btc * (R - spot) with R = (n*A - sum_fixed)/m (see module doc).
+    """
     lo, hi = spot * (1 - stress_frac), spot * (1 + stress_frac)
     pts = {lo, hi}
     for t, q in positions.items():
@@ -237,15 +273,20 @@ def worst_case_loss(
         if q:
             pnl += q * (payoff_vector(specs[t], A) - cost_basis.get(t, 0.0))
     if hedge_btc:
-        pnl += hedge_btc * (A - spot)
+        R = (n_obs * A - sum_fixed) / m_remaining if m_remaining > 0 else np.full(A.shape, spot)
+        pnl += hedge_btc * (R - spot)
     return float(max(0.0, -pnl.min()))
 
 
 def risk_stats(grid: EventGrid, pnl: np.ndarray, worst: float) -> BookRisk:
+    """dollar_delta = Cov(PnL, R)/Var(R): the event book's BTC delta (hedge -dollar_delta)."""
     mean = float(np.dot(grid.w, pnl))
     var = float(np.dot(grid.w, (pnl - mean) ** 2))
-    cov = float(np.dot(grid.w, (pnl - mean) * (grid.A - grid.mean_A)))
-    dd = cov / grid.var_A if grid.var_A > 0 else 0.0
+    R = grid.R
+    mr = float(np.dot(grid.w, R))
+    var_r = float(np.dot(grid.w, (R - mr) ** 2))
+    cov = float(np.dot(grid.w, (pnl - mean) * (R - mr)))
+    dd = cov / var_r if var_r > 0 else 0.0
     return BookRisk(mean, var, cvar_loss(pnl, grid.w), worst, dd)
 
 

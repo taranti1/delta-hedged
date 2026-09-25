@@ -87,6 +87,11 @@ class RiskCfg:
     stale_brti_cancel_near_s: float = 3.0
     stale_brti_cancel_all_s: float = 10.0
     order_group_limit_contracts: float = 50.0
+    order_group_cooldown_s: float = 60.0  # pause after the exchange auto-cancels a fill burst
+    brti_resume_after_s: float = 30.0  # after a BRTI outage, require this long of fresh ticks
+    book_resume_after_s: float = 5.0  # after a book gap/resync, wait before quoting that market
+    kalshi_stream: str = "kalshi.ws"
+    hedge_stream: str = "kalshi_perp.ws"  # FeedStatus stream of the hedge venue
 
 
 @dataclass(frozen=True)

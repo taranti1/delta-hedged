@@ -210,6 +210,8 @@ class QueueEstimator:
             o.queue_ahead = self._arrival_queue(o) if queue_ahead is None else max(0, int(queue_ahead))
         return o
 
+    on_own_order = add_order  # name used in docs/INTERFACES.md
+
     def activate(self, key: str, queue_ahead: int | None = None) -> None:
         """Live fallback when no own delta was seen: join behind the displayed level now."""
         o = self.orders.get(key)

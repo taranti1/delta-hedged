@@ -23,7 +23,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from dh.core.actions import AmendOrder, CancelAll, CancelOrder, DecreaseOrder, PlaceOrder
-from dh.core.events import CancelAck, KalshiFill, KalshiOrderUpdate, OrderAck, OrderReject, Timer
+from dh.core.events import (
+    CancelAck,
+    KalshiFill,
+    KalshiOrderGroupUpdate,
+    KalshiOrderUpdate,
+    KalshiPositionSnapshot,
+    OrderAck,
+    OrderReject,
+    Timer,
+)
 from dh.core.units import NS_PER_S, PX_SCALE, notional_micros
 
 
@@ -50,7 +59,7 @@ NOT_FOUND_REASONS = frozenset({"not_found", "order_not_found", "404"})
 EVENT_KINDS = (
     "accepted", "rejected", "fill", "filled", "canceled", "amended", "decreased", "cancel_rejected",
     "amend_rejected", "decrease_rejected", "cancel_ready", "reconcile_needed", "position_mismatch",
-    "orphan_fill", "unknown_order",
+    "orphan_fill", "unknown_order", "group_triggered", "group_reset",
 )
 
 
@@ -187,6 +196,7 @@ class OrderManager:
         self._fees: dict[str, int] = {}
         self._volume: dict[str, int] = {}
         self._seq = 0
+        self._groups_blocked: set[str] = set()
         self.stats = {"duplicate_fills": 0, "orphan_fills": 0, "position_mismatches": 0, "unknown_events": 0,
                       "stale_updates": 0}
 
@@ -275,7 +285,28 @@ class OrderManager:
             return self._on_reject(ev)
         if isinstance(ev, Timer):
             return self.check_timeouts(ev.ts)
+        if isinstance(ev, KalshiOrderGroupUpdate):
+            return self._on_group(ev)
+        if isinstance(ev, KalshiPositionSnapshot):
+            return self.reconcile_position(ev.ticker, ev.position, ev.ts)
         return []
+
+    def _on_group(self, g: KalshiOrderGroupUpdate) -> list[OrderEvent]:
+        """A triggered group cancels all its orders at the exchange (their cancel updates follow)
+        and rejects new ones until reset; track it so the strategy can stop using the group."""
+        if g.event_type == "triggered":
+            self._groups_blocked.add(g.order_group_id)
+            return [OrderEvent(g.ts, "group_triggered", "", "", detail=g.order_group_id)]
+        if g.event_type in ("reset", "created", "deleted"):
+            was = g.order_group_id in self._groups_blocked
+            self._groups_blocked.discard(g.order_group_id)
+            if was:
+                return [OrderEvent(g.ts, "group_reset", "", "", detail=f"{g.order_group_id}:{g.event_type}")]
+        return []
+
+    def group_blocked(self, order_group_id: str) -> bool:
+        """True after the group triggered (limit hit) until it is reset / recreated."""
+        return order_group_id in self._groups_blocked
 
     def check_timeouts(self, now_ns: int) -> list[OrderEvent]:
         """Flag requests without a response for too long (unknown outcome -> reconcile)."""

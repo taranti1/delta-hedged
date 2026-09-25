@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 from dh.core.actions import CancelHedge, PlaceHedge
 from dh.core.book import ExtBook
-from dh.core.events import ExtBookDelta, ExtBookSnapshot, ExtTrade, HedgeFill, HedgeOrderUpdate, PerpState
+from dh.core.events import ExtBBO, ExtBookDelta, ExtBookSnapshot, ExtTrade, HedgeFill, HedgeOrderUpdate, PerpState
 from dh.execution.latency import LatencyModel
 from dh.execution.queue import normalize_policy
 
@@ -173,12 +173,18 @@ class HedgeVenueSim:
             self._process_x(t, kind, payload)
         self._now = max(self._now, ts)
         if self._mine(ev):
-            if isinstance(ev, ExtBookSnapshot):
-                self.book.snapshot(ev.bids, ev.asks, ev.ts, ev.seq)
+            if isinstance(ev, (ExtBookSnapshot, ExtBBO)):
+                bbo = isinstance(ev, ExtBBO)
+                if bbo:
+                    self.book.apply_bbo(ev)  # top-of-book-only venue: a one-level book
+                else:
+                    self.book.snapshot(ev.bids, ev.asks, ev.ts, ev.seq)
                 self._consumed.clear()
                 self._pend_trade.clear()
                 for o in self._resting.values():
-                    o.queue_ahead = min(o.queue_ahead, self._level(o.side, o.limit_px))
+                    # a BBO says nothing about deeper levels: only clamp orders at the new touch
+                    if not bbo or o.limit_px == (ev.bid if o.side == "buy" else ev.ask):
+                        o.queue_ahead = min(o.queue_ahead, self._level(o.side, o.limit_px))
             elif isinstance(ev, ExtBookDelta):
                 for side, price, size in ev.changes:
                     self._on_level(side, price, size, ts)

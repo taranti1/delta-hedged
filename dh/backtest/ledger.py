@@ -7,7 +7,10 @@ strategy's `Log('fv', ...)` records, and attributes every Kalshi fill:
     markout(h)        (F_{t+h} - F_fill) * s          (negative = adverse selection at horizon h)
     settlement        (settle - F_fill) * s          (= total information/inventory P&L after fill)
     kalshi fee        exchange-reported fee_cost (or simulator fee engine)
-    hedge cost        hedge fees + spread paid, allocated to fills by |delta contribution|
+    hedge cost/P&L    hedge book marked to the benchmark (IndexTick 'BRTI'); fees and P&L of each
+                      hedge interval allocated to the Kalshi fills outstanding at its start by
+                      |delta x contracts|; amounts with nothing outstanding are reported as
+                      unallocated (never dropped)
     net               (settle - px) * s - fee - allocated hedge cost + allocated hedge P&L
 
 Primary outputs: realized net cents per filled contract (event-clustered CI), profitable
@@ -26,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from dh.core.actions import Log
-from dh.core.events import HedgeFill, KalshiFill, Settlement
+from dh.core.events import HedgeFill, IndexTick, KalshiFill, Settlement
 from dh.core.units import MICROS, NS_PER_S, PX_SCALE, QTY_SCALE
 
 MARKOUT_H_S = (0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0)
@@ -38,9 +41,13 @@ class FvSeries:
     F: list[float] = field(default_factory=list)
     delta: list[float] = field(default_factory=list)
 
-    def at(self, t: int) -> tuple[float, float] | None:
+    def at(self, t: int, max_age_ns: int | None = None) -> tuple[float, float] | None:
+        """Last observation at or before t; None if none, or if older than max_age_ns
+        (a markout must not silently reuse a stale value after logging stopped)."""
         i = bisect.bisect_right(self.ts, t) - 1
         if i < 0:
+            return None
+        if max_age_ns is not None and t - self.ts[i] > max_age_ns:
             return None
         return self.F[i], self.delta[i]
 
@@ -77,13 +84,19 @@ class FillRecord:
 
 
 class Ledger:
-    def __init__(self, event_of: dict[str, str], expiration_of: dict[str, int]) -> None:
+    def __init__(self, event_of: dict[str, str], expiration_of: dict[str, int],
+                 mark_index_id: str = "BRTI", markout_max_age_s: float = 5.0) -> None:
         self.event_of = event_of
         self.expiration_of = expiration_of
         self.fv: dict[str, FvSeries] = defaultdict(FvSeries)
         self.fills: list[FillRecord] = []
         self.settle: dict[str, float] = {}
         self.hedge_fills: list[HedgeFill] = []
+        self.mark_index_id = mark_index_id
+        self.mark_ts: list[int] = []
+        self.mark_px: list[float] = []
+        self.markout_max_age_ns = int(markout_max_age_s * NS_PER_S)
+        self.hedge_totals: dict[str, float] = {}
         self.first_ts = 0
         self.last_ts = 0
 
@@ -104,6 +117,10 @@ class Ledger:
             self.settle[ev.ticker] = ev.settlement_px / PX_SCALE
         elif isinstance(ev, HedgeFill):
             self.hedge_fills.append(ev)
+        elif isinstance(ev, IndexTick) and ev.index_id == self.mark_index_id:
+            if not self.mark_ts or ev.ts >= self.mark_ts[-1]:
+                self.mark_ts.append(ev.ts)
+                self.mark_px.append(ev.value)
 
     def on_log(self, ts: int, log: Log) -> None:
         if log.kind == "fv":
@@ -117,12 +134,17 @@ class Ledger:
 
     # ------------------------------------------------------------------ attribution
     def attribute(self) -> pd.DataFrame:
+        """Idempotent: recomputes every derived field from the raw inputs."""
         for f in self.fills:
-            cur = self.fv[f.ticker].at(f.ts)
+            f.F, f.delta = math.nan, 0.0
+            f.markouts = {}
+            f.hedge_alloc_cost = 0.0
+            f.hedge_alloc_pnl = 0.0
+            cur = self.fv[f.ticker].at(f.ts, self.markout_max_age_ns)
             if cur is not None:
                 f.F, f.delta = cur
             for h in MARKOUT_H_S:
-                later = self.fv[f.ticker].at(f.ts + int(h * NS_PER_S))
+                later = self.fv[f.ticker].at(f.ts + int(h * NS_PER_S), self.markout_max_age_ns)
                 if later is not None and not math.isnan(f.F):
                     f.markouts[h] = (later[0] - f.F) * f.side
             f.settle = self.settle.get(f.ticker, math.nan)
@@ -141,29 +163,66 @@ class Ledger:
             rows.append(r)
         return pd.DataFrame(rows)
 
+    def _mark(self, t: int) -> float | None:
+        i = bisect.bisect_right(self.mark_ts, t) - 1
+        return self.mark_px[i] if i >= 0 else None
+
     def _allocate_hedges(self) -> None:
-        """Allocate hedge fees and hedge P&L to Kalshi fills pro rata to |delta| contribution
-        within the same hour bucket (simple, transparent; exact portfolio attribution is
-        reported separately in the summary)."""
-        if not self.hedge_fills or not self.fills:
+        """Mark the hedge book to the benchmark and allocate its P&L and costs to Kalshi fills.
+
+        Hedge P&L is exact at portfolio level: execution vs mark at each hedge fill, plus the
+        position held between consecutive hedge fills marked to the benchmark, plus the final
+        position marked at the last mark. Each piece is allocated pro rata to |delta x contracts|
+        of the Kalshi fills outstanding at its start (filled before, expiring after). Pieces with no
+        outstanding fill go to `unallocated` (reported, never dropped).
+        """
+        tot = {"hedge_pnl": 0.0, "hedge_fees": 0.0, "unallocated_pnl": 0.0, "unallocated_fees": 0.0,
+               "missing_marks": 0.0}
+        self.hedge_totals = tot
+        if not self.hedge_fills:
             return
-        by_hour: dict[int, list[FillRecord]] = defaultdict(list)
-        for f in self.fills:
-            by_hour[f.ts // (3600 * NS_PER_S)].append(f)
-        for h in self.hedge_fills:
-            bucket = by_hour.get(h.ts // (3600 * NS_PER_S)) or []
-            wsum = sum(abs(f.delta * f.contracts) for f in bucket)
+        hf = sorted(self.hedge_fills, key=lambda h: h.ts)
+        fills = sorted(self.fills, key=lambda f: f.ts)
+
+        def outstanding(t: int) -> list[FillRecord]:
+            return [f for f in fills if f.ts <= t and self.expiration_of.get(f.ticker, 0) > t]
+
+        def allocate(t: int, pnl: float, fee: float) -> None:
+            live = outstanding(t)
+            wsum = sum(abs(f.delta * f.contracts) for f in live)
             if wsum <= 0:
-                continue
-            for f in bucket:
-                f.hedge_alloc_cost += h.fee_usd * abs(f.delta * f.contracts) / wsum
+                tot["unallocated_pnl"] += pnl
+                tot["unallocated_fees"] += fee
+                return
+            for f in live:
+                w = abs(f.delta * f.contracts) / wsum
+                f.hedge_alloc_pnl += pnl * w
+                f.hedge_alloc_cost += fee * w
+
+        pos = 0.0
+        end_t = self.mark_ts[-1] if self.mark_ts else hf[-1].ts
+        for i, h in enumerate(hf):
+            sgn = 1.0 if h.side == "buy" else -1.0
+            m = self._mark(h.ts)
+            exec_pnl = sgn * h.qty_btc * ((m if m is not None else h.price) - h.price)
+            pos += sgn * h.qty_btc
+            t_next = hf[i + 1].ts if i + 1 < len(hf) else end_t
+            m0, m1 = self._mark(h.ts), self._mark(t_next)
+            carry = pos * (m1 - m0) if (m0 is not None and m1 is not None) else 0.0
+            if pos and (m0 is None or m1 is None):
+                tot["missing_marks"] += 1  # hedge interval could not be marked: P&L understated
+            piece = exec_pnl + carry
+            tot["hedge_pnl"] += piece
+            tot["hedge_fees"] += h.fee_usd
+            allocate(h.ts, piece, h.fee_usd)
 
     # ------------------------------------------------------------------ summary
     def summary(self, df: pd.DataFrame | None = None, n_boot: int = 500, seed: int = 5) -> dict:
         df = self.attribute() if df is None else df
         done = df[~df.settle.isna()]
+        out_h = dict(self.hedge_totals)
         days = max((self.last_ts - self.first_ts) / (86_400 * NS_PER_S), 1e-9)
-        out: dict = {"fills": len(df), "settled_fills": len(done), "days": days}
+        out: dict = {"fills": len(df), "settled_fills": len(done), "days": days, **{f"hedge_{k}" if not k.startswith("hedge") else k: v for k, v in out_h.items()}}
         if not len(done):
             return out
         ct = done.contracts.sum()

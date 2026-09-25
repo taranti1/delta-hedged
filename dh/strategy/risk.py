@@ -24,6 +24,19 @@ class Health:
 
 
 class RiskEngine:
+    """Feed-status routing is by EXACT stream name (never by prefix):
+
+      cfg.kalshi_stream ('kalshi.ws')      connection: disconnected/stale/gap -> not ready + CancelAll;
+                                           connected/resynced -> ready after book_resume_after_s;
+                                           'error' (bad frame, command error) is logged only
+      'kalshi.book:<ticker>'               per-market book validity (gap/disconnected -> invalid;
+                                           resynced -> valid after book_resume_after_s)
+      'kalshi.order_group:<id>'            'error' = exchange auto-canceled the group (fill burst):
+                                           pause quoting order_group_cooldown_s; 'resynced' = reset
+      cfg.hedge_stream ('kalshi_perp.ws')  hedge venue connection
+      '<venue>.ws'                         external venue: disconnected/stale -> venue counted stale
+    """
+
     def __init__(self, cfg: RiskCfg) -> None:
         self.cfg = cfg
         self.halted_all = False
@@ -31,41 +44,85 @@ class RiskEngine:
         self.halt_reason = ""
         self.pause_until_ns = 0
         self.last_brti_ns = 0
+        self.brti_resume_ns = 0
         self.last_ext_ns: dict[str, int] = {}
         self.kalshi_ok = False
         self.kalshi_resume_ns = 0
+        self.invalid_books: set[str] = set()
+        self.book_resume_ns: dict[str, int] = {}
+        self.group_pause_until_ns = 0
+        self.groups_triggered: set[str] = set()
         self.hedge_venue_ok = True
         self.day = -1
         self.day_start_equity = 0.0
         self.fee_mismatch = False
         self.recon_mismatch = False
+        self.log: list[tuple[int, str]] = []  # (ts, message) informational, bounded by caller
 
     # ------------------------------------------------------------------ feed health
     def note_brti(self, ts_ns: int) -> None:
+        """Called on every settlement-benchmark tick (receive time). An inter-tick gap longer
+        than the cancel-all threshold is an outage: quoting resumes only after
+        brti_resume_after_s of fresh ticks."""
+        c = self.cfg
+        if self.last_brti_ns and ts_ns - self.last_brti_ns > c.stale_brti_cancel_all_s * NS_PER_S:
+            self.brti_resume_ns = ts_ns + int(c.brti_resume_after_s * NS_PER_S)
         self.last_brti_ns = max(self.last_brti_ns, ts_ns)
 
     def note_ext(self, venue: str, ts_ns: int) -> None:
         self.last_ext_ns[venue] = max(self.last_ext_ns.get(venue, 0), ts_ns)
 
     def on_feed_status(self, ev: FeedStatus) -> list[Action]:
+        c = self.cfg
         out: list[Action] = []
-        if ev.stream.startswith("kalshi"):
-            if ev.status in ("disconnected", "gap", "error", "stale"):
+        st = ev.stream
+        if st == c.kalshi_stream:
+            if ev.status in ("disconnected", "gap", "stale"):
                 if self.kalshi_ok or ev.status == "gap":
                     out.append(CancelAll(reason=f"kalshi_{ev.status}"))
                 self.kalshi_ok = False
-            elif ev.status in ("connected", "resynced"):
+            elif ev.status in ("connected", "resynced", "resumed"):
                 self.kalshi_ok = True
-                self.kalshi_resume_ns = ev.ts + 5 * NS_PER_S  # books must be valid for 5 s
-        elif ev.stream.startswith("hedge"):
-            self.hedge_venue_ok = ev.status in ("connected", "resynced")
+                self.kalshi_resume_ns = ev.ts + int(c.book_resume_after_s * NS_PER_S)
+            else:  # 'error': malformed frame / command error -> informational
+                self.log.append((ev.ts, f"kalshi error: {ev.detail}"))
+        elif st.startswith("kalshi.book:"):
+            ticker = st.split(":", 1)[1]
+            if ev.status in ("gap", "disconnected", "stale", "error"):
+                if ticker not in self.invalid_books:
+                    out.append(CancelAll(reason=f"book_{ev.status}", tickers=(ticker,)))
+                self.invalid_books.add(ticker)
+            elif ev.status in ("resynced", "connected", "resumed"):
+                self.invalid_books.discard(ticker)
+                self.book_resume_ns[ticker] = ev.ts + int(c.book_resume_after_s * NS_PER_S)
+        elif st.startswith("kalshi.order_group:"):
+            gid = st.split(":", 1)[1]
+            if ev.status == "error":  # triggered: exchange auto-canceled the group's orders
+                self.groups_triggered.add(gid)
+                self.group_pause_until_ns = max(self.group_pause_until_ns,
+                                                ev.ts + int(c.order_group_cooldown_s * NS_PER_S))
+                out.append(Log("risk", {"event": "order_group_triggered", "group": gid}))
+            elif ev.status in ("resynced", "connected"):
+                self.groups_triggered.discard(gid)
+        elif st == c.hedge_stream:
+            if ev.status in ("disconnected", "stale", "error", "gap"):
+                self.hedge_venue_ok = False
+            elif ev.status in ("connected", "resynced", "resumed"):
+                self.hedge_venue_ok = True
+        elif st.endswith(".ws"):
+            venue = st[: -len(".ws")]
+            if ev.status in ("disconnected", "stale") and venue in self.last_ext_ns:
+                self.last_ext_ns[venue] = 0  # counts as stale until data flows again
         return out
+
+    def book_ok(self, ticker: str, now_ns: int) -> bool:
+        return ticker not in self.invalid_books and now_ns >= self.book_resume_ns.get(ticker, 0)
 
     def health(self, now_ns: int) -> Health:
         c = self.cfg
         reasons: list[str] = []
         brti_age = (now_ns - self.last_brti_ns) / NS_PER_S if self.last_brti_ns else float("inf")
-        fresh_ext = sum(1 for t in self.last_ext_ns.values() if (now_ns - t) / NS_PER_S <= c.stale_ext_s)
+        fresh_ext = sum(1 for t in self.last_ext_ns.values() if t and (now_ns - t) / NS_PER_S <= c.stale_ext_s)
         quoting = True
         if self.halted_all or self.halted_quoting:
             quoting = False
@@ -73,12 +130,18 @@ class RiskEngine:
         if now_ns < self.pause_until_ns:
             quoting = False
             reasons.append("paused")
+        if now_ns < self.group_pause_until_ns or self.groups_triggered:
+            quoting = False
+            reasons.append("order_group_triggered")
         if not self.kalshi_ok or now_ns < self.kalshi_resume_ns:
             quoting = False
             reasons.append("kalshi_not_ready")
         if brti_age > c.stale_brti_cancel_all_s:
             quoting = False
             reasons.append(f"brti_stale_{brti_age:.1f}s")
+        if now_ns < self.brti_resume_ns:
+            quoting = False
+            reasons.append("brti_recovering")
         if self.last_ext_ns and fresh_ext < min(2, len(self.last_ext_ns)):
             quoting = False
             reasons.append("external_stale")

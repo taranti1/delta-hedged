@@ -41,6 +41,7 @@ from dh.core.events import (
     KalshiBookSnapshot,
     KalshiFill,
     KalshiMarketLifecycle,
+    KalshiOrderGroupUpdate,
     KalshiOrderUpdate,
     KalshiTrade,
     OrderAck,
@@ -178,16 +179,19 @@ class KalshiExchangeSim:
         if contracts_limit <= 0:
             raise ValueError("contracts_limit must be > 0")
         self.groups[group_id] = _Group(int(contracts_limit))
+        self._group_msg(group_id, "created", self._now, int(contracts_limit))
 
     def reset_order_group(self, group_id: str) -> None:
         g = self.groups[group_id]
         g.window.clear()
         g.matched = 0
         g.triggered = False
+        self._group_msg(group_id, "reset", self._now)
 
     def update_order_group_limit(self, group_id: str, contracts_limit: int) -> None:
         g = self.groups[group_id]
         g.limit = int(contracts_limit)
+        self._group_msg(group_id, "limit_updated", self._now, g.limit)
         self._roll(g, self._now)
         if g.matched >= g.limit:
             self._trigger_group(group_id, self._now)
@@ -197,6 +201,7 @@ class KalshiExchangeSim:
             if o.group == group_id:
                 self._cancel(o, self._now, "order_group_deleted")
         self.groups.pop(group_id, None)
+        self._group_msg(group_id, "deleted", self._now)
 
     # ================================================================== runner API
     def submit(self, action: Any, decision_ns: int) -> bool:
@@ -626,12 +631,18 @@ class KalshiExchangeSim:
         while w and w[0][0] <= t - GROUP_WINDOW_NS:
             g.matched -= w.popleft()[1]
 
+    def _group_msg(self, group_id: str, event_type: str, t: int, limit: int = -1) -> None:
+        """WS order_group_updates message."""
+        d = self._ws_time(t)
+        self._deliver(d, KalshiOrderGroupUpdate(d, self._exch(t), group_id, event_type, limit))
+
     def _trigger_group(self, group_id: str, t: int) -> None:
         g = self.groups[group_id]
         if g.triggered:
             return
         g.triggered = True
         self.stats["group_triggers"] += 1
+        self._group_msg(group_id, "triggered", t)
         for o in list(self._resting.values()):
             if o.group == group_id:
                 self._cancel(o, t, "order_group_triggered")

@@ -94,3 +94,27 @@ def test_worst_case_and_cvar():
 def test_fully_fixed_window_is_deterministic():
     g = EventGrid.build(n_obs=60, sum_fixed=60 * 84010.0, m_remaining=0, mu_R=84000.0, sd_R=0.0)
     assert g.prob(spec("a", floor=84000.0)) == 1.0
+
+
+def test_hedge_inside_window_uses_remaining_average():
+    """Audit M2: with 30 of 60 prints fixed, the BTC delta is dE/dS and the perp leg is mean-zero."""
+    S, sd = 84000.0, 30.0
+    fixed = 30 * (S + 100.0)
+    K = S + 60.0
+    a = spec("a", floor=K)
+    g = EventGrid.build(n_obs=60, sum_fixed=fixed, m_remaining=30, mu_R=S, sd_R=sd, spot=S,
+                        n_points=4001, breakpoints_A=(K,))
+    pay = {"a": payoff_vector(a, g.A)}
+    base = book_pnl(g, pay, {"a": 1.0}, {"a": 0.5})
+    r = risk_stats(g, base, 0.0)
+    # central finite-difference BTC delta of P(YES): shift spot (mu_R) by +/- $0.5
+    def p_at(x):
+        return EventGrid.build(n_obs=60, sum_fixed=fixed, m_remaining=30, mu_R=x, sd_R=sd, spot=x,
+                               n_points=4001, breakpoints_A=(K,)).prob(a)
+
+    fd = p_at(S + 0.5) - p_at(S - 0.5)
+    assert abs(r.dollar_delta - fd) / fd < 0.003
+    hedged = book_pnl(g, pay, {"a": 1.0}, {"a": 0.5}, hedge_btc=-r.dollar_delta)
+    rh = risk_stats(g, hedged, 0.0)
+    assert abs(rh.mean - r.mean) < 1e-9  # perp leg is mean-zero
+    assert rh.var < 0.5 * r.var  # the correct hedge removes most of the linear risk

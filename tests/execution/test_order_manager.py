@@ -280,3 +280,18 @@ def test_any_delivery_order_converges(kind, data, cancel_at):
     assert om.position(T) == final == o.filled_qty
     assert om.working(T) == [] and o.inflight_fill_qty == 0
     assert om.worst_case_exposure(T, "bid") == final and om.worst_case_exposure(T, "ask") == final
+
+
+def test_order_group_updates_and_position_snapshots():
+    from dh.core.events import KalshiOrderGroupUpdate, KalshiPositionSnapshot
+
+    om = placed()
+    assert kinds(om.on_event(KalshiOrderGroupUpdate(1, 0, "g1", "triggered"))) == ["group_triggered"]
+    assert om.group_blocked("g1") and not om.group_blocked("g2")
+    assert kinds(om.on_event(KalshiOrderGroupUpdate(2, 0, "g1", "reset"))) == ["group_reset"]
+    assert not om.group_blocked("g1")
+    assert om.on_event(KalshiOrderGroupUpdate(3, 0, "g1", "limit_updated", 500)) == []
+    om.on_event(fill(4, "c1", "X1", "bid", 4500, 300, "t1"))
+    assert om.on_event(KalshiPositionSnapshot(5, 0, T, 300)) == []
+    evs = om.on_event(KalshiPositionSnapshot(6, 0, T, 400))
+    assert kinds(evs) == ["position_mismatch"] and om.position(T) == 300  # never adopted silently

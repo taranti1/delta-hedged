@@ -268,3 +268,20 @@ def test_determinism_same_seed_identical_output():
     assert a == b and fa == fb and len(a) > 20
     assert [e.ts for e in a] != [e.ts for e in c]
     assert no_fee(1, 1, True) == 0
+
+
+def test_order_group_messages_reach_order_manager():
+    from dh.core.events import KalshiOrderGroupUpdate
+
+    sim = make_sim()
+    sim.create_order_group("g", 300)
+    sched = [(0, PlaceOrder("a", T, "bid", 4500, 1000, order_group_id="g"))]
+    evs = [snap(0, yes=((4400, 100),)), delta(1, "yes", 4300, 1), trade(1 * S, 4500, 500, "no")]
+    strat, out = run(sim, evs, sched)
+    msgs = [(m.event_type, m.contracts_limit) for m in out if isinstance(m, KalshiOrderGroupUpdate)]
+    assert msgs == [("created", 300), ("triggered", -1)]
+    assert strat.om.group_blocked("g") and strat.om.order("a").state is OrderState.CANCELED
+    assert strat.om.position(T) == 300
+    sim.reset_order_group("g")
+    run_interleaved([delta(2 * S, "yes", 4300, 1)], strat, [sim])
+    assert not strat.om.group_blocked("g")
