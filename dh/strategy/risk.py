@@ -63,6 +63,7 @@ class RiskEngine:
         self.seed_day = -1
         self.seed_day_pnl = 0.0
         self.lag_ok = True  # runner consumer/data lag (audit live M1)
+        self.clock_ok = True  # runner receive-clock offset within limits (audit live m9)
         self.reconciling = False  # own-activity reconciliation after a reconnect (audit live M3)
         self.fee_mismatch = False
         self.recon_mismatch = False
@@ -124,6 +125,14 @@ class RiskEngine:
                 self.lag_ok = False
             elif ev.status in ("resumed", "resynced", "connected"):
                 self.lag_ok = True
+            return out
+        if st == c.clock_stream:
+            if ev.status in ("stale", "gap", "disconnected", "error"):
+                if self.clock_ok:
+                    out.append(CancelAll(reason="clock_offset"))
+                self.clock_ok = False
+            elif ev.status in ("resumed", "resynced", "connected"):
+                self.clock_ok = True
             return out
         if st == c.reconcile_stream:
             if ev.status in ("stale", "gap", "disconnected"):
@@ -199,6 +208,9 @@ class RiskEngine:
         if not self.lag_ok:
             quoting = False
             reasons.append("runner_lag")
+        if not self.clock_ok:
+            quoting = False
+            reasons.append("clock_offset")
         if self.reconciling:
             quoting = False
             reasons.append("reconciling")

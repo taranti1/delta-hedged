@@ -70,39 +70,6 @@ class StartupError(RuntimeError):
     """The runner refuses to start (exit code 2); the message says why."""
 
 
-class _YieldPerFrame:
-    """WebSocket proxy whose recv() always yields to the event loop once: a feed reader that
-    drains a full receive buffer (websockets returns buffered frames without suspending) can
-    then never starve the strategy consumer, the order requests or the heartbeat."""
-
-    def __init__(self, ws: Any) -> None:
-        self._ws = ws
-
-    async def recv(self, *args: Any, **kw: Any) -> Any:
-        m = await self._ws.recv(*args, **kw)
-        await asyncio.sleep(0)
-        return m
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._ws, name)
-
-
-def yield_per_frame(feed: Any) -> bool:
-    """Make an external FeedClient's reader yield once per frame (wraps its connection)."""
-    import contextlib
-
-    orig = getattr(feed, "_ws_connect", None)
-    if orig is None or getattr(feed, "_dh_yield_per_frame", False):
-        return False
-
-    @contextlib.asynccontextmanager
-    async def connect() -> Any:
-        async with orig() as ws:
-            yield _YieldPerFrame(ws)
-
-    feed._ws_connect = connect  # noqa: SLF001
-    feed._dh_yield_per_frame = True  # noqa: SLF001
-    return True
 
 
 @dataclass
@@ -462,7 +429,8 @@ class LiveApp:
             if not getattr(feed, "implemented", True):
                 log.warning("feed %s is a stub: skipped", name)
                 continue
-            yield_per_frame(feed)
+            # FeedClient._reader yields once per frame (dh.feeds.base), so a busy feed cannot
+            # starve the consumer, order requests or the heartbeat (audit live M2)
             runner.add_source(name, (lambda f=feed: f.run(self.recorder.write)), stop=feed.stop)
 
     # ------------------------------------------------------------------ run

@@ -129,6 +129,7 @@ RESULT_STREAM = "events.live"
 PAPER_STREAM = "events.paper"
 META_STREAM = "meta"
 LAG_STREAM = "runner.lag"  # RiskCfg.lag_stream
+CLOCK_STREAM = "runner.clock"  # RiskCfg.clock_stream
 RECONCILE_STREAM = "kalshi.reconcile"  # RiskCfg.reconcile_stream
 LIVE_ORDER_STATES = ("PENDING_NEW", "RESTING", "PENDING_CANCEL", "PENDING_AMEND")
 MARKET_DATA = (IndexTick, KalshiBookDelta, KalshiBookSnapshot, KalshiTrade, KalshiTicker, ExtBBO, ExtBookDelta,
@@ -1025,6 +1026,10 @@ class LiveRunner:
         k = item.kind
         if k == "universe_add":
             self._universe_add(item.ts, list(item.payload or ()))
+        elif k == "clock_gate":
+            p = item.payload or {}
+            self._inject(FeedStatus(item.ts, 0, CLOCK_STREAM, str(p.get("status", "stale")),
+                                    f"clock offset {p.get('offset_ms', '?')} ms"))
         elif k == "spec_changed":
             for t, why in sorted((item.payload or {}).items()):
                 self._block([t], f"spec_changed:{why}", item.ts)
@@ -1628,10 +1633,13 @@ class LiveRunner:
                 log.error("clock offset %.1f ms persists: new orders blocked (restart re-anchors the clock)", eff_s * 1000)
                 self.jlog("gate", ts, action="close", reason="clock", offset_ms=round(eff_s * 1000, 3))
                 self.meta("gate", ts, action="close", reason="clock", offset_ms=round(eff_s * 1000, 3))
+                # the strategy pulls its quotes instead of having new ones gate-rejected
+                self.push_side("clock_gate", {"status": "stale", "offset_ms": round(eff_s * 1000, 3)})
         else:
             self._clock_bad = 0
             if self.gate.open("clock"):
                 self.jlog("gate", ts, action="open", reason="clock", offset_ms=round(eff_s * 1000, 3))
+                self.push_side("clock_gate", {"status": "resumed", "offset_ms": round(eff_s * 1000, 3)})
 
     async def _clock_loop(self) -> None:
         iv = self.cfg.loop.clock_sample_s

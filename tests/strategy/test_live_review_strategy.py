@@ -208,3 +208,15 @@ def test_order_group_reset_is_resent_until_confirmed():
     d.feed(KalshiOrderGroupUpdate(d.now + 1, 0, "dh-main", "reset"))
     resets = [a for a in d.advance(d.now + 2 * cool, step_ms=1000) if isinstance(a, ResetOrderGroup)]
     assert resets == []
+
+
+def test_clock_gate_stream_pulls_quotes_and_blocks_quoting():
+    d = Driver([spec()])
+    _ready(d)
+    _rest_all(d, d.advance(T0 + 6 * NS_PER_S))
+    acts = d.feed(FeedStatus(d.now + 1, 0, "runner.clock", "stale", "clock offset 300 ms"))
+    assert any(isinstance(a, CancelAll) and a.reason == "clock_offset" for a in acts)
+    assert not _places(d.advance(d.now + 3 * NS_PER_S))
+    assert "clock_offset" in d.mm.risk.health(d.now).reasons
+    d.feed(FeedStatus(d.now + 1, 0, "runner.clock", "resumed"))
+    assert _places(d.advance(d.now + 3 * NS_PER_S))

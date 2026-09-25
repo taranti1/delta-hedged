@@ -370,6 +370,11 @@ async def test_persistent_clock_offset_blocks_orders():
     assert "clock" in r.gate.reasons
     r.note_clock_offset(0.001, T0 + 2)
     assert "clock" not in r.gate.reasons
+    # the strategy is told through the consumer (recorded), so it pulls quotes rather than
+    # having new ones gate-rejected until restart
+    r.process_pending()
+    clk = [(e.stream, e.status) for e in s.events if isinstance(e, FeedStatus) and e.stream == "runner.clock"]
+    assert clk == [("runner.clock", "stale"), ("runner.clock", "resumed")]
 
 
 async def test_watchdog_cancel_all_marker_holds_orders_and_reconciles(tmp_path):

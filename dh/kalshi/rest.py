@@ -868,11 +868,33 @@ class KalshiRest:
         """GET /portfolio/orders/{id} -> {'order': Order} (2 tokens)."""
         return await self.get(f"/portfolio/orders/{order_id}", stream="kalshi.rest.portfolio")
 
-    async def find_order_by_client_id(self, client_order_id: str, *, ticker: str | None = None, min_ts: int | None = None) -> dict[str, Any] | None:
-        """Reconcile an UnknownOutcome: scan GET /portfolio/orders for client_order_id."""
-        async for o in self.iter_orders(ticker=ticker, min_ts=min_ts):
-            if o.get("client_order_id") == client_order_id:
-                return o
+    async def find_order_by_client_id(
+        self, client_order_id: str, *, ticker: str | None = None, min_ts: int | None = None,
+        subaccount: int | None = None, created_after_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Reconcile an UnknownOutcome: scan GET /portfolio/orders for client_order_id.
+
+        Pass ``subaccount`` (0 = primary): the spec says an omitted subaccount means ALL
+        subaccounts. Client ids are unique only among live and recent orders, so pass
+        ``created_after_ms`` (request time minus clock skew) to skip an older order that reused
+        the id; an order without a parseable creation time is kept (cannot be excluded).
+        """
+        filters: dict[str, Any] = {"ticker": ticker, "min_ts": min_ts}
+        if subaccount is not None:
+            filters["subaccount"] = subaccount
+        async for o in self.iter_orders(**filters):
+            if o.get("client_order_id") != client_order_id:
+                continue
+            if created_after_ms is not None:
+                ct = o.get("created_ts_ms")
+                if ct in (None, "") and o.get("created_time"):
+                    from dh.kalshi.wire import opt_iso_to_ns
+
+                    ns = opt_iso_to_ns(o.get("created_time"))
+                    ct = ns // 1_000_000 if ns else None
+                if ct not in (None, "") and int(ct) < created_after_ms:
+                    continue
+            return o
         return None
 
     async def get_queue_positions(

@@ -110,6 +110,7 @@ class WorkingOrder:
     pending_total_qty: int
     inflight_fill_qty: int
     unresolved: bool
+    cancel_sent_ns: int = 0  # when the (last) cancel was requested; 0 = never
 
 
 @dataclass(slots=True)
@@ -741,4 +742,5 @@ class OrderManager:
         am = o.amend
         return WorkingOrder(o.coid, o.order_id, o.ticker, o.book_side, o.px, o.cap, o.filled, o.remaining, o.state,
                             o.created_ns, o.updated_ns, o.post_only, o.expiration_ts, o.group, o.unknown,
-                            o.cancel_requested, am[1] if am else 0, am[2] if am else 0, o.inflight, o.unresolved)
+                            o.cancel_requested, am[1] if am else 0, am[2] if am else 0, o.inflight, o.unresolved,
+                            o.cancel_sent_ns if o.cancel_requested else 0)

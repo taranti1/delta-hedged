@@ -331,3 +331,17 @@ async def test_windowed_trades_deduped_across_three_overlapping_windows():
     got = await k.collect(k.iter_trades(ticker="T", min_ts=100, max_ts=106, window_s=2))
     ids = [g["trade_id"] for g in got]
     assert sorted(ids) == sorted(x["trade_id"] for x in trades) and len(ids) == len(set(ids))
+
+
+async def test_find_order_by_client_id_scopes_subaccount_and_skips_older_reuse():
+    """Audit live M4/M6: send the subaccount explicitly (omitted = all subaccounts) and skip an
+    older order that reused the client id."""
+    old = dict(S.ORDER_ROW, order_id="o-old", created_time="2026-09-24T10:00:00Z")
+    new = dict(S.ORDER_ROW, order_id="o-new", created_time="2026-09-25T12:00:00Z")
+    t = FakeTransport(resp(200, {"orders": [old, new], "cursor": ""}), resp(200, {"orders": [old], "cursor": ""}))
+    k, _, _ = client(t)
+    cutoff_ms = 1790337600000 - 2000  # 2026-09-25T12:00:00Z minus 2 s of skew
+    o = await k.find_order_by_client_id("dhA-1", subaccount=0, created_after_ms=cutoff_ms)
+    assert o is not None and o["order_id"] == "o-new"
+    assert ("subaccount", "0") in t.calls[0]["params"]
+    assert await k.find_order_by_client_id("dhA-1", subaccount=0, created_after_ms=cutoff_ms) is None

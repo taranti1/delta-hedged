@@ -155,3 +155,30 @@ async def test_run_refuses_stub():
 
     with pytest.raises(NotImplementedError):
         await KalshiPerpFeed().run(lambda s, t, r: None)
+
+
+async def test_reader_yields_to_the_event_loop_once_per_frame():
+    """Audit live M2: websockets returns buffered frames without suspending, so the reader
+    must yield after every frame or a busy feed starves every other task in the process."""
+    import asyncio
+
+    from dh.feeds.coinbase import CoinbaseFeed
+
+    class WS:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def recv(self, decode: bool = True) -> bytes:  # never suspends, like a full buffer
+            self.n += 1
+            return b'{"channel":"heartbeats","sequence_num":%d}' % self.n
+
+    feed = CoinbaseFeed()
+    got: list = []
+    feed._emit_raw = lambda stream, t, raw: got.append(raw)  # noqa: SLF001
+    ws = WS()
+    task = asyncio.create_task(feed._reader(ws))  # noqa: SLF001
+    for _ in range(5):
+        await asyncio.sleep(0)  # would never return here if the reader did not yield
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert 1 <= ws.n <= 6 and len(got) == ws.n

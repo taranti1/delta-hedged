@@ -279,53 +279,6 @@ async def test_live_session_with_a_ws_reconnect_replays_bit_for_bit(tmp_path):
     assert any(a[1] == "PlaceOrder" for a in live_a)
     assert live_a == rep_a and live_l == rep_l
 
-
-async def test_external_feed_readers_yield_once_per_frame():
-    """M2: websockets returns buffered frames without suspending; the wrapped connection makes
-    an external feed reader yield to the event loop after every frame."""
-    import contextlib
-
-    from dh.live.app import yield_per_frame
-
-    class WS:
-        def __init__(self):
-            self.n = 0
-
-        async def recv(self, decode=True):
-            self.n += 1
-            return b"frame"
-
-        async def send(self, m):
-            return None
-
-    class Feed:
-        def __init__(self):
-            self.ws = WS()
-
-        def _ws_connect(self):
-            @contextlib.asynccontextmanager
-            async def cm():
-                yield self.ws
-            return cm()
-
-        async def run(self, out):
-            async with self._ws_connect() as ws:
-                while True:
-                    out.append(await ws.recv(decode=False))
-
-    feed = Feed()
-    assert yield_per_frame(feed) and not yield_per_frame(feed)  # idempotent
-    got: list = []
-    ticks = 0
-    task = asyncio.create_task(feed.run(got))
-    for _ in range(5):
-        await asyncio.sleep(0)
-        ticks += 1
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    assert 1 <= len(got) <= ticks + 1, "without the yield the reader would never give the loop back"
-
-
 async def test_live_session_with_a_lag_episode_replays_bit_for_bit(tmp_path):
     """The runner's lag decisions (runner.lag stale/resumed, injected after the market event
     that caused them) are recorded, so a session with a data-lag episode replays exactly."""

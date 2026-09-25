@@ -807,6 +807,9 @@ class FeedClient(ABC):
             self._emit(recv_ns, raw)
             for reply in self.control_replies(raw):
                 await self.send(reply)
+            # websockets returns buffered frames without suspending: yield once per frame so a
+            # busy feed never starves the strategy consumer, order requests or heartbeats
+            await asyncio.sleep(0)
             if self._reconnect_reason is not None:
                 reason, self._reconnect_reason = self._reconnect_reason, None
                 raise ResyncReconnect(reason)

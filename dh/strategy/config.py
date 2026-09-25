@@ -102,6 +102,7 @@ class RiskCfg:
     # reconnect ('stale' = reconciling ... 'resynced')
     lag_stream: str = "runner.lag"
     reconcile_stream: str = "kalshi.reconcile"
+    clock_stream: str = "runner.clock"  # receive clock offset beyond the runner's limit
     hedge_stream: str = "kalshi_perp.ws"  # FeedStatus stream of the hedge venue
 
 
