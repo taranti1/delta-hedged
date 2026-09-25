@@ -1,0 +1,65 @@
+# M1: the smallest configuration that can trade tiny size live, safely, and produce useful data.
+# Loaded by dh.strategy.config.load_config. Every key maps 1:1 to a dataclass field.
+run_prefix: "dhm1"
+fair_value:
+  tail: "gauss"            # replaced by the calibration study's recommendation (docs/research/01)
+  vol_half_life_s: 1800.0
+  vol_floor_ann: 0.15
+  use_seasonality: true
+  band_sigma_lo_mult: 0.85
+  band_sigma_hi_mult: 1.20
+  band_tail_alt: "student_t"
+  nowcast: "brti_last"     # Experiment 2 decides whether a composite nowcast replaces it
+  max_benchmark_age_s: 3.0
+quoting:
+  enabled_series: ["KXBTCD"]
+  max_ticks_from_touch: 3
+  clip_contracts: 2.0      # tiny size: data first, P&L second
+  v_min_dollars: 0.002     # 0.2c minimum modeled net value per contract
+  kappa_replace_per_s: 0.0002
+  min_tau_s: 90.0
+  z_min_final: 2.5
+  max_tau_s: 3900.0
+  price_floor_px: 300      # no quotes below 3c / above 97c YES until tail calibration is done
+  price_cap_px: 9700
+  requote_min_interval_ms: 500
+  post_only: true
+  order_expiry_s: 0.0
+fill:
+  taker_rate_per_s: 0.3
+  taker_size_mean: 20.0
+  taker_size_cv: 2.0
+  improve_rate_mult: 1.0
+  behind_rate_mult: 0.15
+adverse:
+  a0: 0.003
+  b_momentum: 0.5
+  c_final: 0.01
+  horizon_s: 60.0
+  lookback_s: 2.0
+  behind_mult: 2.0
+risk:
+  risk_capital: 1000.0
+  kelly_fraction: 0.25
+  lambda_tail: 1.0
+  tail_budget: 20.0
+  max_pos_per_market: 10.0
+  max_event_worst_loss: 20.0
+  max_total_worst_loss: 50.0
+  max_abs_delta_btc: 0.02
+  max_hedge_notional: 0.0
+  daily_loss_halt: 25.0
+  settlement_loss_halt: 15.0
+  near_expiry_s: 300.0
+  near_expiry_limit_mult: 0.5
+  abnormal_move_sigma: 6.0
+  abnormal_pause_s: 120.0
+  stale_ext_s: 2.0
+  stale_brti_cancel_near_s: 3.0
+  stale_brti_cancel_all_s: 10.0
+  order_group_limit_contracts: 20.0
+hedge:
+  enabled: false           # Experiment 5: no hedge at M1 scale is optimal at every fee tier
+timers:
+  quote_period_ms: 200
+  risk_period_ms: 1000

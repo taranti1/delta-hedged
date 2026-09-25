@@ -1,0 +1,26 @@
+# One VM (AWS us-east-1 recommended). Roles are separate processes so a crash in one never
+# stops capture, and the watchdog can always cancel orders.
+services:
+  recorder:
+    build: {context: .., dockerfile: deploy/Dockerfile}
+    command: ["scripts/record.py", "--config", "config/feeds.yaml", "--root", "/data/raw"]
+    volumes: ["/data:/data", "/secrets:/secrets:ro"]
+    restart: always
+  strategy:
+    build: {context: .., dockerfile: deploy/Dockerfile}
+    command: ["scripts/run_live.py", "--config", "config/m1.yaml", "--mode", "paper"]
+    volumes: ["/data:/data", "/secrets:/secrets:ro", "/run/dh:/run/dh"]
+    restart: "no"          # never auto-restart a trading process: a human decides
+    ports: ["127.0.0.1:9108:9108"]   # metrics
+  watchdog:
+    build: {context: .., dockerfile: deploy/Dockerfile}
+    command: ["scripts/watchdog.py", "--heartbeat", "/run/dh/heartbeat.json", "--max-age-s", "2"]
+    volumes: ["/secrets:/secrets:ro", "/run/dh:/run/dh"]
+    restart: always
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    network_mode: host
+  grafana:
+    image: grafana/grafana:latest
+    network_mode: host
