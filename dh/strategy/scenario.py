@@ -312,7 +312,11 @@ def marginal_risk_charge(
     def charge(pnl: np.ndarray) -> float:
         mean = float(np.dot(grid.w, pnl))
         var = float(np.dot(grid.w, (pnl - mean) ** 2))
-        tail = cvar_loss(pnl, grid.w) if lambda_tail > 0 else 0.0
+        tail = 0.0
+        # CVaR <= worst grid loss, so the O(N log N) CVaR is needed only if the worst loss
+        # exceeds the budget (exact shortcut; keeps requote cycles fast)
+        if lambda_tail > 0 and -float(pnl.min()) > tail_budget:
+            tail = cvar_loss(pnl, grid.w)
         return 0.5 * lam * var + lambda_tail * max(0.0, tail - tail_budget)
 
     new = base_pnl + dq * (payoff_k - price)
@@ -331,3 +335,45 @@ def cross_event_variance(
             if i != j:
                 tot += dollar_deltas[i] * dollar_deltas[j] * s2 * min(taus_s[i], taus_s[j])
     return tot
+
+
+def worst_case_loss_with_orders(
+    specs: dict[str, MarketSpec],
+    positions: dict[str, float],
+    cost_basis: dict[str, float],
+    working: list[tuple[str, str, float, float]],
+    spot: float,
+    hedge_btc: float = 0.0,
+    stress_frac: float = 0.15,
+    n_obs: int = 60,
+    sum_fixed: float = 0.0,
+    m_remaining: int = 60,
+) -> float:
+    """Worst-case loss over A in the stress range AND over which working orders fill.
+
+    working: (ticker, 'bid'|'ask', price $, contracts). At each settlement value the adversary
+    fills exactly the orders that lose money there (a bid at p loses p for YES->0, an ask at p
+    loses 1-p for YES->1), which is the exact worst case over all fill subsets.
+    """
+    lo, hi = spot * (1 - stress_frac), spot * (1 + stress_frac)
+    pts = {lo, hi}
+    tickers = set(positions) | {w[0] for w in working}
+    for t in tickers:
+        for b in breakpoints(specs[t]):
+            for d in (-1e-6, 0.0, 1e-6):
+                v = b + d
+                if lo <= v <= hi:
+                    pts.add(v)
+    A = np.array(sorted(pts))
+    pnl = np.zeros_like(A)
+    for t, q in positions.items():
+        if q:
+            pnl += q * (payoff_vector(specs[t], A) - cost_basis.get(t, 0.0))
+    for t, side, px, n in working:
+        pay = payoff_vector(specs[t], A)
+        contrib = (pay - px) * n if side == "bid" else (px - pay) * n
+        pnl += np.minimum(contrib, 0.0)
+    if hedge_btc:
+        R = (n_obs * A - sum_fixed) / m_remaining if m_remaining > 0 else np.full(A.shape, spot)
+        pnl += hedge_btc * (R - spot)
+    return float(max(0.0, -pnl.min()))

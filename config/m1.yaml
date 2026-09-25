@@ -8,7 +8,7 @@ fair_value:
   use_seasonality: true
   band_sigma_lo_mult: 0.85
   band_sigma_hi_mult: 1.20
-  band_tail_alt: "student_t"
+  band_tail_alt: "gauss"
   nowcast: "brti_last"     # Experiment 2 decides whether a composite nowcast replaces it
   max_benchmark_age_s: 3.0
 quoting:

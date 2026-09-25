@@ -22,7 +22,7 @@ class FairValueCfg:
     use_seasonality: bool = True
     band_sigma_lo_mult: float = 0.85  # sigma multipliers spanning vol uncertainty for F_lo/F_hi
     band_sigma_hi_mult: float = 1.20
-    band_tail_alt: str = "student_t"  # alternative tail model included in the band
+    band_tail_alt: str = "gauss"  # alternative tail model spanned by the band (production tail is the fitted Student-t)
     nowcast: str = "brti_last"  # brti_last | brti_plus_composite (Experiment 2 decides)
     nowcast_beta: float = 0.0
     max_benchmark_age_s: float = 3.0
@@ -35,6 +35,8 @@ class QuotingCfg:
     clip_contracts: float = 5.0  # size per quote (contracts)
     v_min_dollars: float = 0.001  # min net value per filled contract to quote (0.1c)
     kappa_replace_per_s: float = 0.0002  # EVrate improvement ($/s) required to cancel/replace
+    replace_rel: float = 0.5  # ...and a relative improvement of this fraction (hysteresis)
+    min_order_age_ms: int = 3000  # positive-value orders are never replaced younger than this
     min_tau_s: float = 90.0  # no new near-strike quotes after T - min_tau_s
     z_min_final: float = 2.5  # |z| required to quote inside min_tau_s
     max_tau_s: float = 3900.0  # only quote events expiring within this horizon

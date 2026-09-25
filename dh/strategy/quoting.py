@@ -27,6 +27,7 @@ class ExistingOrder:
     px: int
     remaining_qty: int  # 0.01-contract units
     queue_ahead: float  # contracts ahead of us at px (estimator)
+    age_ns: int = 10**18  # time since placement (hysteresis); default: old
 
 
 @dataclass
@@ -182,6 +183,8 @@ def decide_side(
     adverse: AdverseSelectionModel,
     v_min: float,
     kappa_replace: float,
+    replace_rel: float = 0.0,
+    min_age_ns: int = 0,
 ) -> SideDecision:
     """Choose to keep, replace, place or pull our quote on one side of one market.
 
@@ -216,7 +219,10 @@ def decide_side(
                 best = c
     place: QuoteCandidate | None = None
     if top is not None:
-        if best is not None and best.px != top.px and best.ev_rate > top.ev_rate + kappa_replace:
+        age = next((o.age_ns for o in existing if o.client_order_id == top.existing_id), 10**18)
+        better = (best is not None and best.px != top.px
+                  and best.ev_rate > top.ev_rate * (1.0 + replace_rel) + kappa_replace)
+        if better and age >= min_age_ns:
             cancel.append(top.existing_id)
             place = best
         else:
