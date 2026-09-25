@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from dh.core.actions import CancelOrder, PlaceOrder
+from dh.core.actions import AmendOrder, CancelOrder, DecreaseOrder, PlaceOrder
 from dh.core.events import (
     CancelAck,
     KalshiBookDelta,
@@ -98,6 +98,10 @@ class Scripted:
                 self.om.request_place(a, ev.ts)
             elif isinstance(a, CancelOrder):
                 self.om.request_cancel(a, ev.ts)
+            elif isinstance(a, AmendOrder):
+                self.om.request_amend(a, ev.ts)
+            elif isinstance(a, DecreaseOrder):
+                self.om.request_decrease(a, ev.ts)
             out.append(a)
         return out
 
@@ -112,7 +116,7 @@ YES_LEVELS = (4200, 4300, 4400, 4500)  # YES bids (YES scale)
 NO_LEVELS = (5100, 5200, 5300, 5400)  # NO bids == YES asks at 49, 48, 47, 46 (never crossed)
 
 
-def gen_stream(seed: int, n: int, *, ticker: str = T, t0: int = 0) -> list:
+def gen_stream(seed: int, n: int, *, ticker: str = T, t0: int = 0, sweeps: bool = True) -> list:
     """A self-consistent recorded Kalshi stream: snapshot, joins, cancels, trades with their
     book deltas in either order (sometimes separated in time), multi-level sweeps."""
     import random
@@ -125,7 +129,7 @@ def gen_stream(seed: int, n: int, *, ticker: str = T, t0: int = 0) -> list:
     gaps = (0, 1 * MS, 5 * MS, 50 * MS, 300 * MS, 1 * S)
     for _ in range(n):
         ts += rng.choice(gaps)
-        op = rng.choice(("add", "add", "cancel", "hit", "hit", "sweep"))
+        op = rng.choice(("add", "add", "cancel", "hit", "hit", "sweep") if sweeps else ("add", "add", "cancel", "hit"))
         side = rng.choice(("yes", "no"))
         lv = book[side]
         if op == "add":

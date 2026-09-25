@@ -224,7 +224,9 @@ class IndexTick:
 
     ts: int
     ts_exch: int
-    index_id: str  # 'BRTI'
+    index_id: str  # namespaced: 'BRTI' (Kalshi CF feed = settlement benchmark); external
+    # indices use '<venue>:<name>' (e.g. 'deribit:btc_usd', 'deribit:dvol_btc_usd').
+    # Settlement logic MUST filter on index_id == spec.settlement.index_id ('BRTI').
     value: float
     feed: str  # '1hz' | '5hz' | 'rest'
     kalshi_recv_ns: int = 0  # when Kalshi received the upstream frame
@@ -291,12 +293,12 @@ class PerpState:
     ts_exch: int
     venue: str
     symbol: str
-    mark: float = 0.0
-    index: float = 0.0
-    funding_rate: float = 0.0  # per funding interval, as a fraction
+    mark: float = 0.0  # USD; 0.0 = unknown
+    index: float = 0.0  # USD; 0.0 = unknown
+    funding_rate: float = 0.0  # per funding interval, as a fraction; 0.0 = unknown
     funding_interval_s: int = 0
     next_funding_ts: int = 0
-    open_interest: float = 0.0
+    open_interest: float = 0.0  # BTC (contracts converted); 0.0 = unknown
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +327,10 @@ class OptionQuote:
     bid_iv: float
     ask_iv: float
     underlying: float
+    mark: float = 0.0  # option mark price (venue units, BTC for Deribit); 0.0 = unknown
+    bid_size: float = 0.0
+    ask_size: float = 0.0
+    delta: float = 0.0
 
 
 # ----------------------------------------------------------------------------- hedge venue
@@ -362,7 +368,7 @@ class FeedStatus:
     ts: int
     ts_exch: int
     stream: str  # e.g. 'kalshi.ws', 'coinbase.ws', 'kalshi.book:KXBTCD-...'
-    status: Literal["connected", "disconnected", "gap", "stale", "resynced", "error"]
+    status: Literal["connected", "disconnected", "gap", "stale", "resynced", "resumed", "error"]
     detail: str = ""
 
 

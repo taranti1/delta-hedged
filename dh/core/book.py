@@ -184,6 +184,22 @@ class ExtBook:
         else:
             book[price] = size
 
+    def apply_snapshot(self, ev) -> None:
+        """Apply an ExtBookSnapshot (replaces the book, updates ts/seq)."""
+        self.snapshot(ev.bids, ev.asks, ev.ts, ev.seq)
+
+    def apply(self, ev) -> None:
+        """Apply an ExtBookDelta (absolute sizes) and advance ts/seq."""
+        for side, price, size in ev.changes:
+            self.update(side, price, size)
+        self.ts = ev.ts
+        if ev.seq:
+            self.seq = ev.seq
+
+    def apply_bbo(self, ev) -> None:
+        """Apply an ExtBBO as a one-level book (venues that only publish top of book)."""
+        self.snapshot([(ev.bid, ev.bid_size)], [(ev.ask, ev.ask_size)], ev.ts, ev.seq)
+
     def top(self) -> ExtTop | None:
         if not self.bids or not self.asks:
             return None

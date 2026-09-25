@@ -137,6 +137,7 @@ kalshi:
   enabled: true
   config: null                    # dh.kalshi.config.load_config path; null = config/kalshi.yaml or the example
   env: null                       # prod | demo (null = from the kalshi config)
+  max_markets_per_subscription: 100  # shard market subscriptions (Kalshi error 26 = too many markets)
   series: [KXBTCD, KXBTC, KXBTC15M]
   market_channels: [orderbook_delta, trade, ticker]
   lifecycle_channels: [market_lifecycle_v2]   # all markets (new-market discovery + settlements)

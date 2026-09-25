@@ -426,13 +426,21 @@ class QueueEstimator:
             it.vol = 0
 
     def _classify_cancel(self, it: _Pend) -> None:
-        self.stats["cancel_volume"] += it.vol
+        vol, it.vol = it.vol, 0
+        self.stats["cancel_volume"] += vol
         ticker, book, px = it.lvl
-        for k in self._side.get((ticker, book), {}).get(px, []):
+        keys = self._side.get((ticker, book), {}).get(px, [])
+        if not keys:
+            return
+        # Invariant: others ahead of us <= displayed others + depletion not yet classified.
+        # (FIFO print<->delta pairing can make the stored level_before stale; the policy-
+        # independent clamp keeps every policy consistent and preserves A <= B <= C.)
+        bound = self._level_excl(it.lvl) + self._pending_total(self._pend_depl, it.lvl)
+        for k in keys:
             o = self.orders[k]
             if o.pending or o.seq > it.max_seq:
                 continue
-            o.queue_ahead = cancel_update(o.queue_ahead, it.level_before, it.vol, self.policy)
+            o.queue_ahead = min(cancel_update(o.queue_ahead, it.level_before, vol, self.policy), bound)
 
     def _fills_through(self, ticker: str, book: str, p: int, v: int, *, cross: bool) -> list[QueueFill]:
         """Fill capacity of volume v reaching book ``book`` at price p (see module doc)."""

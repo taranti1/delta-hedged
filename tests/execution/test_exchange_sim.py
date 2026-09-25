@@ -203,10 +203,9 @@ def test_order_group_window_rolls_after_15s():
     evs = [snap(0, yes=((4400, 100),)), delta(1, "yes", 4300, 1), trade(1 * S, 4500, 300, "no"),
            trade(17 * S, 4500, 300, "no")]
     strat, out = run(sim, evs, sched)
-    assert [f.qty for f in of(out, KalshiFill)] == [300, 300] and sim.stats["group_triggers"] == 1
-    assert sim.order_status("a")["status"] == "canceled"  # 600 >= 500 within... no: window rolled
-    # the first 300 rolled out of the window, so the trigger came from 300+300 only if within 15 s
-    assert sim.groups["g"].matched == 300 or sim.groups["g"].triggered
+    # 300 + 300 > 500 in total, but the first 300 left the rolling 15 s window before the second
+    assert [f.qty for f in of(out, KalshiFill)] == [300, 300] and sim.stats["group_triggers"] == 0
+    assert sim.order_status("a")["status"] == "resting" and sim.groups["g"].matched == 300
 
 
 def test_amend_priority_rules_and_decrease():

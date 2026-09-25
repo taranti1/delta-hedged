@@ -172,6 +172,7 @@ class KalshiWS:
         ws_path: str = WS_PATH,
         stream: str = STREAM,
         on_message: MessageCallback | None = None,
+        max_markets_per_subscription: int = 0,
     ) -> None:
         self.url = url
         self.signer = signer
@@ -193,6 +194,9 @@ class KalshiWS:
         self.ws_path = ws_path
         self.stream = stream
         self.on_message = on_message  # parsed exchange messages (e.g. metadata_updated bodies)
+        # Kalshi rejects subscriptions with too many markets (error code 26; limit undocumented):
+        # 0 = unlimited, else add_markets() fills existing shards and opens new ones as needed.
+        self.max_markets_per_subscription = max_markets_per_subscription
         self.state = KalshiWsState(use_yes_price=use_yes_price)
         self._emit: EventCallback = on_event or (lambda ev: None)
         self._conn: WSConnection | None = None
@@ -278,24 +282,44 @@ class KalshiWS:
         return base * (0.5 + 0.5 * self._rng.random())
 
     async def add_markets(self, tickers: list[str], channel: str = "orderbook_delta") -> None:
-        """Add markets to the subscription carrying `channel` (applied now and on reconnect)."""
-        idx = self._sub_index(channel)
-        sub = self.subscriptions[idx]
-        new = [t for t in tickers if t not in sub.market_tickers]
-        if not new:
-            return
-        sub.market_tickers.extend(new)
-        await self._update_markets(idx, new, "add_markets")
+        """Add markets to subscription(s) carrying `channel` (applied now and on reconnect).
+
+        With ``max_markets_per_subscription`` > 0, markets fill existing shards first and new
+        shards (copies of the first shard's channels/extra) are subscribed as needed.
+        """
+        shards = [i for i, sub in enumerate(self.subscriptions) if channel in sub.channels]
+        if not shards:
+            raise KeyError(f"no subscription carries channel {channel!r}")
+        have = {t for i in shards for t in self.subscriptions[i].market_tickers}
+        new = [t for t in dict.fromkeys(tickers) if t not in have]
+        cap = self.max_markets_per_subscription
+        for idx in shards:
+            if not new:
+                return
+            sub = self.subscriptions[idx]
+            room = len(new) if cap <= 0 else max(0, cap - len(sub.market_tickers))
+            take, new = new[:room], new[room:]
+            if take:
+                sub.market_tickers.extend(take)
+                await self._update_markets(idx, take, "add_markets")
+        template = self.subscriptions[shards[0]]
+        while new:
+            take, new = new[:cap], new[cap:]
+            self.subscriptions.append(Subscription(list(template.channels), market_tickers=take,
+                                                   extra=dict(template.extra)))
+            if self.connected:
+                await self._send_subscribe(len(self.subscriptions) - 1)
 
     async def delete_markets(self, tickers: list[str], channel: str = "orderbook_delta") -> None:
-        """Remove markets from the subscription carrying `channel`."""
-        idx = self._sub_index(channel)
-        sub = self.subscriptions[idx]
-        gone = [t for t in tickers if t in sub.market_tickers]
-        if not gone:
-            return
-        sub.market_tickers[:] = [t for t in sub.market_tickers if t not in gone]
-        await self._update_markets(idx, gone, "delete_markets")
+        """Remove markets from every subscription shard carrying `channel`."""
+        drop = set(tickers)
+        for idx, sub in enumerate(self.subscriptions):
+            if channel not in sub.channels:
+                continue
+            gone = [t for t in sub.market_tickers if t in drop]
+            if gone:
+                sub.market_tickers[:] = [t for t in sub.market_tickers if t not in drop]
+                await self._update_markets(idx, gone, "delete_markets")
 
     async def request_snapshot(self, tickers: list[str], sid: int | None = None) -> None:
         """Ask for fresh orderbook snapshots (update_subscription/get_snapshot)."""
@@ -486,3 +510,17 @@ async def _safe_close(conn: WSConnection) -> None:
         await asyncio.wait_for(conn.close(), 5.0)
     except Exception:  # noqa: BLE001 - closing a dead socket must not mask the real error
         pass
+
+
+def shard_market_subscriptions(
+    channels: list[str], tickers: list[str], max_per_subscription: int, extra: dict[str, Any] | None = None
+) -> list[Subscription]:
+    """Split a market-channel subscription into shards of at most `max_per_subscription`
+    markets (0 = one subscription). Always returns at least one subscription."""
+    ts = list(dict.fromkeys(tickers))
+    if max_per_subscription <= 0 or len(ts) <= max_per_subscription:
+        return [Subscription(list(channels), market_tickers=ts, extra=dict(extra or {}))]
+    return [
+        Subscription(list(channels), market_tickers=ts[i : i + max_per_subscription], extra=dict(extra or {}))
+        for i in range(0, len(ts), max_per_subscription)
+    ]

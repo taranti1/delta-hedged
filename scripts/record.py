@@ -165,7 +165,7 @@ class KalshiSource:
         try:
             from dh.kalshi.config import load_config
             from dh.kalshi.rest import KalshiRest
-            from dh.kalshi.ws import KalshiWS, Subscription
+            from dh.kalshi.ws import KalshiWS, Subscription, shard_market_subscriptions
         except ImportError as exc:
             log.error("Kalshi source disabled: dh.kalshi not importable (%s)", exc)
             self.recorder.write_event("status", FeedStatus(time.time_ns(), 0, "kalshi.ws", "error", f"dh.kalshi import failed: {exc}"[:300]))
@@ -188,14 +188,17 @@ class KalshiSource:
                 log.error("kalshi: no API credentials (KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH): the WebSocket "
                           "requires authentication, recording REST snapshots only")
             else:
-                subs = [Subscription(list(self.kcfg.get("market_channels") or ["orderbook_delta", "trade", "ticker"]),
-                                     market_tickers=list(self.tickers))]
+                cap = int(self.kcfg.get("max_markets_per_subscription", 100) or 0)
+                subs = shard_market_subscriptions(
+                    list(self.kcfg.get("market_channels") or ["orderbook_delta", "trade", "ticker"]),
+                    list(self.tickers), cap)
                 for ch in self.kcfg.get("lifecycle_channels") or ["market_lifecycle_v2"]:
                     subs.append(Subscription([ch]))
                 for ch in self.kcfg.get("index_channels") or ["cfbenchmarks_value", "cfbenchmarks_value_5hz"]:
                     subs.append(Subscription([ch], index_ids=list(self.kcfg.get("index_ids") or kc.index_ids)))
                 ws_kw = _ws_kwargs(kc.ws)
-                self.ws = KalshiWS(kc.ws_url, signer, subs, on_raw=self.recorder.write, on_event=self.on_event, **ws_kw)
+                self.ws = KalshiWS(kc.ws_url, signer, subs, on_raw=self.recorder.write, on_event=self.on_event,
+                                   max_markets_per_subscription=cap, **ws_kw)
                 self.monitor.kalshi_ws = self.ws
                 tasks.append(asyncio.create_task(self.ws.run(), name="kalshi:ws"))
             stopper = asyncio.create_task(self.stop.wait(), name="kalshi:stop")

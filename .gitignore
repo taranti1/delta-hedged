@@ -9,6 +9,7 @@ data/raw/
 data/cache/
 data/external/
 data/sessions/
+data/parquet/
 # Secrets: API keys, RSA private keys, env files.
 secrets/
 .secrets/
