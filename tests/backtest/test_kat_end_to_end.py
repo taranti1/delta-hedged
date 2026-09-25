@@ -54,3 +54,15 @@ def test_informed_flow_worsens_fill_markouts():
                                       mm_lag_s=1.5, vol_ann=0.9), cfg)
     assert calm.summary["contracts"] > 0 and toxic.summary["contracts"] > 0
     assert toxic.summary.get("markout_10s_c", 0.0) <= calm.summary.get("markout_10s_c", 0.0) + 0.5
+
+
+def test_add_markets_roll_over(base_run):
+    from dataclasses import replace as dc_replace
+
+    mm = base_run.mm
+    spec = next(iter(mm.specs.values()))
+    new = dc_replace(spec, ticker=spec.ticker + "-NEXT", expiration_ts=spec.expiration_ts + 3600 * NS_PER_S,
+                     close_ts=spec.close_ts + 3600 * NS_PER_S)
+    assert mm.add_markets([new]) == [new.ticker]
+    assert mm.add_markets([new]) == []
+    assert new.ticker in mm.books and new.ticker in mm.fee_sched

@@ -162,6 +162,34 @@ class MarketMaker:
         self.stats = MMStats()
         self.brti_hist: deque[tuple[int, float]] = deque()
 
+    # ================================================================== universe
+    def add_markets(self, specs: Iterable[MarketSpec]) -> list[str]:
+        """Add newly listed markets (hourly roll-over) without restarting. Deterministic:
+        call it from the event stream (the live runner emits it on discovery; replay does the
+        same at the recorded discovery time). Returns the tickers actually added."""
+        added = []
+        for s in specs:
+            if s.ticker in self.specs:
+                continue
+            self.specs[s.ticker] = s
+            self.books[s.ticker] = KalshiBook(s.ticker)
+            self.fv_hist[s.ticker] = deque()
+            self._resolve_fee(s.ticker, s)
+            added.append(s.ticker)
+        return added
+
+    def prune_settled(self, before_ns: int) -> int:
+        """Drop state for markets settled before `before_ns` with no position/working orders."""
+        drop = [t for t, s in self.specs.items()
+                if t in self.settled and s.expiration_ts < before_ns and not self.om.working(t)]
+        for t in drop:
+            self.specs.pop(t, None)
+            self.books.pop(t, None)
+            self.fv_hist.pop(t, None)
+            self.fvc.pop(t, None)
+            self.last_fv_log.pop(t, None)
+        return len(drop)
+
     # ================================================================== helpers
     def _resolve_fee(self, ticker: str, spec: MarketSpec) -> None:
         if not spec.fee_type:
