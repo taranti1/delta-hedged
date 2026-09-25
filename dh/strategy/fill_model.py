@@ -1,8 +1,12 @@
 """Fill-intensity and adverse-selection models used by the quote engine.
 
 M1 = interpretable parametric forms with per-segment parameters measured from recorded public
-trades (dh.research.calibrate_fill). M2 replaces them with fitted models only if that
+trades (dh.research.calibrate_flow). M2 replaces them with fitted models only if that
 improves out-of-sample realized net P&L.
+
+Provenance (look-ahead guard): every parameter set carries a ParamProvenance (prior placeholder,
+or fitted on data in [fitted_from_utc, fitted_to_utc)). ``provenance`` is the one in use: the
+bound segments' / coefficients' when present, else the config's (cfg.fill / cfg.adverse).
 
 Fill intensity (contracts/s filled for OUR order):
     taker orders arrive at rate r = Lambda / E[X] (orders/s) on our side, sizes X ~ LogNormal.
@@ -20,7 +24,7 @@ from dataclasses import dataclass, field
 
 from scipy.special import ndtr
 
-from dh.strategy.config import AdverseSelCfg, FillModelCfg
+from dh.strategy.config import AdverseSelCfg, FillModelCfg, ParamProvenance
 
 
 def lognormal_params(mean: float, cv: float) -> tuple[float, float]:
@@ -74,6 +78,15 @@ def segment_key(tau_s: float, abs_z: float, side: str) -> tuple[str, str, str]:
 class FillIntensityModel:
     cfg: FillModelCfg
     segments: dict[tuple[str, str, str], SegmentFlow] = field(default_factory=dict)
+    segments_provenance: ParamProvenance | None = None  # fitted segments (calibrate_flow meta.provenance)
+
+    @property
+    def provenance(self) -> ParamProvenance:
+        """Provenance of the flow parameters in use: the bound segments' (unknown fitting window
+        when segments are bound without one), else the config's."""
+        if self.segments:
+            return self.segments_provenance or ParamProvenance("fitted", note="segments without provenance")
+        return self.cfg.provenance
 
     def flow(self, key: tuple[str, str, str]) -> SegmentFlow:
         """Segment flow; unseen segments fall back to the pooled per-side estimate
@@ -107,6 +120,15 @@ class AdverseSelectionModel:
 
     cfg: AdverseSelCfg
     coefs: dict[tuple[str, str, str], tuple[float, float, float]] = field(default_factory=dict)
+    coefs_provenance: ParamProvenance | None = None  # fitted per-segment coefficients
+
+    @property
+    def provenance(self) -> ParamProvenance:
+        """Provenance of the coefficients in use: the bound per-segment coefficients' (unknown
+        fitting window when bound without one), else the config's."""
+        if self.coefs:
+            return self.coefs_provenance or ParamProvenance("fitted", note="coefficients without provenance")
+        return self.cfg.provenance
 
     def expected(
         self, *, key: tuple[str, str, str], adverse_recent_move: float, tau_s: float, position: str = "touch"

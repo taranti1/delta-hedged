@@ -32,6 +32,12 @@ fill:
   taker_size_cv: 2.0
   improve_rate_mult: 1.0
   behind_rate_mult: 0.15
+  provenance:              # look-ahead guard (docs/research/EXPERIMENTS_RUNBOOK.md s.2a): these values are
+    status: "prior"        # [ESTIMATE] placeholders never fitted on data -> out-of-sample for every window,
+    fitted_from_utc: ""    # labelled "prior". A refit sets status "fitted", the UTC fitting window
+    fitted_to_utc: ""      # (every datum before fitted_to_utc), the dataset id/hash and the method
+    dataset_id: ""         # (dh.research.calibrate_flow writes them into flow_segments.json meta.provenance)
+    method: "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
 adverse:
   a0: 0.003
   b_momentum: 0.5
@@ -39,6 +45,12 @@ adverse:
   horizon_s: 60.0
   lookback_s: 2.0
   behind_mult: 2.0
+  provenance:              # as for fill: [ESTIMATE] priors until Experiment 3 fits them on real fills
+    status: "prior"
+    fitted_from_utc: ""
+    fitted_to_utc: ""
+    dataset_id: ""
+    method: "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
 risk:
   risk_capital: 1000.0
   kelly_fraction: 0.25

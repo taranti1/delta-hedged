@@ -533,7 +533,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "panel_rows": len(pr.panel),
                        "step_ms": step_ms, "folds": n_folds, "brti_ticks": len(pr.brti),
                        "hook_beta(g_med, h=%gs)" % hook_horizon_s: beta,
-                       **({"P&L hook " + k: v for k, v in inputs_meta(uni, t_split)[0].items()} if pnl else {}),
+                       **({"P&L hook " + k: v for k, v in inputs_meta(uni, t_split, cfg, t1)[0].items()} if pnl else {}),
                        **({"P&L hook latency": describe_latency(lat, uni)} if pnl else {})})
     short = metrics[metrics["horizon"].isin([f"{h:g}s" for h in horizons_s])]
     best = short[short["model"].isin(["ridge", "lgbm"])]
@@ -542,7 +542,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     pnl_ok, pnl_bad, have = hook_decision(hook)
     rep.decision_events = int(hook["events"].min()) if len(hook) and "events" in hook else None
     rep.policies = have
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t_split) if pnl else (False, "")
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t_split, cfg, t1) if pnl else (False, "")
     if gain_ok and pnl_ok:
         rep.verdict = ("ACCEPT (RMSE gain >= 10% at every short horizon; replay net c/contract CI > 0 with contracts/day "
                        "and $/day not lower under B and C)")

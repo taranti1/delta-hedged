@@ -151,7 +151,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     rep = Report("e9_multistrike", "E9 — Quoting 1 vs 3 vs all strikes: netting and capital efficiency", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E9,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "reference": ref,
-                       **inputs_meta(uni, t0)[0], "latency": describe_latency(lat, uni)})
+                       **inputs_meta(uni, t0, cfg, t1)[0], "latency": describe_latency(lat, uni)})
     good = [v for v in others if improves.get(v)]
     if good:
         rep.verdict = f"ACCEPT: {', '.join(good)} improve(s) on {ref} ($/day up and turnover per contract down, CIs under B and C)"
@@ -161,7 +161,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
         rep.verdict = f"INCONCLUSIVE (no variant shows $/day up and turnover down vs {ref} with CIs under both B and C)"
     rep.decision_events = int(paired["events"].min()) if len(paired) else None
     rep.policies = policies_with_results(runs)
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0, cfg, t1)
     for w in run_warnings(runs):
         rep.line(f"WARNING: {w}")
     rep.table("variants", tab, "Per variant x policy. d_* = paired difference in net c/contract vs the reference; "

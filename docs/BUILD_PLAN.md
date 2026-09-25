@@ -108,10 +108,10 @@ selection comes from fills landing within 10 ms of our cancel (the migration rul
 | Vol: seasonal (hour-of-week, NY time) horizon-weighted EWMA blend; tails: Student-t by horizon | `docs/research/01_fair_value_calibration.md` | [VERIFIED] -12.1 mn log loss [-12.8, -11.4] vs Gaussian+2h EWMA on 15,005 out-of-sample hours; calibration error 0.2-0.5c |
 | Delta = dP/dS (BTC per YES contract); gamma analytic; portfolio delta sum q_i Delta_i + H | `dh/models/fairvalue.py`, `dh/strategy/scenario.py` | [VERIFIED] vs finite differences |
 | Inventory risk: exact scenario grid of the settlement average; mean-variance + CVaR charge; exact adversarial worst case | `docs/MODELS.md` s.2, `dh/strategy/scenario.py` | [BUILT], tested vs closed forms |
-| Fill intensity: compound Poisson taker flow vs queue ahead, per segment, gamma-Poisson shrinkage | `dh/strategy/fill_model.py`, `dh/research/calibrate_flow.py` | [BUILT]; parameters [ESTIMATE] until calibrated |
-| Toxicity: E[markout given fill, features]; parametric in M1, fitted in M2 only if it lifts net P&L | `docs/MODELS.md` s.3.2, Experiment 3 | [BUILT]; parameters [ESTIMATE] |
+| Fill intensity: compound Poisson taker flow vs queue ahead, per segment, gamma-Poisson shrinkage | `dh/strategy/fill_model.py`, `dh/research/calibrate_flow.py` | [BUILT]; parameters [ESTIMATE] until calibrated (recorded as priors; every fit records its UTC window, dataset hash and method) |
+| Toxicity: E[markout given fill, features]; parametric in M1, fitted in M2 only if it lifts net P&L | `docs/MODELS.md` s.3.2, Experiment 3 | [BUILT]; parameters [ESTIMATE] (recorded as priors, provenance as for fill intensity) |
 | Quote objective: EVrate = intensity x (edge - AS - fee - hedge - inventory); ranking by EVrate per $ collateral | `dh/strategy/quoting.py`, `mm.py` | [BUILT] |
-| Hedge: trade to the band edge when \|D\| > 2cS/(lambda sigma^2 h); unwind at settlement | `docs/research/05_hedge_policy.md` | [VERIFIED] on real paths with synthetic flow |
+| Hedge: trade to the band edge when \|D\| > 2cS/(lambda sigma^2 h); unwind at settlement | `docs/research/05_hedge_policy.md`, `dh/research/exp5_hedge.py` | [VERIFIED] on real paths with synthetic flow; the re-run on realized fills is [BUILT] |
 | Fees: exact Kalshi quadratic schedule by series type and multiplier, with micro rounding and per-order carry | `dh/kalshi/fees.py`, `config/fees.yaml` | [BUILT]; must be verified vs live `fee_cost` |
 
 ## E. Research test matrix
@@ -123,22 +123,34 @@ calibration, the settlement-convention check and incentives. `docs/CORE_QUESTION
 
 Results so far:
 - **Fair value:** [VERIFIED], `docs/research/01_*`.
-- **E5 hedging:** [VERIFIED on real paths], `docs/research/05_*`.
+- **E5 hedging:** [VERIFIED on real paths with synthetic flow], `docs/research/05_*`. The re-run on
+  realized fills that section H requires is [BUILT] (`run_experiment.py e5`, `dh/research/exp5_hedge.py`):
+  no hedge, per-fill hedging and the mean-variance band (lambda x fee-tier grid, plus the configured
+  engine at `cfg.lam` and the achieved tier) on the SAME fill stream (the replay's under B and C, or a
+  live / paper session's) and the recorded BTC path, utility and P&L variance with event-clustered CIs.
+  Known answers: an injected linear delta is hedged to zero variance at zero cost and to the known band
+  edge at cost c; zero-delta flow never ACCEPTs; above the break-even cost the band never trades. It
+  needs real fills (>= 20 settlement events) for a decision.
 - **E0 and E1:** [BUILT], and the known-answer tests recover injected effects:
   - Maker P&L sign follows flow toxicity.
   - Injected maker lags of 0.3, 1.5 and 4 s give measured half-lives of 0.21, 0.75 and
     1.98 s. After 2-sd external moves the injected staleness shows as 1.4-3.7 ticks.
-- **E1-E4 and E6-E10:** [BUILT]. Each runs with one command on a recording
+- **E1-E10:** [BUILT]. Each runs with one command on a recording
   (`scripts/run_experiment.py`; runbook `docs/research/EXPERIMENTS_RUNBOOK.md`).
   - They drive the production `MarketMaker`, the queue-aware simulator (policies B and C, with
     A as a reference) and the ledger.
   - Look-ahead guards:
     - fair-value parameters are labelled in- or out-of-sample against the window;
+    - so are the fill-intensity and adverse-selection (toxicity) parameters: each set records its
+      provenance (UTC fitting window, dataset id/hash, method, or "prior" for the current
+      [ESTIMATE] placeholders), fitted flow segments and E3's cancel rule record theirs, and a fit
+      that overlaps the window (or has no recorded window) caps an ACCEPT at INCONCLUSIVE;
     - BTC bars join only once closed;
     - flow calibration uses a time split with out-of-sample rows;
     - E3 folds purge overlapping labels.
   - Any verdict backed by fewer than 20 settlement events is reported INCONCLUSIVE.
-  - All ten ran end to end on a synthetic 4-event recording (`docs/research/synthetic_demo/`).
+  - All of them (E5 included) ran end to end on a synthetic 4-event recording
+    (`docs/research/synthetic_demo/`).
     Every verdict there is INCONCLUSIVE by design: the demo validates the pipelines, never
     edge.
   - An independent review found 22 decision-rule and inference defects; all are fixed
@@ -198,7 +210,8 @@ Each item ships only if its experiment passes on M1 data under fill policies B *
 
 Each item follows its own evidence gate.
 - **Hedge engine on:** only if E5 re-run on real fills shows positive utility at the achieved
-  perp fee tier (about 1 bp or less).
+  perp fee tier (about 1 bp or less): `run_experiment.py e5 --session-fills live --hedge-fee-bps <tier>
+  [--hedge-venue kalshi_perp]` on M1 fills, confirmed on the replayed fills under B and C.
 - **Portfolio optimization across series and expirations.**
 - **Automated monthly refits** of vol, tails and flow models.
 - **Rust feed-to-cancel hot path:** only if the latency rule in C triggers.

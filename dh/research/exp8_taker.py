@@ -406,6 +406,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     """One scan per (policy, threshold): each threshold is its own taking policy (audit M2); the
     verdict uses the 0.5c scans under B and C."""
     Path(out).mkdir(parents=True, exist_ok=True)
+    cfg = cfg or StrategyConfig()
     uni = universe or build_universe(root, t0, t1)
     lat = research_latency(uni, latency, seed=seed)
     ths = sorted(set(float(x) for x in thresholds_c) | {0.5})
@@ -449,12 +450,12 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                                      "fee": "exact per-order fee incl. balance rounding (OrderFeeAccumulator)",
                                      "latency": describe_latency(lat, uni),
                                      "fv_warm": any_r.info.get("fv_warm") if any_r else "",
-                                     **inputs_meta(uni, t0)[0]})
+                                     **inputs_meta(uni, t0, cfg, t1)[0]})
     rep.verdict = verdict
     rep.policies = have
     rep.decision_events = events
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
-    for w in inputs_meta(uni, t0)[1]:
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0, cfg, t1)
+    for w in inputs_meta(uni, t0, cfg, t1)[1]:
         rep.line(f"WARNING: {w}")
     if any(not r.info.get("fv_ready_at_t0", True) for r in res_by.values()):
         rep.line("WARNING: fair-value model NOT warm at t0 (no opportunities are evaluated until it is): start t0 "

@@ -71,5 +71,18 @@ about 0.37 for cost-heavy policies because the settlement unwind is booked in th
 Policy differences are many SEs apart, so conclusions are unaffected.
 1-minute resolution understates within-minute gamma near expiry. No market impact at large
 hedge sizes. The synthetic flow's strike and side distribution and its informed fraction are
-assumptions: rerun this study on recorded Kalshi fills (same code path, real fills) once
-available. Bitstamp prices stand in for both the BRTI and the perp (basis ignored).
+assumptions: rerun this study on recorded Kalshi fills once available (below). Bitstamp prices
+stand in for both the BRTI and the perp (basis ignored).
+
+## Re-run on realized fills (the M3 gate)
+
+`python scripts/run_experiment.py e5 --root <recording> --t0 A --t1 B [--hedge-fee-bps <tier>]`
+(`dh/research/exp5_hedge.py`) evaluates the same policy family (none, per fill, the mean-variance band
+for a lambda x fee-tier grid, and the configured engine at `cfg.lam` and the achieved tier) on the
+SAME realized fill stream: the production strategy replayed under fill policies B and C, or a live /
+paper session's fills (`--session-fills live|paper|<ledger.csv>`), against the recorded BRTI path,
+with the hedge executed by `dh.execution.hedge_sim.HedgeVenueSim` (proxy book at BRTI +- half spread,
+or a recorded venue with `--hedge-venue`). Utility and P&L variance per settlement event with
+event-clustered CIs; the hedge engine turns on only if the configured band beats no hedge in utility
+under B and C (docs/research/EXPERIMENTS_RUNBOOK.md, E5). The synthetic demo
+(`docs/research/synthetic_demo/e5/`) validates the pipeline only.

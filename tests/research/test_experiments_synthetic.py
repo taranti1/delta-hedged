@@ -109,6 +109,7 @@ def test_every_experiment_runs_end_to_end_on_the_synthetic_recording(tiny_rec, t
         "e2": ["--no-pnl", *pol],
         "e3": pol,
         "e4": ["--grid", '{"config": {}}', *pol],
+        "e5": ["--hedge-fees-bps", "1", "--hedge-lams", "1e-2", *pol],
         "e67": pol,
         "e8": pol,
         "e9": ["--strikes", "1,0", *pol],
@@ -122,7 +123,7 @@ def test_every_experiment_runs_end_to_end_on_the_synthetic_recording(tiny_rec, t
         assert SYNTHETIC_BANNER in md and "**Verdict:**" in md and "**Decision rule" in md, name
         assert "**Verdict:** ACCEPT" not in md, name  # synthetic data, policy B only: never an ACCEPT
     assert "recenter_always" in reports["e4"] and "nearest_1" in reports["e9"] and "x4" in reports["e10"]
-    for name in ("e3", "e4", "e8", "e9", "e10"):  # regime splits (audit m8)
+    for name in ("e3", "e4", "e5", "e8", "e9", "e10"):  # regime splits (audit m8)
         reg = next((tmp_path / name).glob("*regimes.csv"), None)
         assert reg is not None, name
     for p in tmp_path.glob("*/*.csv"):

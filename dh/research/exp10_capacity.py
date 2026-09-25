@@ -90,14 +90,14 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                 cap_rows.append(row)
     cap = pd.DataFrame(cap_rows)
     rep = Report("e10_capacity", "E10 — Capacity: net edge vs quote size", Path(out), synthetic=uni.synthetic,
-                 rule=RULE_E10, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
+                 rule=RULE_E10, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0, cfg, t1)[0],
                                       "latency": describe_latency(lat, uni),
                                       "base_clip_contracts": cfg.quoting.clip_contracts,
                                       "limits_scaled_with_size": scale_limits})
     bk = cap[(cap.level_c == 0.0) & (cap.basis == "point")]
     rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
     rep.policies = policies_with_results(runs)
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0, cfg, t1)
     reg = [regime_table(add_regimes(settled(r.df)).assign(policy=r.policy, variant=r.variant), group=("variant", "policy"))
            for r in runs if len(settled(r.df))]
     rep.verdict = "MEASUREMENT — breakeven clip multiple: " + ", ".join(

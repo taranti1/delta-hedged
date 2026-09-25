@@ -5,10 +5,114 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+PROVENANCE_STATUSES = ("prior", "fitted")
+
+
+def _utc_iso(v: Any) -> str:
+    """'' | ISO-8601 string | datetime/date (YAML parses unquoted timestamps) | epoch s/ms/ns ->
+    normalized ISO-8601 UTC string ('YYYY-MM-DDTHH:MM:SSZ', sub-second kept), '' if empty."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        dt = v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+    elif isinstance(v, date):
+        dt = datetime(v.year, v.month, v.day, tzinfo=timezone.utc)
+    elif isinstance(v, (int, float)) and not isinstance(v, bool):
+        x = float(v)
+        sec = x / 1e9 if abs(x) > 1e17 else x / 1e3 if abs(x) > 1e11 else x
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    else:
+        s = str(v).strip()
+        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + (f".{dt.microsecond:06d}" if dt.microsecond else "") + "Z"
+
+
+def utc_from_ms(ms: int | float | None) -> str:
+    """Epoch MILLISECONDS -> ISO-8601 UTC ('' for None); explicit unit (no magnitude guessing)."""
+    return "" if ms is None else _utc_iso(datetime.fromtimestamp(float(ms) / 1e3, tz=timezone.utc))
+
+
+def utc_from_ns(ns: int | None) -> str:
+    """Epoch NANOSECONDS -> ISO-8601 UTC ('' for None); explicit unit (no magnitude guessing)."""
+    if ns is None:
+        return ""
+    sec, rem = divmod(int(ns), 1_000_000_000)
+    return _utc_iso(datetime.fromtimestamp(sec, tz=timezone.utc).replace(microsecond=rem // 1_000))
+
+
+@dataclass(frozen=True)
+class ParamProvenance:
+    """Where a fitted parameter set comes from (look-ahead guard, docs/research/EXPERIMENTS_RUNBOOK.md
+    section 2a). Replays label the set against their evaluation window exactly like the fair-value
+    parameters (dh.research.replay_env.provenance_status):
+
+      status           'prior'  = placeholder / [ESTIMATE] value never fitted on data: out-of-sample
+                                  for every window, labelled "prior";
+                       'fitted' = estimated on data in [fitted_from_utc, fitted_to_utc): IN-SAMPLE for a
+                                  window starting before fitted_to_utc; a fitted set without
+                                  fitted_to_utc has an unknown fitting window (treated as in-sample)
+      fitted_from_utc  first datum used (ISO-8601 UTC; '' = unknown)
+      fitted_to_utc    every datum used precedes this time (ISO-8601 UTC)
+      dataset_id       dataset id and/or content hash of the fitting data
+      method           fit method
+    """
+
+    status: str = "prior"
+    fitted_from_utc: str = ""
+    fitted_to_utc: str = ""
+    dataset_id: str = ""
+    method: str = ""
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in PROVENANCE_STATUSES:
+            raise ValueError(f"provenance status must be one of {PROVENANCE_STATUSES}, not {self.status!r}")
+        for k in ("fitted_from_utc", "fitted_to_utc"):
+            object.__setattr__(self, k, _utc_iso(getattr(self, k)))
+
+    @property
+    def is_prior(self) -> bool:
+        return self.status == "prior"
+
+    @staticmethod
+    def _ns(s: str) -> int | None:
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+        return int(dt.timestamp()) * 1_000_000_000 + dt.microsecond * 1_000
+
+    @property
+    def fitted_from_ns(self) -> int | None:
+        return self._ns(self.fitted_from_utc)
+
+    @property
+    def fitted_to_ns(self) -> int | None:
+        return self._ns(self.fitted_to_utc)
+
+    def as_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "ParamProvenance":
+        d = dict(d or {})
+        return cls(**{f.name: d[f.name] for f in fields(cls) if f.name in d and d[f.name] is not None})
+
+    @classmethod
+    def fitted(cls, fitted_from: Any, fitted_to: Any, *, dataset_id: str = "", method: str = "",
+               note: str = "") -> "ParamProvenance":
+        return cls("fitted", _utc_iso(fitted_from), _utc_iso(fitted_to), dataset_id, method, note)
+
+
+PRIOR_METHOD = "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
 
 
 @dataclass(frozen=True)
@@ -58,6 +162,8 @@ class FillModelCfg:
     taker_size_cv: float = 2.0
     improve_rate_mult: float = 1.0  # intensity multiplier when first in queue at an improved price
     behind_rate_mult: float = 0.15  # sweep intensity for prices behind the touch (per tick)
+    # fitting window of the values above (look-ahead guard); default: a prior never fitted on data
+    provenance: ParamProvenance = field(default_factory=lambda: ParamProvenance(method=PRIOR_METHOD))
 
 
 @dataclass(frozen=True)
@@ -68,6 +174,8 @@ class AdverseSelCfg:
     lookback_s: float = 2.0  # window for the recent fair-value move
     behind_mult: float = 2.0  # sweep fills (quotes behind the touch) are more toxic (Experiment 4)
     horizon_s: float = 60.0
+    # fitting window of the values above (look-ahead guard); default: a prior never fitted on data
+    provenance: ParamProvenance = field(default_factory=lambda: ParamProvenance(method=PRIOR_METHOD))
 
 
 @dataclass(frozen=True)

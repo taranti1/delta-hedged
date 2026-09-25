@@ -4,12 +4,13 @@
 
 | run | |
 |---|---|
-| root | /tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data |
+| root | /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data |
 | window | 2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z |
 | reference | nearest_1 |
 | FV parameters | fv_recommended.json: n/a (synthetic recording) |
 | taker flow | config defaults (cfg.fill) |
-| strategy fill/adverse parameters | fitting window not recorded in the strategy config: NOT covered by the look-ahead check (fit them on data before the replay window) |
+| fill-intensity parameters | config fill: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
+| adverse-selection parameters | config adverse: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
 | latency | submit lognormal(median 30 ms, sigma 0.4); cancel = submit; response lognormal(median 30 ms, sigma 0.4); ws lognormal(median 10 ms, sigma 0.5); md 20 ms [measured: median receive - exchange time of 20000 Kalshi trade/delta messages received in the first 600 s after t0 (no data before t0)]; policy C x1.5 |
 | settlement events behind the decision | 4 |
 | fill policies with results | B,C |
@@ -39,9 +40,9 @@ Decision table: paired CIs vs the reference (net $/day over settlement events; d
 
 | variant | policy | d_usd_day | d_usd_day_lo | d_usd_day_hi | events | d_turnover_per_ct | d_turnover_lo | d_turnover_hi | time_blocks | p_joint | d_usd_day_daylo | day_blocks | day_check |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| nearest_3 | B | 157.4 | -58.2 | 397.0 | 4 | -0.007357 | -0.007357 | -0.007357 | 2 | 0.05137 | nan | 1 |  |
+| nearest_3 | B | 157.4 | -58.2 | 397.0 | 4 | -0.007357 | nan | nan | 2 | 0.05137 | nan | 1 |  |
 | nearest_3 | C | 172.1 | -24.43 | 368.6 | 4 | -0.008435 | -0.008435 | -0.008435 | 2 | 0.0343 | nan | 1 |  |
-| all | B | -6.24 | -354.8 | 342.3 | 4 | -0.02664 | -0.02664 | -0.02664 | 2 | 0.5209 | nan | 1 |  |
+| all | B | -6.24 | -354.8 | 342.3 | 4 | -0.02664 | nan | nan | 2 | 0.5209 | nan | 1 |  |
 | all | C | -13.68 | -398.1 | 324.5 | 4 | -0.02593 | nan | nan | 2 | 0.5471 | nan | 1 |  |
 
 CSV: `e9_multistrike_paired.csv`

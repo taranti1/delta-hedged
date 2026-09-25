@@ -13,7 +13,7 @@ True,B,log_tau,138,-0.184774
 True,B,abs_z,138,-0.266169
 True,B,yes_px,138,-0.0401214
 True,B,spread_ticks,31,0.602586
-True,B,sigma_ann,138,0.107331
+True,B,sigma_ann,138,0.106988
 True,B,fv_edge_c,138,0.721459
 True,C,queue_at_place_ct,129,0.0147684
 True,C,quote_age_s,129,-0.0955307
@@ -29,5 +29,5 @@ True,C,log_tau,129,-0.0520189
 True,C,abs_z,129,-0.253131
 True,C,yes_px,129,-0.108818
 True,C,spread_ticks,24,0.265626
-True,C,sigma_ann,129,0.134531
+True,C,sigma_ann,129,0.134632
 True,C,fv_edge_c,129,0.63963

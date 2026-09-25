@@ -20,8 +20,8 @@ Decision rule (E6/E7), with multiplicity control and out-of-sample confirmation 
      candidates, >= 20 events);
   3. 'disable' when Holm-significant < 0 under B or C in the selection sample.
 The verdict states that selection was in-sample and where it was confirmed. Ledgers carry the
-replay's status columns (synthetic, fv_status, flow_status); a pooled ledger without them has an
-unknown status, which caps an ACCEPT (audit M7).
+replay's status columns (synthetic, fv_status, flow_status, fill_status, adverse_status); a pooled
+ledger without them has an unknown status, which caps an ACCEPT (audit M7).
 """
 
 from __future__ import annotations
@@ -173,25 +173,34 @@ def add_recommendation(t: pd.DataFrame, keys: Sequence[str], min_events: int = M
     return t
 
 
+STATUS_COLUMNS = {"fv_status": "FV parameters", "flow_status": "taker flow", "fill_status": "fill-intensity parameters",
+                  "adverse_status": "adverse-selection parameters"}
+
+
 def ledger_status(dfs: dict[str, pd.DataFrame]) -> tuple[bool, bool, str]:
-    """(synthetic, in_sample, why) from the status columns of ledger frames (audit M7). A frame
-    without fv_status / flow_status columns has an UNKNOWN status (treated as in-sample)."""
+    """(synthetic, in_sample, why) from the status columns of ledger frames (audit M7; replay_env.
+    status_columns). A frame without every status column (fv_status, flow_status, fill_status,
+    adverse_status), or with an 'unknown' status, is treated as in-sample; 'prior' (placeholder
+    never fitted on data) counts as out-of-sample."""
     synthetic, ins, why = False, False, []
     for pol, d in dfs.items():
         if d is None or not len(d):
             continue
         if "synthetic" in d and d["synthetic"].astype(str).str.lower().isin(["true", "1"]).any():
             synthetic = True
-        if "fv_status" not in d or "flow_status" not in d:
+        missing = [c for c in STATUS_COLUMNS if c not in d]
+        if missing:
             ins = True
-            why.append(f"ledger {pol} lacks the fv_status / flow_status columns (status unknown)")
+            why.append(f"ledger {pol} lacks the {' / '.join(missing)} column(s) (status unknown)")
             continue
-        if (d["fv_status"].astype(str) == "in_sample").any():
-            ins = True
-            why.append(f"ledger {pol}: FV parameters in sample")
-        if (d["flow_status"].astype(str) == "in_sample").any():
-            ins = True
-            why.append(f"ledger {pol}: taker flow in sample")
+        for col, what in STATUS_COLUMNS.items():
+            st = d[col].astype(str)
+            if (st == "in_sample").any():
+                ins = True
+                why.append(f"ledger {pol}: {what} in sample")
+            elif (st == "unknown").any():
+                ins = True
+                why.append(f"ledger {pol}: {what} of unknown fitting window")
     return synthetic, ins, "; ".join(dict.fromkeys(why))
 
 
@@ -226,7 +235,9 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
     Path(out).mkdir(parents=True, exist_ok=True)
     cfg = cfg or StrategyConfig()
     warns: list[str] = []
-    imeta: dict[str, Any] = {"FV parameters": "as recorded in the ledgers' status columns"}
+    imeta: dict[str, Any] = {"FV / taker-flow / fill-intensity / adverse-selection parameters":
+                             "as recorded in the ledgers' status columns (fv_status, flow_status, fill_status, "
+                             "adverse_status)"}
     conf_dfs: dict[str, pd.DataFrame] = {}
     lat = None
     if (confirm_t0 is None) != (confirm_t1 is None):
@@ -246,9 +257,9 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
                             n_jobs=n_jobs, progress=progress, latency=lat)
         dfs = {r.policy: r.df for r in runs}
         warns = run_warnings(runs)
-        imeta = {**inputs_meta(uni, t0)[0], "latency": describe_latency(lat, uni)}
+        imeta = {**inputs_meta(uni, t0, cfg, t1)[0], "latency": describe_latency(lat, uni)}
         synthetic = uni.synthetic
-        in_sample, why = inputs_status(uni, t0)
+        in_sample, why = inputs_status(uni, t0, cfg, t1)
         if confirm_t0 is not None and confirm_t1 is not None:
             cuni = build_universe(root, confirm_t0, confirm_t1)
             cuni.fv_config, cuni.fv_config_source = uni.fv_config, uni.fv_config_source
@@ -257,7 +268,7 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
                                  seed=seed, n_jobs=n_jobs, progress=progress, latency=research_latency(cuni, latency))
             conf_dfs = {r.policy: r.df for r in cruns}
             warns += [w for w in run_warnings(cruns) if w not in warns]
-            ci_s, ci_why = inputs_status(cuni, confirm_t0)
+            ci_s, ci_why = inputs_status(cuni, confirm_t0, cfg, confirm_t1)
             in_sample, why = in_sample or ci_s, "; ".join(x for x in (why, ci_why) if x)
     if conf_dfs:
         sel_dfs, sel_win, conf_win = dfs, f"{fmt_ns(t0)} .. {fmt_ns(t1)}", f"{fmt_ns(confirm_t0)} .. {fmt_ns(confirm_t1)}"

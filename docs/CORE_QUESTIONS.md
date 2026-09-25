@@ -87,7 +87,9 @@ fees, with at least 20 opportunities a day.
 fill: a base cost, a momentum term against us, a final-minute term, and a multiplier for
 quotes that sit behind the touch (`docs/MODELS.md` s.3.2).
 
-**Status.** [BUILT], with [ESTIMATE] parameters. E3 fits it on real fills:
+**Status.** [BUILT], with [ESTIMATE] parameters, recorded as priors (`adverse.provenance` in
+`config/m1.yaml`): every experiment labels them prior / in-sample / out-of-sample against its window
+and a fit overlapping the window caps an ACCEPT. E3 fits it on real fills:
 - M1 live fills;
 - shadow fills of hypothetical quotes in replay (`dh/research/exp3_toxicity.py`).
 
@@ -122,7 +124,8 @@ enters as follows:
 | current gamma | the scenario grid prices the full step payoff, so gamma is inside the inventory term |
 | size | clip, capacity under limits, and the fee-efficient size (Kalshi's per-order fee rounding) |
 
-**Status.** [BUILT], tested with known-answer tests. Parameters stay [ESTIMATE] until E3/E4
+**Status.** [BUILT], tested with known-answer tests. Parameters stay [ESTIMATE] (recorded as
+priors with a `provenance`; a refit records its UTC fitting window and dataset hash) until E3/E4
 and the flow calibration run on real data.
 
 ### 6. What is the correct delta of each Kalshi binary position?
@@ -149,7 +152,10 @@ their event settles.
 - Time-based and continuous rebalancing are dominated at every fee tier.
 - Continuous hedging *raises* P&L s.d. by 11% at 5 bp and by 135% at 12 bp.
 
-**Settled by.** E5 re-run on recorded Kalshi fills.
+**Settled by.** E5 re-run on recorded Kalshi fills: [BUILT] (`run_experiment.py e5`,
+`dh/research/exp5_hedge.py`). It evaluates no hedge, per-fill hedging and the band (lambda x fee tier,
+and the configured engine) on the same realized fills (the replay's under B and C, or a live / paper
+session's) and the recorded BTC path; [OPEN] the run on real fills.
 
 ### 8. When is NOT hedging immediately superior to immediate hedging?
 
@@ -160,7 +166,8 @@ their event settles.
 - Hedging is a *scaling* tool, since variance grows as q^2 and cost as q. It starts to pay at
   about 1,000+ contracts/hour and hedge costs of about 1 bp or less.
 
-**Status.** [VERIFIED] (Experiment 5). The M1 config has the hedge disabled.
+**Status.** [VERIFIED] (Experiment 5 on real paths with synthetic flow). The M1 config has the hedge
+disabled; `run_experiment.py e5` re-checks it on realized fills before the hedge engine may turn on.
 
 ### 9. When should the system stop quoting entirely?
 

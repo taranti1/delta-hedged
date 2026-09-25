@@ -18,6 +18,8 @@ Inputs (all causal):
 
 ``flow_segments.json`` is fitted on every market of the window, so ``meta.fit_end_ms`` is the last
 expiration (<= t1): use it only for replays that start after it (run_replay warns otherwise).
+``meta.provenance`` records the fitting window (UTC), the dataset (recording root, window and a
+content hash of the fitting sample) and the fit method (dh.research.calibrate_flow).
 ``flow_segments_train.json`` is the training-period fit that the in-sample / out-of-sample table
 grades (chronological split by expiration, or walk-forward by day). Limitation: recorder
 downtime inside the window is counted as exposure without trades (rates biased low); check the
@@ -120,6 +122,10 @@ def fit_flow(root: str | Path, t0: int, t1: int, out: str | Path, *, universe: U
     res.meta.update({"source": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "trades": len(trades),
                      "markets_in_window": len(markets), "own_taker_prints_removed":
                      sum(1 for f in uni.own_fills.values() if f.is_taker)})
+    src = f"recording {root} [{fmt_ns(t0)} .. {fmt_ns(t1)}]: kalshi.ws public prints + BRTI ticks"
+    for prov in (res.provenance, res.provenance_all):
+        if prov:
+            prov["dataset_id"] = f"{prov.get('dataset_id', '')} ({src})"
     write_split_report(res, out, title="Taker-flow calibration from a recording (time split)",
                        note=f"Window {fmt_ns(t0)} .. {fmt_ns(t1)}; {len(trades)} public prints, {len(markets)} fully "
                             "observed markets; BRTI ticks as the point-in-time reference.", synthetic=uni.synthetic)

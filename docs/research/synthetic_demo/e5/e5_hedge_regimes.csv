@@ -1,0 +1,9 @@
+synthetic,policy,family,regime,events,d_usd_event,d_lo,d_hi,sd_none,sd_hedged
+True,B,vol_tercile,high,1,0,,,,
+True,B,vol_tercile,low,2,0,,,1.96576,1.96576
+True,B,vol_tercile,mid,1,0,,,,
+True,B,weekday,weekday,4,0,0,0,3.69272,3.69272
+True,C,vol_tercile,high,1,0,,,,
+True,C,vol_tercile,low,2,0,,,3.80423,3.80423
+True,C,vol_tercile,mid,1,0,,,,
+True,C,weekday,weekday,4,0,0,0,5.10599,5.10599
