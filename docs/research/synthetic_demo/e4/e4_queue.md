@@ -4,11 +4,12 @@
 
 | run | |
 |---|---|
-| root | /tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data |
+| root | /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data |
 | window | 2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z |
 | FV parameters | fv_recommended.json: n/a (synthetic recording) |
 | taker flow | config defaults (cfg.fill) |
-| strategy fill/adverse parameters | fitting window not recorded in the strategy config: NOT covered by the look-ahead check (fit them on data before the replay window) |
+| fill-intensity parameters | config fill: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
+| adverse-selection parameters | config adverse: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
 | latency | submit lognormal(median 30 ms, sigma 0.4); cancel = submit; response lognormal(median 30 ms, sigma 0.4); ws lognormal(median 10 ms, sigma 0.5); md 20 ms [measured: median receive - exchange time of 20000 Kalshi trade/delta messages received in the first 600 s after t0 (no data before t0)]; policy C x1.5 |
 | variants | 8 |
 | tested (pre-registered, Holm) | config, hysteresis_strong, age_only_5s |

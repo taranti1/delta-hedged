@@ -52,15 +52,19 @@ price file, or (flagged, synthetic) a seeded GBM path: ``warm='recorded'|'record
 'csv:<path>'|'none'``. Missing settlements are filled from recorded REST market results.
 
 Fitted inputs and look-ahead: the fair-value parameters (default dh/models/data/fv_recommended.json,
-fitted on history through its ``data_end_utc``) and optional taker-flow segments
-(dh.research.calibrate_flow / flow_recording JSON, ``meta.fit_end_ms``) are checked against the
-replay's t0. A replay that starts before the end of their fitting data is IN-SAMPLE: the summary
-says so (``fv_params``, ``fv_params_in_sample``, ``flow_segments``, ``flow_in_sample``) and a warning
-is raised; bind walk-forward inputs with ``bind_replay_inputs(universe, fv_config=..,
-flow_segments=..)`` (CLI --fv-config / --flow-segments) or pass them to run_replay. Recordings made
-after the FV fit (every recording from 2026-09-25 on, for the committed config) are
-out-of-sample. Settlement prints are mapped only by dh.settlement (SettlementTracker: 1 Hz tick
-with source time u = print for second ceil(u), later of two kept); nothing here re-derives it.
+fitted on history through its ``data_end_utc``), optional taker-flow segments
+(dh.research.calibrate_flow / flow_recording JSON, ``meta.provenance`` / ``meta.fit_end_ms``) and
+the strategy config's fill-intensity and adverse-selection parameters (``cfg.fill.provenance``,
+``cfg.adverse.provenance``: prior placeholder, or fitted on [fitted_from_utc, fitted_to_utc)) are
+checked against the replay's t0. A replay that starts before the end of their fitting data is
+IN-SAMPLE: the summary says so (``fv_params``, ``fv_params_in_sample``, ``flow_segments``,
+``flow_in_sample``, ``fill_params``, ``adverse_params``), the ledger carries status columns and a
+warning is raised; priors never fitted on data count as out-of-sample and are labelled 'prior'.
+Bind walk-forward inputs with ``bind_replay_inputs(universe, fv_config=.., flow_segments=..)`` (CLI
+--fv-config / --flow-segments) or pass them to run_replay. Recordings made after the FV fit (every
+recording from 2026-09-25 on, for the committed config) are out-of-sample. Settlement prints are
+mapped only by dh.settlement (SettlementTracker: 1 Hz tick with source time u = print for second
+ceil(u), later of two kept); nothing here re-derives it.
 
 Determinism: identical inputs and seeds -> identical results (no clock, seeded latency).
 """
@@ -121,7 +125,7 @@ from dh.models.fvmodel import FairValueModel, load_recommended_config
 from dh.research.exp_common import policy_letter
 from dh.store.codec import decode_event
 from dh.store.replay import Normalizers, ReadStats, iter_raw, list_streams, resolve_streams
-from dh.strategy.config import StrategyConfig
+from dh.strategy.config import ParamProvenance, StrategyConfig, utc_from_ms
 from dh.strategy.mm import MarketMaker
 
 HOUR_S = 3600.0
@@ -1167,22 +1171,78 @@ def fv_params_status(cfg: Mapping[str, Any], source: str, t0: int, synthetic: bo
     return info, warn
 
 
+def provenance_status(prov: ParamProvenance | Mapping[str, Any] | None, source: str, t0: int,
+                      t1: int | None = None, *, what: str = "parameters") -> tuple[dict[str, Any], str | None]:
+    """Label a fitted parameter set against the evaluation window [t0, t1) exactly like the FV
+    parameters (fv_params_status): in sample = fitted on data NOT strictly before t0 (the fit
+    overlaps the window, or used later data). Statuses:
+
+      prior          placeholder never fitted on data ([ESTIMATE]): out-of-sample by construction,
+                     but labelled 'prior' (it is not evidence of anything either)
+      out_of_sample  every fitting datum precedes t0 (fitted_to_utc <= t0)
+      in_sample      fitted_to_utc > t0: look-ahead parameters
+      unknown        fitted without fitted_to_utc, or no provenance at all: treated as in-sample
+
+    Returns ({status, in_sample, label, fitted_from, fitted_to, dataset_id, method}, warning|None)."""
+    if isinstance(prov, ParamProvenance):
+        p: ParamProvenance | None = prov
+    else:
+        p = ParamProvenance.from_dict(prov) if prov is not None else None
+    src = source or "given"
+    if p is None:
+        status, ins, label = "unknown", True, f"{src}: UNKNOWN provenance (none recorded): treated as in-sample"
+    elif p.is_prior:
+        status, ins = "prior", False
+        label = f"{src}: prior, never fitted on data (counts as out-of-sample): {p.method or p.note or 'placeholder'}"
+    else:
+        end = p.fitted_to_ns
+        rng = f"{p.fitted_from_utc or '?'} .. {p.fitted_to_utc or '?'}"
+        ds = f"; dataset {p.dataset_id}" if p.dataset_id else ""
+        if end is None:
+            status, ins = "unknown", True
+            label = f"{src}: UNKNOWN fit window (fitted, no fitted_to_utc{ds}): treated as in-sample"
+        elif t0 < end:
+            start = p.fitted_from_ns
+            where = ("fitted on data after the window" if t1 is not None and start is not None and start >= t1
+                     else "fit overlaps the window")
+            status, ins = "in_sample", True
+            label = f"{src}: IN-SAMPLE (fitted on data {rng}{ds}; {where})"
+        else:
+            status, ins = "out_of_sample", False
+            label = f"{src}: out-of-sample (fitted on data {rng}{ds}, before t0)"
+    info = {"status": status, "in_sample": ins, "label": label,
+            "fitted_from": p.fitted_from_utc if p else "", "fitted_to": p.fitted_to_utc if p else "",
+            "dataset_id": p.dataset_id if p else "", "method": p.method if p else ""}
+    warn = None
+    if ins:
+        warn = (f"in-sample {what}: {label}; the window starts {_iso_ns(t0)}: fit them on data strictly before t0 "
+                "or report the result as in-sample")
+    return info, warn
+
+
 def flow_status(seg: Mapping[Any, Any] | None, meta: Mapping[str, Any], source: str,
-                t0: int) -> tuple[dict[str, Any], str | None]:
-    """Same check for taker-flow segments (``meta.fit_end_ms``: every training datum precedes it)."""
+                t0: int, t1: int | None = None) -> tuple[dict[str, Any], str | None]:
+    """Same check for taker-flow segments: ``meta.provenance`` (dh.research.calibrate_flow: fitting
+    window, dataset hash, method) or, for older files, ``meta.fit_end_ms`` (every training datum
+    precedes it); neither = unknown fitting window (in sample)."""
     if not seg:
-        return {"flow_segments": "config defaults (cfg.fill)", "flow_in_sample": None}, None
-    end_ms = meta.get("fit_end_ms")
-    end_ns = int(end_ms) * 1_000_000 if end_ms is not None else None
-    ins = True if end_ns is None else t0 < end_ns
-    info = {"flow_segments": f"{source or 'given'} ({len(seg)} segments, fit through {_iso_ns(end_ns)})",
-            "flow_in_sample": ins}
+        return {"flow_segments": "config defaults (cfg.fill)", "flow_in_sample": None, "flow_status": "defaults"}, None
+    prov = meta.get("provenance")
+    if prov is None:
+        end_ms = meta.get("fit_end_ms")
+        prov = ParamProvenance("fitted", fitted_to_utc=utc_from_ms(end_ms))
+    p = prov if isinstance(prov, ParamProvenance) else ParamProvenance.from_dict(prov)
+    info, _ = provenance_status(p, source or "given", t0, t1, what="flow")
+    ins = bool(info["in_sample"])
+    out = {"flow_segments": f"{source or 'given'} ({len(seg)} segments, fit through {p.fitted_to_utc or '?'}): "
+                            f"{info['label'].split(': ', 1)[-1]}",
+           "flow_in_sample": ins, "flow_status": "in_sample" if ins else "out_of_sample", "flow_provenance": info}
     warn = None
     if ins:
         warn = (f"in-sample flow: the taker-flow segments ({source or 'given'}) were fitted on data through "
-                f"{_iso_ns(end_ns)}, not before this replay's t0 {_iso_ns(t0)}; fit them strictly before t0 "
+                f"{p.fitted_to_utc or '?'}, not before this replay's t0 {_iso_ns(t0)}; fit them strictly before t0 "
                 "(run_experiment.py flow --t1 <replay t0>)")
-    return info, warn
+    return out, warn
 
 
 def fv_label_for(uni: Universe, t0: int) -> tuple[dict[str, Any], str | None]:
@@ -1191,46 +1251,71 @@ def fv_label_for(uni: Universe, t0: int) -> tuple[dict[str, Any], str | None]:
     return fv_params_status(cfg, src, t0, uni.synthetic)
 
 
-FILL_ADVERSE_NOTE = ("fitting window not recorded in the strategy config: NOT covered by the look-ahead check "
-                     "(fit them on data before the replay window)")
+STRATEGY_PARAMS = {"fill": ("fill-intensity parameters", "fill-intensity"),
+                   "adverse": ("adverse-selection parameters", "adverse-selection")}
 
 
-def inputs_meta(uni: Universe, t0: int) -> tuple[dict[str, Any], list[str]]:
-    """Report metadata + warnings for the fitted inputs of a window's replays (FV parameters and
-    taker-flow segments; in-sample = fitted on data not strictly before t0). The strategy's
-    fill/adverse config parameters carry no fitting window, so the check cannot cover them."""
-    fv_info, fv_warn = fv_label_for(uni, t0)
-    fl_info, fl_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
-    return ({"FV parameters": fv_info["fv_params"], "taker flow": fl_info["flow_segments"],
-             "strategy fill/adverse parameters": FILL_ADVERSE_NOTE},
-            [w for w in (fv_warn, fl_warn) if w])
+def strategy_param_status(cfg: StrategyConfig | None, section: str, t0: int,
+                          t1: int | None = None) -> tuple[dict[str, Any], str | None]:
+    """provenance_status of the strategy config's fill-intensity (``section='fill'``) or adverse-
+    selection (``'adverse'``) parameters. No config given = unknown (treated as in-sample)."""
+    what = STRATEGY_PARAMS[section][1]
+    if cfg is None:
+        return provenance_status(None, f"strategy config {section} (not given)", t0, t1, what=what)
+    return provenance_status(getattr(cfg, section).provenance, f"config {section}", t0, t1, what=what)
 
 
-def inputs_status(uni: Universe, t0: int) -> tuple[bool, str]:
-    """(in_sample, why): True when the FV parameters or the bound flow segments were fitted on
-    data not strictly before t0 (or their fitting window is unknown). Feeds Report.in_sample,
-    which caps an ACCEPT at INCONCLUSIVE (audit M7)."""
-    fv_info, _ = fv_label_for(uni, t0)
-    fl_info, _ = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
+def input_labels(uni: Universe, t0: int, cfg: StrategyConfig | None = None,
+                 t1: int | None = None) -> dict[str, tuple[dict[str, Any], str | None]]:
+    """Look-ahead labels of every fitted input of a window's replays (runbook section 2a): FV
+    parameters, taker-flow segments, the strategy's fill-intensity and adverse-selection parameters."""
+    t1 = uni.t1 if t1 is None else t1
+    return {"fv": fv_label_for(uni, t0), "flow": flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0, t1),
+            "fill": strategy_param_status(cfg, "fill", t0, t1), "adverse": strategy_param_status(cfg, "adverse", t0, t1)}
+
+
+def inputs_meta(uni: Universe, t0: int, cfg: StrategyConfig | None = None,
+                t1: int | None = None) -> tuple[dict[str, Any], list[str]]:
+    """Report metadata + warnings for the fitted inputs of a window's replays: FV parameters,
+    taker-flow segments and the strategy's fill-intensity / adverse-selection parameters, each
+    labelled in-sample / out-of-sample / prior against the window (in-sample = fitted on data not
+    strictly before t0). Pass the strategy config the replays use (None = unknown: in-sample)."""
+    lab = input_labels(uni, t0, cfg, t1)
+    return ({"FV parameters": lab["fv"][0]["fv_params"], "taker flow": lab["flow"][0]["flow_segments"],
+             STRATEGY_PARAMS["fill"][0]: lab["fill"][0]["label"],
+             STRATEGY_PARAMS["adverse"][0]: lab["adverse"][0]["label"]},
+            [w for _, w in lab.values() if w])
+
+
+def inputs_status(uni: Universe, t0: int, cfg: StrategyConfig | None = None,
+                  t1: int | None = None) -> tuple[bool, str]:
+    """(in_sample, why): True when the FV parameters, the bound flow segments or the strategy's
+    fill-intensity / adverse-selection parameters were fitted on data not strictly before t0 (or
+    their fitting window is unknown; priors never fitted on data count as out-of-sample). Feeds
+    Report.in_sample, which caps an ACCEPT at INCONCLUSIVE (audit M7)."""
+    lab = input_labels(uni, t0, cfg, t1)
     why = []
-    if fv_info["fv_params_in_sample"]:
-        why.append(f"FV parameters {fv_info['fv_params']}")
-    if fl_info["flow_in_sample"]:
-        why.append(f"taker flow {fl_info['flow_segments']} fitted on data not before t0")
+    if lab["fv"][0]["fv_params_in_sample"]:
+        why.append(f"FV parameters {lab['fv'][0]['fv_params']}")
+    if lab["flow"][0]["flow_in_sample"]:
+        why.append(f"taker flow {lab['flow'][0]['flow_segments']} fitted on data not before t0")
+    for k in ("fill", "adverse"):
+        if lab[k][0]["in_sample"]:
+            why.append(f"{STRATEGY_PARAMS[k][0]} {lab[k][0]['label']}")
     return bool(why), "; ".join(why)
 
 
-def status_columns(uni: Universe, t0: int) -> dict[str, Any]:
+def status_columns(uni: Universe, t0: int, cfg: StrategyConfig | None = None, t1: int | None = None) -> dict[str, Any]:
     """Status columns written into every replay ledger (audit M7): synthetic recording, FV
-    parameter status (in_sample / out_of_sample / n/a) and taker-flow status (in_sample /
-    out_of_sample / defaults), so pooled ledgers keep them."""
-    fv_info, _ = fv_label_for(uni, t0)
-    fl_info, _ = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
-    fvs = fv_info["fv_params_in_sample"]
-    fls = fl_info["flow_in_sample"]
+    parameter status (in_sample / out_of_sample / n/a), taker-flow status (in_sample /
+    out_of_sample / defaults) and the strategy's fill-intensity / adverse-selection parameter
+    status (prior / in_sample / out_of_sample / unknown), so pooled ledgers keep them."""
+    lab = input_labels(uni, t0, cfg, t1)
+    fvs = lab["fv"][0]["fv_params_in_sample"]
     return {"synthetic": bool(uni.synthetic),
             "fv_status": "n/a" if fvs is None else ("in_sample" if fvs else "out_of_sample"),
-            "flow_status": "defaults" if fls is None else ("in_sample" if fls else "out_of_sample")}
+            "flow_status": lab["flow"][0]["flow_status"],
+            "fill_status": lab["fill"][0]["status"], "adverse_status": lab["adverse"][0]["status"]}
 
 
 def bind_replay_inputs(uni: Universe, *, fv_config: str | Path | Mapping[str, Any] | None = None,
@@ -1742,7 +1827,9 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     postprocess(result) runs while result.mm/sim/ledger are still attached (use it to derive
     columns from the ledger inside a worker process); they are detached unless keep_objects.
     fv_config / flow_segments override the inputs bound to the universe (bind_replay_inputs);
-    both are checked for look-ahead against t0 (summary fv_params / flow_segments + warnings).
+    both are checked for look-ahead against t0 (summary fv_params / flow_segments + warnings), and so
+    are the strategy config's fill-intensity / adverse-selection parameters (cfg.fill.provenance,
+    cfg.adverse.provenance: summary fill_params / adverse_params, prior / in- / out-of-sample).
     latency: None -> research_latency(universe) (placeholders + the recording's measured Kalshi
     market-data latency). Books are primed from each market's last snapshot before t0, searched
     back ``prime_search_s``; markets that never get a valid book are counted and warned about.
@@ -1763,8 +1850,9 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     if fv_config is not None or flow_segments is not None:
         uni = bind_replay_inputs(dataclasses.replace(uni), fv_config=fv_config, flow_segments=flow_segments)
     fv_cfg = uni.fv_config or resolve_fv_config(None)[0]
-    fv_info, fv_warn = fv_label_for(uni, t0)
-    flow_info, flow_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
+    labels = input_labels(uni, t0, cfg, t1)
+    fv_info, fv_warn = labels["fv"]
+    flow_info, flow_warn = labels["flow"]
     fv = FairValueModel.from_config(fv_cfg)
     winfo = warm_fair_value(fv, root, t0, warm, fv_warm_s=fv_warm_s, gbm_vol_ann=gbm_vol_ann, seed=seed,
                             cache=uni.cache, fv_config=fv_cfg)
@@ -1782,6 +1870,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     if not can_add:  # older MarketMaker: every spec up front (books arrive via synthesized snapshots)
         mm = factory(cfg, feed.initial + [s for _, s in feed.pending], fv_model=fv, fee_engine=fee_engine,
                      **(factory_kwargs or {}))
+    if uni.flow_segments and hasattr(mm, "flow") and uni.flow_meta.get("provenance"):
+        mm.flow.segments_provenance = ParamProvenance.from_dict(uni.flow_meta["provenance"])
     scheds = {s.ticker: fee_engine.schedule_for_spec(s.fee_type, s.fee_multiplier) for s in specs}
     sim = TickerFeeExchangeSim(lat, POLICY_FULL[letter], scheds, seed=seed)
     for s in feed.initial:
@@ -1849,7 +1939,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
             ledger.settle[f.ticker] = settle[f.ticker]
             filled_from_rest += 1
     df = ledger.attribute()
-    status = status_columns(uni, t0)
+    status = status_columns(uni, t0, cfg, t1)
     if len(df):
         df["event_ticker"] = df["ticker"].map(lambda t: all_specs[t].event_ticker if t in all_specs else t)
         df["expiration_ns"] = df["ticker"].map(lambda t: all_specs[t].expiration_ts if t in all_specs else 0)
@@ -1908,6 +1998,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         "wall_s": wall, "drive_counts": dict(counts), "universe_notes": list(uni.notes),
         "quote_hours": quote_hours(sim, t1 + _ns(tail_s)), "orders": len(sim.orders),
         **fv_info, **flow_info,
+        **{f"{k}_params": labels[k][0]["label"] for k in ("fill", "adverse")},
+        **{f"{k}_params_in_sample": labels[k][0]["in_sample"] for k in ("fill", "adverse")},
     })
     summary["net_usd_per_quote_hour"] = (float(done["net"].sum()) / summary["quote_hours"]
                                          if len(df) and summary["quote_hours"] > 0 else 0.0)
@@ -1924,7 +2016,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         warns.append(f"{len(never)} of {len(set(added))} quotable market(s) never had a valid order book in the replay "
                      f"(never quoted), e.g. {', '.join(never[:3])}: no orderbook snapshot within prime_search_s "
                      f"({prime_search_s / 3600:g} h) before t0 or during the window")
-    warns += [w for w in (fv_warn, flow_warn) if w]
+    warns += [w for _, w in labels.values() if w]
     summary["warnings"] = warns
     extras: dict[str, Any] = {"collectors": [c.result() if hasattr(c, "result") else c for c in extra]}
     res = ReplayResult(df, summary, uni, extras, mm, sim, ledger)
@@ -2070,5 +2162,6 @@ __all__ = [
     "ReplayFeed", "brti_ticks", "warm_fair_value", "TickerFeeExchangeSim", "drive", "run_replay", "ReplayResult",
     "NearestStrikes", "FvProbe", "probe_for_window", "prime_probe", "FillCapture", "PortfolioSampler", "restrict_universe",
     "default_streams", "load_price_file", "Recording", "open_recording", "bind_replay_inputs", "resolve_fv_config",
-    "fv_params_status", "fv_label_for", "flow_status", "inputs_meta",
+    "fv_params_status", "fv_label_for", "flow_status", "inputs_meta", "inputs_status", "input_labels",
+    "provenance_status", "strategy_param_status", "status_columns",
 ]

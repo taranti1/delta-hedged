@@ -128,8 +128,18 @@ def test_regime_columns_split_by_tau_vol_tercile_and_weekday():
     assert set(t.family) == {"tau_bucket", "vol_tercile", "weekday"} and (t["mean"] == 1.0).all()
 
 
-def test_reports_say_the_lookahead_check_cannot_cover_fill_and_adverse_parameters():
-    from dh.research.replay_env import Universe, inputs_meta
+def test_reports_label_fill_and_adverse_parameters_against_the_window():
+    """The fill-intensity / adverse-selection parameters are labelled like the FV parameters
+    (tests/research/test_leakage_guards.py has the in-/out-of-sample cases)."""
+    from pathlib import Path
 
-    meta, _ = inputs_meta(Universe(root="/nonexistent", t0=0, t1=1), 0)
-    assert "NOT covered by the look-ahead check" in meta["strategy fill/adverse parameters"]
+    from dh.research.replay_env import Universe, inputs_meta
+    from dh.strategy.config import load_config
+
+    uni = Universe(root="/nonexistent", t0=0, t1=1)
+    meta, warns = inputs_meta(uni, 0, load_config(Path(__file__).resolve().parents[2] / "config" / "m1.yaml"))
+    for k in ("fill-intensity parameters", "adverse-selection parameters"):
+        assert "prior" in meta[k] and "never fitted on data" in meta[k], k
+    assert not any("fill-intensity" in w or "adverse-selection" in w for w in warns)
+    meta, warns = inputs_meta(uni, 0)  # the strategy config was not given: unknown, treated as in-sample
+    assert "UNKNOWN" in meta["fill-intensity parameters"] and any("in-sample fill-intensity" in w for w in warns)

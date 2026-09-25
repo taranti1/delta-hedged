@@ -4,7 +4,7 @@
 
 | run | |
 |---|---|
-| root | /tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data |
+| root | /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data |
 | window | 2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z |
 | decision_grid_ms | 250 |
 | clip_contracts | 10 |
@@ -14,7 +14,8 @@
 | fv_warm | recorded_brti |
 | FV parameters | fv_recommended.json: n/a (synthetic recording) |
 | taker flow | config defaults (cfg.fill) |
-| strategy fill/adverse parameters | fitting window not recorded in the strategy config: NOT covered by the look-ahead check (fit them on data before the replay window) |
+| fill-intensity parameters | config fill: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
+| adverse-selection parameters | config adverse: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
 | settlement events behind the decision | 4 |
 | fill policies with results | B,C |
 
@@ -32,10 +33,10 @@ One scan per edge threshold (c/contract after the exact per-order taker fee, ban
 | B | 0.5 | 251 | 6024.0 | 251 | 212 | 0.8446 | 1849.0 | 4 | 6.961 | -12.86 | 49.8 | 8.793 | 3.112 | 56.23 | 13.16 | -1.088 | 32.43 | 5837.8 | nan | 1 | False |
 | B | 1 | 193 | 4632.0 | 193 | 152 | 0.7876 | 1329.0 | 4 | 7.211 | -16.49 | 10.09 | 9.242 | -2.115 | 61.87 | 12.46 | -7.695 | 150.2 | 3972.7 | nan | 1 | False |
 | B | 2 | 108 | 2592.0 | 108 | 81 | 0.75 | 749.0 | 4 | 8.113 | -41.65 | 67.76 | 10.29 | -55.76 | 79.7 | 12.83 | -49.48 | 47.99 | 2306.6 | nan | 1 | False |
-| C | 0 | 314 | 7536.0 | 314 | 242 | 0.7707 | 2114.0 | 4 | 6.069 | -3.269 | 24.15 | 8.093 | -2.643 | 17.38 | 11.68 | -446.9 | 98.3 | 5926.6 | nan | 1 | False |
-| C | 0.5 | 251 | 6024.0 | 251 | 187 | 0.745 | 1600.0 | 4 | 7.085 | -3.328 | 40.99 | 10.67 | 8.656 | 15.91 | 14.7 | 4.692 | 28.84 | 5645.5 | nan | 1 | False |
-| C | 1 | 193 | 4632.0 | 193 | 137 | 0.7098 | 1188.0 | 4 | 7.091 | -63.23 | 13.24 | 8.733 | -4.35 | 113.1 | 12.27 | -9.723 | 186.9 | 3497.3 | nan | 1 | False |
-| C | 2 | 108 | 2592.0 | 108 | 74 | 0.6852 | 671.0 | 4 | 8.075 | -35.48 | 32.57 | 10.4 | -32.76 | 58.35 | 12.88 | -32.18 | 37.72 | 2074.8 | nan | 1 | False |
+| C | 0 | 314 | 7536.0 | 314 | 242 | 0.7707 | 2114.0 | 4 | 6.069 | -3.269 | 24.55 | 8.093 | -2.643 | 17.38 | 11.68 | -446.9 | 98.3 | 5926.6 | nan | 1 | False |
+| C | 0.5 | 251 | 6024.0 | 251 | 187 | 0.745 | 1600.0 | 4 | 7.085 | -3.328 | 41.75 | 10.67 | 8.656 | 16.15 | 14.7 | 4.692 | 28.84 | 5645.5 | nan | 1 | False |
+| C | 1 | 193 | 4632.0 | 193 | 137 | 0.7098 | 1188.0 | 4 | 7.091 | -63.23 | 13.05 | 8.733 | -4.35 | 113.1 | 12.27 | -9.723 | 186.9 | 3497.3 | nan | 1 | False |
+| C | 2 | 108 | 2592.0 | 108 | 74 | 0.6852 | 671.0 | 4 | 8.075 | -35.48 | 31.82 | 10.4 | -32.76 | 31.84 | 12.88 | -32.18 | 37.72 | 2074.8 | nan | 1 | False |
 
 CSV: `e8_taker_summary.csv`
 

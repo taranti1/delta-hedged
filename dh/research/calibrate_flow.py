@@ -31,6 +31,14 @@ test markets' data before the split are dropped as well. Segments fitted this wa
 replay may use (``save_segments``/``load_segments``; dh.research.flow_recording fits them from a
 recording strictly before the replay's t0).
 
+Provenance (look-ahead guard): every fit carries a ParamProvenance (dh.strategy.config) with the
+UTC fitting window [fitted_from_utc, fitted_to_utc) (first exposure / order of the fitting sample;
+every datum precedes fitted_to_utc), a content hash of the fitting sample (``dataset_hash``: taker
+orders, markets and the BTC reference rows available before fitted_to_utc) and the fit method.
+``FlowSplit.provenance`` belongs to the graded training fit, ``provenance_all`` to the whole-sample
+fit; both are written into the segment JSON files (``meta.provenance``) and checked by every replay
+against its window (dh.research.replay_env.flow_status).
+
 CLI:  python -m dh.research.calibrate_flow --trades T.parquet --markets M.parquet --btc B.parquet
           --out DIR [--split 0.7 | --walk-forward-days 1] [--btc-bar-ms 60000]
 """
@@ -38,6 +46,7 @@ CLI:  python -m dh.research.calibrate_flow --trades T.parquet --markets M.parque
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import defaultdict
@@ -50,6 +59,7 @@ import numpy as np
 import pandas as pd
 
 from dh.research.kalshi_data import DEFAULT_BTC_BAR_MS, normalize_markets, normalize_trades
+from dh.strategy.config import ParamProvenance, utc_from_ms
 from dh.strategy.fill_model import SegmentFlow, segment_key
 
 SEC_YR = 365.0 * 24 * 3600
@@ -222,6 +232,40 @@ def calibrate(
     return fit_segments(stats, min_orders, prior_s)
 
 
+# ============================================================================ provenance
+def dataset_hash(orders: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | None = None,
+                 btc_bar_ms: int = DEFAULT_BTC_BAR_MS, until_ms: int | None = None) -> str:
+    """Content hash of a fitting sample: 'sha256:<16 hex>' over the sorted taker orders, the markets
+    (ticker, open, expiration, strikes) and the BTC reference rows available before ``until_ms``."""
+    h = hashlib.sha256()
+    o = orders[[c for c in ("ticker", "ts_ms", "taker_side", "contracts") if c in orders]]
+    h.update(o.sort_values(list(o.columns)).to_csv(index=False).encode())
+    m = markets[[c for c in ("ticker", "open_ts_ms", "expiration_ts_ms", "floor_strike", "cap_strike") if c in markets]]
+    h.update(m.sort_values("ticker").to_csv(index=False).encode())
+    if btc is not None and len(btc):
+        avail = (btc["close_ts_ms"] if "close_ts_ms" in btc else btc["ts_ms"] + int(btc_bar_ms)).to_numpy(dtype=np.int64)
+        b = btc.loc[avail < until_ms] if until_ms is not None else btc
+        h.update(b[["ts_ms", "price"]].sort_values("ts_ms").to_csv(index=False).encode())
+    return "sha256:" + h.hexdigest()[:16]
+
+
+def fit_provenance(orders: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | None, *, to_ms: int | None,
+                   method: str, btc_bar_ms: int = DEFAULT_BTC_BAR_MS) -> dict[str, str]:
+    """ParamProvenance (as a dict) of segments fitted on ``markets`` (and their orders): from the
+    first exposure / order of the sample to ``to_ms`` (every datum precedes it), with its hash."""
+    o = orders[orders.ticker.isin(set(markets.ticker))]
+    starts = [int(markets.open_ts_ms.min())] if len(markets) else []
+    if len(o):
+        starts.append(int(o.ts_ms.min()))
+    return ParamProvenance.fitted(utc_from_ms(min(starts)) if starts else "", utc_from_ms(to_ms),
+                                  dataset_id=dataset_hash(o, markets, btc, btc_bar_ms, to_ms), method=method).as_dict()
+
+
+def _method(kind: str, *, prior_s: float, min_orders: int, vol_ann: float) -> str:
+    return (f"calibrate_flow.fit_segments: gamma-Poisson shrunk segment rates (prior_s={prior_s:g}, "
+            f"min_orders={min_orders}, vol_ann={vol_ann:g}); {kind}")
+
+
 # ============================================================================ out-of-sample grading
 def evaluate_flow(seg: Mapping[tuple[str, str, str], SegmentFlow], stats: FlowStats) -> pd.DataFrame:
     """Predicted vs realized taker flow per segment of an evaluation sample.
@@ -285,6 +329,8 @@ class FlowSplit:
     segments_all: dict[tuple[str, str, str], SegmentFlow] | None = None  # every market of the sample
     all_end_ms: int | None = None  # every datum of segments_all is before this time (use for later replays)
     meta: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, str] = field(default_factory=dict)  # ParamProvenance of ``segments`` (training fit)
+    provenance_all: dict[str, str] = field(default_factory=dict)  # ParamProvenance of ``segments_all``
 
 
 def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame, *, train_frac: float = 0.7,
@@ -314,11 +360,19 @@ def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFra
     st_all = FlowStats()
     st_all.add(st_tr)
     st_all.add(st_te_full)
+    all_end = int(exp[-1]) if len(exp) else None
+    kw = dict(prior_s=prior_s, min_orders=min_orders, vol_ann=vol_ann)
     return FlowSplit(seg, pd.DataFrame(rows), per, split_ms=int(split_ms), train_end_ms=int(split_ms),
                      segments_all=fit_segments(st_all, min_orders, prior_s),
-                     all_end_ms=int(exp[-1]) if len(exp) else None,
+                     all_end_ms=all_end,
                      meta={"method": "chronological", "train_frac": train_frac, "purge": purge,
-                           "train_markets": st_tr.markets, "test_markets": st_te.markets, "btc_bar_ms": btc_bar_ms})
+                           "train_markets": st_tr.markets, "test_markets": st_te.markets, "btc_bar_ms": btc_bar_ms},
+                     provenance=fit_provenance(orders, train_m, btc, to_ms=int(split_ms), btc_bar_ms=btc_bar_ms,
+                                               method=_method("training markets of a chronological split by "
+                                                              f"expiration (train_frac={train_frac:g})", **kw)),
+                     provenance_all=fit_provenance(orders, mk, btc, to_ms=all_end, btc_bar_ms=btc_bar_ms,
+                                                   method=_method("every market of the sample (graded by a "
+                                                                  "chronological split)", **kw)))
 
 
 def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame, *, min_train_days: int = 1,
@@ -362,17 +416,23 @@ def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.Dat
                  **flow_metrics(tab_is)})
     per.append(tab_is.assign(sample="in_sample"))
     end = int(mk.expiration_ts_ms.max()) if len(mk) else None
+    prov = fit_provenance(orders, mk, btc, to_ms=end, btc_bar_ms=btc_bar_ms,
+                          method=_method(f"every market of the sample (graded walk-forward by day, "
+                                         f"min_train_days={min_train_days})", prior_s=prior_s, min_orders=min_orders,
+                                         vol_ann=vol_ann))
     return FlowSplit(seg_all, pd.DataFrame(rows), pd.concat(per, ignore_index=True), split_ms=None, train_end_ms=end,
                      segments_all=seg_all, all_end_ms=end,
                      meta={"method": "walk_forward_day", "min_train_days": min_train_days, "purge": purge,
-                           "days": len(days), "btc_bar_ms": btc_bar_ms})
+                           "days": len(days), "btc_bar_ms": btc_bar_ms},
+                     provenance=prov, provenance_all=dict(prov))
 
 
 # ============================================================================ persistence
 def save_segments(seg: Mapping[tuple[str, str, str], SegmentFlow], path: str | Path, *,
                   meta: Mapping[str, Any] | None = None) -> Path:
     """JSON {"meta": {...}, "segments": {"tau|z|side": {rate_contracts_per_s, size_mean, size_cv}}}.
-    ``meta.fit_end_ms`` (every training datum precedes it) lets a replay check causality."""
+    ``meta.provenance`` (ParamProvenance: fitting window, dataset hash, method) and
+    ``meta.fit_end_ms`` (every training datum precedes it) let a replay check causality."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     body = {"meta": dict(meta or {}),
@@ -400,12 +460,14 @@ def write_split_report(res: FlowSplit, out: str | Path, *, title: str = "Flow ca
     out.mkdir(parents=True, exist_ok=True)
     write_csv(res.metrics, out / "flow_metrics.csv", synthetic)
     write_csv(res.per_segment, out / "flow_segments_eval.csv", synthetic)
-    save_segments(res.segments_all if res.segments_all is not None else res.segments, out / "flow_segments.json",
-                  meta={**res.meta, "fit_end_ms": res.all_end_ms if res.segments_all is not None else res.train_end_ms,
-                        "fit_on": "whole sample", "synthetic": synthetic})
+    whole = res.segments_all is not None
+    save_segments(res.segments_all if whole else res.segments, out / "flow_segments.json",
+                  meta={**res.meta, "fit_end_ms": res.all_end_ms if whole else res.train_end_ms,
+                        "fit_on": "whole sample", "synthetic": synthetic,
+                        "provenance": (res.provenance_all if whole else res.provenance) or None})
     save_segments(res.segments, out / "flow_segments_train.json",
                   meta={**res.meta, "fit_end_ms": res.train_end_ms, "split_ms": res.split_ms, "fit_on": "training period",
-                        "synthetic": synthetic})
+                        "synthetic": synthetic, "provenance": res.provenance or None})
     lines = [f"# {title}", ""]
     if synthetic:
         lines += [f"**{SYNTHETIC_BANNER}**", ""]
@@ -415,8 +477,14 @@ def write_split_report(res: FlowSplit, out: str | Path, *, title: str = "Flow ca
               f"(flow_segments.json) data end: {res.all_end_ms} -- use it only for replays that start later. Rows `in_sample` grade "
               "the fit on its own training data; `out_of_sample` rows grade it on later data only. ratio_ct = predicted / "
               "realized taker contracts; wape_ct = sum |pred - realized| / realized over segments; dev_explained = 1 - "
-              "Poisson deviance(model) / deviance(pooled per-side rate) of order counts.", "",
-              markdown_table(res.metrics), ""]
+              "Poisson deviance(model) / deviance(pooled per-side rate) of order counts.", ""]
+    for name, prov in (("flow_segments.json", res.provenance_all or res.provenance),
+                       ("flow_segments_train.json", res.provenance)):
+        if prov:
+            lines.append(f"Provenance of `{name}` (look-ahead guard): fitted on data {prov.get('fitted_from_utc') or '?'} "
+                         f".. {prov.get('fitted_to_utc') or '?'} (every datum before the end); dataset "
+                         f"{prov.get('dataset_id') or '?'}; method: {prov.get('method') or '?'}.")
+    lines += ["", markdown_table(res.metrics), ""]
     md = out / "flow_calibration.md"
     md.write_text("\n".join(lines))
     return md
@@ -439,6 +507,10 @@ def main(argv: list[str] | None = None) -> None:
         res = walk_forward_by_day(tr, mk, bt, min_train_days=a.walk_forward_days, vol_ann=a.vol_ann, btc_bar_ms=a.btc_bar_ms)
     else:
         res = calibrate_split(tr, mk, bt, train_frac=a.split, vol_ann=a.vol_ann, btc_bar_ms=a.btc_bar_ms)
+    files = f"files trades={Path(a.trades).name} markets={Path(a.markets).name} btc={Path(a.btc).name}"
+    for prov in (res.provenance, res.provenance_all):
+        if prov:
+            prov["dataset_id"] = f"{prov.get('dataset_id', '')} ({files})"
     md = write_split_report(res, a.out)
     print(res.metrics.to_string(index=False))
     print(f"wrote {md}")

@@ -4,7 +4,7 @@
 
 | run | |
 |---|---|
-| root | /tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data |
+| root | /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data |
 | window | 2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z |
 | markets | 36 |
 | panel_rows | 777600 |
@@ -13,6 +13,7 @@
 | vol_source | realized, 6 h before t0 (0.35 if < 2 h of 1 Hz data) |
 | Kalshi receive latency (anchor) | 20.0 ms (measured: median receive - exchange time of 20000 Kalshi trade/delta messages received in the first 600 s after t0 (no data before t0)) |
 | FV parameters | not used (research Gaussian fair value) |
+| fill-intensity / adverse-selection parameters | not used (no strategy replay) |
 | inference | 95% CI over 60 s time blocks shared by every market (hull of studentized bootstrap-t and jackknife-t) |
 | gap-closure half-life (s, reference only) | 0.8352 |
 | gap_ticks_all (reference only) | 1.223 |

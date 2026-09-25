@@ -41,12 +41,13 @@ logged fair value only when it is at most 5 s old (audit m6).
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import math
 import statistics
 from collections import defaultdict, deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -83,11 +84,12 @@ from dh.research.replay_env import (
     inputs_status,
     prime_probe,
     probe_for_window,
+    provenance_status,
     research_latency,
     run_replay,
     settlement_cluster,
 )
-from dh.strategy.config import StrategyConfig
+from dh.strategy.config import ParamProvenance, StrategyConfig, utc_from_ns
 from dh.strategy.mm import MarketMaker
 
 SEC_YR = 365.0 * 24 * 3600
@@ -511,6 +513,7 @@ class ToxicityRule:
     train_fills: int = 0
     removed_share_train: float = 0.0
     gain_train_c: float = 0.0
+    provenance: dict[str, str] = field(default_factory=dict)  # ParamProvenance: fitting window, dataset, method
 
     def score(self, row: dict[str, float]) -> float:
         x = np.nan_to_num(np.array([[row.get(f, math.nan) for f in self.features]], dtype=float))
@@ -612,6 +615,17 @@ class _DayCI:
     clusters: int
 
 
+def rule_provenance(train: pd.DataFrame, t0: int, t_split: int, source: str) -> dict[str, str]:
+    """ParamProvenance of a cancel rule fitted on ``train`` (policy-B fills of [t0, t_split) whose
+    label ended before t_split): fitting window [t0, t_split), content hash of the training fills."""
+    cols = [c for c in ("ts", "ticker", "side", "px", "contracts", "toxic") if c in train]
+    h = hashlib.sha256(train[cols].sort_values(cols[:2]).to_csv(index=False).encode()).hexdigest()[:16]
+    return ParamProvenance.fitted(
+        utc_from_ns(t0), utc_from_ns(t_split), dataset_id=f"sha256:{h} ({len(train)} policy-B shadow fills of {source})",
+        method="logistic P(toxic) on fill-time features; pull threshold maximizing the training net markout with "
+               f"<= 20% of fills removed; {RULE_LABEL_H_S:g} s label embargo").as_dict()
+
+
 def rule_training_fills(fills: dict[str, pd.DataFrame], t_split: int, label_h_s: float = RULE_LABEL_H_S) -> pd.DataFrame:
     """Training fills of the cancel rule: policy B only (audit C2), and only fills whose label
     (net markout at label_h_s) ended before t_split, where the scored half starts (audit m2)."""
@@ -681,6 +695,11 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     # t_split (audit C2/m2), replayed on [t_split, t1) under every policy
     train = rule_training_fills(fills, t_split)
     rule = fit_rule(train) if len(train) else None
+    rule_info: dict[str, Any] | None = None
+    if rule is not None:
+        # look-ahead label of the fitted rule against the window it is scored on, [t_split, t1)
+        rule.provenance = rule_provenance(train, t0, t_split, f"{root} [{fmt_ns(t0)} .. {fmt_ns(t_split)})")
+        rule_info, _ = provenance_status(rule.provenance, "cancel rule", t_split, t1, what="toxicity")
     if rule is not None and rule.threshold <= 1.0:
         ev_runs = run_variants(root, t_split, t1, [Variant("base", cfg),
                                                     Variant("guard", cfg, strategy_factory=ToxicityGuardMM,
@@ -746,17 +765,22 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     rep = Report("e3_toxicity", "E3 — Predictability of fill toxicity and a toxicity-aware cancel rule", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E3,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "rule_fit_until": fmt_ns(t_split),
-                       **inputs_meta(uni, t0)[0], "latency": describe_latency(lat, uni),
+                       **inputs_meta(uni, t0, cfg, t1)[0], "latency": describe_latency(lat, uni),
                        "label": f"toxic = fair value moved against the fill within {LABEL_H_S:g}s",
                        "rule_training": f"policy-B fills with t + {RULE_LABEL_H_S:g} s <= split (label embargo)",
                        "features": "captured at match time (simulator fill hook)",
                        "rule_threshold": rule.threshold if rule else "n/a (too few policy-B training fills)",
+                       "cancel rule provenance (vs its scoring window from the split)":
+                           rule_info["label"] if rule_info else "n/a (no rule fitted)",
                        "rule_train_fills": rule.train_fills if rule else 0,
                        "rule_removed_share_train": rule.removed_share_train if rule else math.nan})
     rep.decision_events = int(cancel["events"].min()) if len(cancel) else (
         int(lift["events"].min()) if len(lift) else None)
     rep.policies = sorted(set(cancel["policy"])) if len(cancel) else sorted(set(lift["policy"])) if len(lift) else []
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0, cfg, t1)
+    if rule_info is not None and rule_info["in_sample"]:
+        rep.in_sample = True
+        rep.in_sample_why = "; ".join(x for x in (rep.in_sample_why, rule_info["label"]) if x)
     rep.verdict = e3_verdict(cancel, lift, rule)
     for w in run_warnings(runs):
         rep.line(f"WARNING: {w}")

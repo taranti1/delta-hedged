@@ -4,17 +4,19 @@
 
 | run | |
 |---|---|
-| root | /tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data |
+| root | /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data |
 | window | 2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z |
 | rule_fit_until | 2026-09-24T12:30:00.000Z |
 | FV parameters | fv_recommended.json: n/a (synthetic recording) |
 | taker flow | config defaults (cfg.fill) |
-| strategy fill/adverse parameters | fitting window not recorded in the strategy config: NOT covered by the look-ahead check (fit them on data before the replay window) |
+| fill-intensity parameters | config fill: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
+| adverse-selection parameters | config adverse: prior, never fitted on data (counts as out-of-sample): M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE]) |
 | latency | submit lognormal(median 30 ms, sigma 0.4); cancel = submit; response lognormal(median 30 ms, sigma 0.4); ws lognormal(median 10 ms, sigma 0.5); md 20 ms [measured: median receive - exchange time of 20000 Kalshi trade/delta messages received in the first 600 s after t0 (no data before t0)]; policy C x1.5 |
 | label | toxic = fair value moved against the fill within 10s |
 | rule_training | policy-B fills with t + 60 s <= split (label embargo) |
 | features | captured at match time (simulator fill hook) |
 | rule_threshold | 0.5621 |
+| cancel rule provenance (vs its scoring window from the split) | cancel rule: out-of-sample (fitted on data 2026-09-24T12:00:00Z .. 2026-09-24T12:30:00Z; dataset sha256:e610f2d1cf938b14 (61 policy-B shadow fills of /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data [2026-09-24T12:00:00.000Z .. 2026-09-24T12:30:00.000Z)), before t0) |
 | rule_train_fills | 61 |
 | rule_removed_share_train | 0.1697 |
 | settlement events behind the decision | 2 |
@@ -74,9 +76,9 @@ OOS Brier improvement over the base rate per fill (settlement-event CI); no OOS 
 
 | policy | model | n_oos | brier_lift | lift_lo | lift_hi | events |
 |---|---|---|---|---|---|---|
-| B | logistic | 106 | -0.02502 | -1e+06 | 0.002402 | 3 |
+| B | logistic | 106 | -0.02502 | -0.05245 | 0.002402 | 3 |
 | B | gbm_cls | 106 | -0.01041 | -0.02833 | 84339.0 | 3 |
-| C | logistic | 100 | -0.04079 | -0.1315 | 0.04993 | 3 |
+| C | logistic | 100 | -0.04079 | -9.69e+06 | 921273.2 | 3 |
 | C | gbm_cls | 100 | -0.02312 | -0.06408 | 0.01874 | 3 |
 
 CSV: `e3_toxicity_oos_lift.csv`
@@ -101,7 +103,7 @@ Spearman correlation of each fill-time feature with the net 10 s markout.
 | B | abs_z | 138 | -0.2662 |
 | B | yes_px | 138 | -0.04012 |
 | B | spread_ticks | 31 | 0.6026 |
-| B | sigma_ann | 138 | 0.1073 |
+| B | sigma_ann | 138 | 0.107 |
 | B | fv_edge_c | 138 | 0.7215 |
 | C | queue_at_place_ct | 129 | 0.01477 |
 | C | quote_age_s | 129 | -0.09553 |
@@ -117,7 +119,7 @@ Spearman correlation of each fill-time feature with the net 10 s markout.
 | C | abs_z | 129 | -0.2531 |
 | C | yes_px | 129 | -0.1088 |
 | C | spread_ticks | 24 | 0.2656 |
-| C | sigma_ann | 129 | 0.1345 |
+| C | sigma_ann | 129 | 0.1346 |
 | C | fv_edge_c | 129 | 0.6396 |
 
 CSV: `e3_toxicity_univariate.csv`

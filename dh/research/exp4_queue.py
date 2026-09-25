@@ -131,14 +131,14 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     mix = position_mix(runs)
     tested = [v for v in g if v != REF and (grid or v in KEEP_PRIORITY)]
     rep = Report("e4_queue", "E4 — Queue priority vs continuous repricing", Path(out), synthetic=uni.synthetic,
-                 rule=RULE_E4, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
+                 rule=RULE_E4, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0, cfg, t1)[0],
                                      "latency": describe_latency(lat, uni), "variants": len(variants),
                                      "tested (pre-registered, Holm)": ", ".join(tested) or "none",
                                      "policies": ",".join(policies)})
     winners, _ = e4_decision(tab, tested)
     rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
     rep.policies = policies_with_results(runs, [REF, *tested])
-    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0, cfg, t1)
     rep.verdict = (f"ACCEPT: {', '.join(winners)} beat re-centering under B and C (Holm across {len(tested)} "
                    "pre-registered variants)" if winners else
                    "REJECT (differences within the CI: no pre-registered keep-priority variant beats always-re-centering "

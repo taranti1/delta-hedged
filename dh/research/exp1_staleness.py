@@ -339,6 +339,7 @@ def run(root, t0: int, t1: int, out, *, cfg=None, step_ms: int = 100, nowcast: s
                                      "panel_rows": len(panel), "nowcast": nowcast, "vol_ann": vol, "vol_source": vol_src,
                                      "Kalshi receive latency (anchor)": f"{md_latency_ms:.1f} ms ({md_note})",
                                      "FV parameters": "not used (research Gaussian fair value)",
+                                     "fill-intensity / adverse-selection parameters": "not used (no strategy replay)",
                                      "inference": "95% CI over 60 s time blocks shared by every market (hull of "
                                                   "studentized bootstrap-t and jackknife-t)",
                                      "gap-closure half-life (s, reference only)": hl,

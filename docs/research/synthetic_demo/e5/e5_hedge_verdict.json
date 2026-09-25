@@ -1,0 +1,19 @@
+{
+ "experiment": "e5_hedge",
+ "verdict": "INCONCLUSIVE \u2014 only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "REJECT (hedge stays disabled: the band never trades at this scale and cost, no hedge is optimal; B: utility gain 0 [0, 0] $/event, turnover 0 BTC/event, 4 events; C: utility gain 0 [0, 0] $/event, turnover 0 BTC/event, 4 events)",
+ "guards": [
+  "only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)"
+ ],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "ACCEPT (hedge engine on) only if the configured mean-variance band (cfg.hedge at cfg.lam and the achieved hedge fee tier) beats no hedge in utility = mean - lambda/2 var of settlement-event P&L on the same fills (paired CI lower bound > 0 over settlement events) under BOTH fill policies B and C; REJECT (hedge stays disabled) if the utility-gain CI upper bound <= 0 under B or C; else INCONCLUSIVE"
+}

@@ -127,10 +127,18 @@ def test_e67_chronological_split_keeps_settlement_events_whole():
 
 
 def test_ledger_status_columns_reach_the_verdict():
-    d = pd.DataFrame({"event": ["exp a"], "synthetic": [True], "fv_status": ["out_of_sample"], "flow_status": ["defaults"]})
-    assert ledger_status({"B": d}) == (True, False, "")
+    d = pd.DataFrame({"event": ["exp a"], "synthetic": [True], "fv_status": ["out_of_sample"], "flow_status": ["defaults"],
+                      "fill_status": ["prior"], "adverse_status": ["prior"]})
+    assert ledger_status({"B": d}) == (True, False, "")  # priors never fitted on data count as out-of-sample
     old = d.drop(columns=["fv_status", "flow_status"])
     syn, ins, why = ledger_status({"B": old})
     assert ins and "status unknown" in why
     ins2 = ledger_status({"B": d.assign(fv_status="in_sample")})
     assert ins2[1] and "FV parameters in sample" in ins2[2]
+    # ledgers written before the fill / adverse provenance existed: status unknown -> in sample
+    pre = d.drop(columns=["fill_status", "adverse_status"])
+    assert ledger_status({"B": pre})[1] and "fill_status" in ledger_status({"B": pre})[2]
+    ins3 = ledger_status({"B": d.assign(adverse_status="in_sample")})
+    assert ins3[1] and "adverse-selection parameters in sample" in ins3[2]
+    ins4 = ledger_status({"B": d.assign(fill_status="unknown")})
+    assert ins4[1] and "fill-intensity parameters of unknown fitting window" in ins4[2]

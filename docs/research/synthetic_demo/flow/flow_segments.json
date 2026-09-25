@@ -6,8 +6,16 @@
   "markets_in_window": 36,
   "method": "chronological",
   "own_taker_prints_removed": 0,
+  "provenance": {
+   "dataset_id": "sha256:c7aee4e525803ba2 (recording /private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data [2026-09-24T12:00:00.000Z .. 2026-09-24T13:00:00.000Z]: kalshi.ws public prints + BRTI ticks)",
+   "fitted_from_utc": "2026-09-24T12:00:02.100000Z",
+   "fitted_to_utc": "2026-09-24T13:00:00Z",
+   "method": "calibrate_flow.fit_segments: gamma-Poisson shrunk segment rates (prior_s=1800, min_orders=30, vol_ann=0.4); every market of the sample (graded by a chronological split)",
+   "note": "",
+   "status": "fitted"
+  },
   "purge": true,
-  "source": "/tmp/claude-0/-home-user-delta-hedged/f6a0735c-3e34-592e-9ea7-4e95ff222bfa/scratchpad/demo_data",
+  "source": "/private/tmp/claude-501/-Users-thomast-Desktop-delta-hedged/d71a108d-06fa-4bfc-b8c3-afada2d04599/scratchpad/demo_data",
   "synthetic": true,
   "test_markets": 9,
   "trades": 5977,

@@ -1,4 +1,4 @@
-# Experiments runbook: E1–E10 on recorded data
+# Experiments runbook: E1–E10 on recorded data (E5 on replayed or session fills)
 
 Status: every remaining experiment of `docs/TEST_MATRIX.md` runs with **one command** on a
 recording made by `scripts/record.py`, through the production strategy code (the same
@@ -10,8 +10,9 @@ numbers validate code paths and injected known answers, never edge.
 
 ```
 python scripts/run_experiment.py <name> --root data --t0 2026-10-01 --t1 2026-10-08 [--out DIR] [--jobs 4]
-    names: universe | replay | flow | e1 | e2 | e3 | e4 | e67 | e8 | e9 | e10 | all | synth | demo
+    names: universe | replay | flow | e1 | e2 | e3 | e4 | e5 | e67 | e8 | e9 | e10 | all | synth | demo
     fitted inputs (checked for look-ahead against t0, section 2a): [--fv-config FV.json] [--flow-segments FLOW.json]
+        and the strategy config's fill-intensity / adverse-selection `provenance` blocks (--config)
 ```
 
 Defaults: strategy `config/m1.yaml`, fill policies `B,C` (`--policies A,B,C` adds A as a
@@ -103,7 +104,9 @@ the replayed strategy.
   KXBTC15M markets expiring together settle on one BRTI average, so they are ONE event for every
   CI and count), `event_ticker`, `expiration_ns`, regime columns (`day`, `weekend`, `rv_1h` =
   benchmark realized vol over the prior hour, causal) and status columns (`synthetic`,
-  `fv_status`, `flow_status`) that travel with pooled ledgers (`e67 --ledger`).
+  `fv_status`, `flow_status`, `fill_status`, `adverse_status`) that travel with pooled ledgers
+  (`e67 --ledger`; a ledger without them, e.g. one written before the fill/adverse provenance
+  existed, has an unknown status and cannot ACCEPT).
 
 ## 2b. Inference and evidence guards
 
@@ -119,7 +122,8 @@ the replayed strategy.
 * **Verdict guards** (`exp_common.Report`; `<name>_verdict.json` keeps both fields): a decision
   becomes INCONCLUSIVE when fewer than 20 settlement events stand behind it, when a policy-based
   experiment lacks results under BOTH B and C, and (ACCEPT only) on a synthetic recording or with
-  fitted inputs in sample or of unknown status. The rule's own outcome is a separate field and
+  fitted inputs (FV parameters, taker-flow segments, fill-intensity or adverse-selection parameters;
+  section 2a) in sample or of unknown status. The rule's own outcome is a separate field and
   never appears inside the INCONCLUSIVE text.
 * **Economic acceptance.** E2 needs contracts/day, profitable contracts/day and $/day not lower
   under B and C on top of the net c/contract CI; E3 needs $/day and PROFITABLE contracts/day (the
@@ -133,7 +137,7 @@ the replayed strategy.
 ## 2a. Look-ahead guards (fitted inputs, causal joins)
 
 * **Fair-value parameters (in-sample FV).** The committed `dh/models/data/fv_recommended.json` was
-  fitted on Bitstamp 1-minute history through `data_end_utc` = 1790301480 (2026-09-25T00:38Z).
+  fitted on Bitstamp 1-minute history through `data_end_utc` = 1790301480 (2026-09-25T01:58Z).
   A replay whose t0 is before the end of the FV fitting data uses look-ahead parameters: every
   replay summary carries `fv_params` (`... IN-SAMPLE (fitted on data through ...)` /
   `out-of-sample` / `n/a (synthetic recording)`) and `fv_params_in_sample`, the CLI and every report
@@ -143,8 +147,30 @@ the replayed strategy.
   become in-sample: refit walk-forward on data strictly before t0 (`dh/research/fv_study`; a config
   with `data_end_utc` <= t0) and pass it with `--fv-config FV.json`, or report the result as
   in-sample FV. A config without `data_end_utc` is treated as in-sample. Affected: every replay
-  (E2 P&L hook, E3, E4, E6/E7, E9, E10) and E8/E3-live (fair-value probe). E1 does not use these
-  parameters (Gaussian research fair value with the benchmark vol realized over the 6 h BEFORE t0).
+  (E2 P&L hook, E3, E4, E5, E6/E7, E9, E10) and E8/E3-live/E5-session (fair-value probe). E1 does not
+  use these parameters (Gaussian research fair value with the benchmark vol realized over the 6 h
+  BEFORE t0).
+* **Fill-intensity and adverse-selection (toxicity) parameters.** Every parameter set carries a
+  `provenance` (`dh.strategy.config.ParamProvenance`): `status` (`prior` = [ESTIMATE] placeholder
+  never fitted on data, or `fitted`), `fitted_from_utc` / `fitted_to_utc` (UTC; every datum used
+  precedes `fitted_to_utc`), `dataset_id` (dataset and content hash) and `method`. They live in the
+  strategy config (`fill.provenance`, `adverse.provenance`; `config/m1.yaml` marks its values as
+  priors), on the model classes (`FillIntensityModel.provenance` / `AdverseSelectionModel.provenance`:
+  the bound segments' or coefficients' when present, else the config's) and in the fitters' output:
+  `dh.research.calibrate_flow` / `run_experiment.py flow` write `meta.provenance` into
+  `flow_segments.json` / `flow_segments_train.json` (fitting window of the whole-sample / training fit,
+  sha256 of the fitting sample, gamma-Poisson method) and the flow report; E3's cancel rule records
+  its own (fitted on [t0, split), scored on [split, t1): labelled out-of-sample in `e3_toxicity.md`).
+  Every experiment labels them exactly like the FV parameters (`replay_env.provenance_status`):
+  `prior` (counts as out-of-sample, labelled "prior"), `out-of-sample` (fitted_to <= t0), `IN-SAMPLE`
+  (fitted_to > t0: the fit overlaps the window or used later data) or `UNKNOWN` (fitted without
+  `fitted_to_utc`, bound segments/coefficients without provenance, or the strategy config not given:
+  treated as in-sample). Report rows `fill-intensity parameters` / `adverse-selection parameters`,
+  replay summaries (`fill_params`, `adverse_params`, `*_in_sample`), ledger columns and a
+  `WARNING: in-sample fill-intensity|adverse-selection ...` line carry the label, and an in-sample or
+  unknown label caps an ACCEPT at INCONCLUSIVE (`inputs_status`; tests/research/test_param_provenance.py).
+  When refitting from real data, set `status: fitted` and the window/dataset/method in the config
+  (or bind fitted flow segments with `--flow-segments`, whose provenance is read from the JSON).
 * **Taker-flow segments.** By default the strategy's fill model uses the config's flow parameters
   (not fitted on the recording). `run_experiment.py flow --t0 A --t1 B` calibrates
   `dh.research.calibrate_flow` on the recorded public tape (our own taker prints removed; BRTI ticks
@@ -154,9 +180,11 @@ the replayed strategy.
   `flow_metrics.csv` / `flow_calibration.md` with **in-sample and out-of-sample** rows (predicted /
   realized taker contracts, WAPE over segments, Poisson deviance of order counts vs a pooled
   per-side null), `flow_segments_train.json` (the graded training fit) and `flow_segments.json`
-  (fit on the whole window; `meta.fit_end_ms` = last expiration). Use the latter only for replays
+  (fit on the whole window; `meta.fit_end_ms` = last expiration; `meta.provenance` = fitting window,
+  dataset hash, method). Use the latter only for replays
   that start later: `e4 --t0 B --t1 C --flow-segments <out>/flow_segments.json`. Replays check
-  `fit_end_ms` against t0 (`flow_in_sample` + `WARNING: in-sample flow ...`). The same split runs
+  `meta.provenance.fitted_to_utc` (older files: `fit_end_ms`) against t0 (`flow_in_sample` +
+  `WARNING: in-sample flow ...`). The same split runs
   on downloaded history: `python -m dh.research.calibrate_flow --trades T --markets M --btc B --out D
   [--split 0.7 | --walk-forward-days 1]`.
 * **BTC reference joins (E0, calibrate_flow).** Bitstamp/Kraken OHLC exports stamp a bar at its
@@ -207,6 +235,7 @@ buckets need >= 20 events under both B and C for any recommendation.
 | E2 | `exp2_nowcast` | >= 3 days (folds = UTC days; 7 recommended) of BRTI 5 Hz + >= 4 constituent books (+ perps for basis) | `run_experiment.py e2 [--step-ms 200] [--split 0.5] [--no-replica] [--no-pnl]` | 4 (P&L hook on the second part) | `e2_nowcast_forecast.csv` (OOS RMSE/MAE by horizon: last print, median mid, replica, ridge, LightGBM; gain CI), `_window_average.csv`, `_pnl_hook.csv`, `_forecast_regimes.csv`, `_pnl_hook_regimes.csv` | accept if RMSE improves >= 10% at 0.2–1 s AND replayed net c/contract improves (paired CI > 0) with contracts/day and $/day not lower, under B and C; reject if < 5% or no P&L gain |
 | E3 | `exp3_toxicity` | >= 7 days (>= 5 000 shadow fills, >= 200 events); live fills when M1 trades (`--live-fills`) | `run_experiment.py e3 [--split 0.5] [--live-fills]` | 2 + 4 | `e3_toxicity_markouts.csv` (net markout vs fill price 0.1–60 s + settlement), `_models.csv` (walk-forward AUC/log-loss/Brier, OOS R^2), `_oos_lift.csv`, `_univariate.csv`, `_cancel_rule.csv`, `_regimes.csv`, `_cancel_rule_regimes.csv`, per-fill `e3_toxicity_fills_<p>.csv` | accept if the cancel rule raises net c/contract >= 0.1c (CI > 0) at <= 20% fill loss with $/day not lower, under B and C; reject if no OOS lift (Brier-lift CI upper bound <= 0) or the lift vanishes under C |
 | E4 | `exp4_queue` | >= 7 days | `run_experiment.py e4 [--grid variants.yaml]` | 16 (8 variants) | `e4_queue_variants.csv` (net c/ct CI, $/day, fills/day, quote-hours, $ per quote-hour, paired diff vs `recenter_always` with p-value and day-block CI), `_fill_position_mix.csv`, `_regimes.csv` | accept a pre-registered keep-priority variant (config, hysteresis_strong, age_only_5s; Holm across them) if it beats always-re-centering by > 0.05c/contract (CI > 0) and in $/day under B and C; else reject (differences within CI) |
+| E5 | `exp5_hedge` | >= 20 settlement events that settle inside the window (hourly: >= 1 day; the decision needs several weeks); live M1 fills when trading (`--session-fills live`) | `run_experiment.py e5 [--hedge-fee-bps F] [--hedge-fees-bps 0.6,1,5,12] [--hedge-lams 1e-4,1e-3,1e-2] [--hedge-scales 1,25] [--hedge-step-ms 1000] [--hedge-venue V] [--session-fills live\|paper\|L.csv]` | 2 (none with session fills) | `e5_hedge_decision.csv` (band_configured vs no hedge per fill policy: utility gain with paired CI, variance ratio, net c/ct), `_policies.csv` (every hedge policy x fee tier x lambda x scale: utility, s.d., hedge P&L / fees / execution cost c/ct, turnover), `_regimes.csv`, `_events.csv` (per settlement event) | hedge engine on (ACCEPT) only if the configured band (cfg.hedge at cfg.lam and the achieved fee tier) beats no hedge in utility = mean - lambda/2 var of settlement-event P&L (paired CI > 0) under B and C; REJECT (hedge stays disabled) if the gain CI upper bound <= 0 under B or C (a band that never trades: gain exactly 0) |
 | E6/E7 | `exp67_segments` | >= 14 days (tau x \|z\| cells) + a later confirmation window | `run_experiment.py e67 [--split 0.5] [--confirm-t0 T --confirm-t1 T'] [--ledger L.csv ...]` | 3 (A,B,C) (+3 on the confirmation window) | `e67_segments_tau.csv`, `_abs_z.csv`, `_yes_price.csv`, `_tau_x_z.csv` (net c/ct CI, p-values, Holm flags, confirmation lower bound, fills/day, markouts, toxic share, recommendation) | quote only buckets Holm-significant > 0 in the selection sample AND with CI lower bound > 0 on the disjoint later sample, under B and C; disable buckets Holm-significant < 0 (B or C) |
 | E8 | `exp8_taker` | >= 7 days | `run_experiment.py e8 [--step-ms 250] [--latency-ms 40,40,15,25]` | 8 scans (one per threshold and policy) | `e8_taker_summary.csv` (per threshold scan: opportunities/day, fill rate after latency, net c/ct at 5 s / 60 s / settlement with CI and day-block check, $/day), `_by_touch_staleness.csv`, `_regimes.csv`, `e8_taker_takes_<p>.csv` | accept if the 0.5c scan nets > 0.5c/contract after the exact per-order fee with CI > 0 and >= 20 opportunities/day, under B and C; otherwise taking stays disabled |
 | E9 | `exp9_multistrike` | >= 7 days | `run_experiment.py e9 [--strikes 1,3,0]` | 6 | `e9_multistrike_variants.csv` ($/day, net c/ct, peak/mean collateral, mean \|D\|, netting ratio, delta turnover per contract), `_paired.csv` (decision CIs), `_regimes.csv` | accept if $/day is up (paired CI over settlement events) and delta turnover per contract is down (paired CI over 1 h blocks) vs the single best strike, under B and C, Holm across variants |
@@ -218,10 +247,11 @@ tables, no recording needed; `python -m dh.research.exp0_maker_pnl --trades T --
 maker fee (rounded up to the cent; each print priced as one order, an upper bound) by series fee
 type, only segments with >= 200 settlement events, Holm across every segment examined, coded
 verdict (`exp0.md`, `exp0_verdict.json`). E1 runs on the own-footprint-filtered `ReplayStream`
-with the universe's specs and the benchmark's vol realized over the 6 h before t0. E5 is
-`dh.research.hedge_study` (real BTC paths); it does NOT rerun through the replay: `drive()` has no
-hedge-venue simulator, so `hedge.enabled` in a replay config produces hedge orders that never
-fill. A fill-based E5 needs a hedge simulator wired into `drive` (proposed, section 7).
+with the universe's specs and the benchmark's vol realized over the 6 h before t0. E5 runs in two
+forms: `dh.research.hedge_study` (real 1-minute BTC paths with SYNTHETIC fill flow; the policy study of
+`docs/research/05_hedge_policy.md`) and `dh.research.exp5_hedge` (`run_experiment.py e5`): the hedge
+policies evaluated on the REAL realized fill stream of a replay (or of a live / paper session) and the
+recorded BRTI path, as BUILD_PLAN H requires before the hedge engine may turn on (method notes below).
 
 Per-experiment method notes:
 * **E1.** x = research fair value from the external composite, y = Kalshi mid on a 100 ms grid.
@@ -255,6 +285,29 @@ Per-experiment method notes:
   `{name: {section: {field: value}}}`. Only the keep-priority variants (config, hysteresis_strong,
   age_only_5s; every variant of a custom grid) are tested, with Holm across them; the placement
   variants are descriptive.
+* **E5.** Fill streams: the production `MarketMaker` replayed under B and C with the hedge engine OFF
+  (the configuration being decided; `HedgeInputCollector` records every `--hedge-step-ms` the strategy's
+  own Kalshi delta per settlement event, benchmark, sigma and time to expiry, each fill's delta change when
+  the fill is delivered, and the BRTI ticks), or `--session-fills live` (private `fill` frames of the
+  recording), `paper` (`events.paper` of a paper session) or a ledger CSV (`replay`'s `ledger_<p>.csv`):
+  positions are rebuilt from the fills and deltas come from the strategy's `FvProbe`; the hedge
+  execution is still simulated under B and C. Policies, all on the identical fills (paired by settlement
+  event): none; per fill (hedge each fill's delta when known); the mean-variance band
+  (`dh.strategy.hedging.decide_hedge`, band floor 0) for every lambda x fee tier; and `band_configured`
+  = the production engine as configured (`cfg.hedge` incl. `band_min_btc`) at `cfg.lam` and the achieved
+  fee tier (`--hedge-fee-bps`, default `cfg.hedge.fee_bps_maker`): the decision policy. Each settlement
+  event has its own hedge book (h = its time to expiry), unwound when it settles. Execution:
+  `dh.execution.hedge_sim.HedgeVenueSim` (market orders, research latency, C x1.5, venue fee) against a
+  proxy top of book at BRTI +- `--hedge-half-spread-bps` (default `cfg.hedge.half_spread_bps`) or a
+  recorded venue's top of book (`--hedge-venue kalshi_perp` once the perp is recorded). P&L per event =
+  realized Kalshi net (identical across policies) + hedge P&L - hedge fees; utility at the band's own
+  lambda (else `cfg.lam`); CIs: hull of the jackknife-t and the percentile bootstrap over settlement
+  events. `--hedge-scales` multiplies the Kalshi leg and its delta (a what-if on the same fills; E10
+  replays real size). Events that expire after t1 (no BTC path to settlement) or with unsettled fills
+  are excluded and listed. Known answers (`tests/research/test_e5_hedge.py`): an injected linear delta
+  is hedged to zero variance at zero cost and to the known band edge -(D0 - B) at cost c; zero-delta
+  flow and a delta the Kalshi leg does not carry never ACCEPT; above the break-even cost the band never
+  trades.
 * **E6/E7.** Selection on the earlier sample (Holm within each table family), confirmation on a
   disjoint LATER sample: `--confirm-t0/--confirm-t1` (replayed separately) or the built-in split
   of settlement events by expiration at `t0 + --split x (t1 - t0)`. The verdict states where the
@@ -294,12 +347,16 @@ publication delay (gain shrinks when the delay is removed); E8 finds many more +
 than a 0.2 s maker lag, with positive 1 s markouts after fees; E3 shadow fills mark out worse
 with informed flow on the same price path. E1's lag coefficient accepts an injected 1.5 s lag and
 rejects a zero-lag market with quote noise and model error, and a pure receive delay
-(`tests/research/test_e1_statistic.py`). The demo window has 4 settlement events, so every
+(`tests/research/test_e1_statistic.py`); E5 recovers a known optimal hedge on constructed fill
+streams (`tests/research/test_e5_hedge.py`) and runs on the demo's replayed fills (`e5/`, scales x1 and
+x25). The demo window has 4 settlement events, so every
 event-based verdict in it is INCONCLUSIVE by the 20-event guard, and every ACCEPT would be capped
 anyway (synthetic recording); each report keeps the rule's own outcome in a separate field, and the
 README lists both. The flow stage shows the in-sample / out-of-sample table (`flow/`). Leakage
 guards are tested in `tests/research/test_leakage_guards.py` (causal BTC bar join, time-split
-flow calibration, in-sample FV / flow labels, replay wiring of fitted flow segments); the audit
+flow calibration, in-sample FV / flow labels, replay wiring of fitted flow segments) and
+`tests/research/test_param_provenance.py` (fill-intensity / adverse-selection provenance and labels,
+calibrate_flow and E3 provenance, the ACCEPT cap); the audit
 fixes in `test_verdict_guards.py`, `test_inference.py`, `test_multiplicity.py`,
 `test_replay_fixes.py` and `test_e8_e3_cli_fixes.py`, each with null (zero-effect) cases that must
 not ACCEPT.
@@ -326,8 +383,18 @@ not ACCEPT.
 * **E6/E7**: 'quote' requires confirmation on a later sample (built in); 'disable' is decided on
   the selection sample with Holm (the safe direction). With a short window the built-in split
   leaves few settlement events on each side: prefer `--confirm-t0/--confirm-t1` on a later week.
-* **Strategy fill/adverse parameters** in the config carry no fitting window; the look-ahead
-  check covers the FV parameters and bound flow segments only (reports say so).
+* **Strategy fill/adverse parameters** are labelled against every window (section 2a), but the
+  label is only as good as the recorded provenance: the M1 values are priors ([ESTIMATE]); a value
+  refitted by hand must get `status: fitted` and its window, or it keeps claiming to be a prior.
+  There is no fitter for the parametric adverse-selection coefficients yet (E3 fits a cancel rule).
+* **E5** evaluates hedge policies on the unhedged strategy's fills: the hedge's feedback on quoting
+  (inventory term with a hedge, `rho_hedged_fraction`) is not replayed. Hedges trade as market orders
+  (no maker-fee or spread capture), each settlement event has its own hedge book (no netting across
+  overlapping events: an upper bound on cost), the proxy venue is BRTI +- half spread with unlimited
+  depth (no impact, no basis, no funding) until a hedge venue (`kalshi_perp`) is recorded and passed
+  with `--hedge-venue`; a recorded one-level top of book fills larger orders partially (remainders are
+  retried; the unwind remainder is retried until flat, a residual at the end is marked to the last
+  BRTI tick). Scales > 1 are what-ifs on the same fills (Kalshi P&L scaled linearly).
 * **Flow calibration from recordings** counts recorder downtime inside the window as exposure
   without trades (rates biased low); fit across outages only after checking the session records.
   |z| segments use a fixed 40 % vol (calibrate_flow convention), not the strategy's live sigma, and
@@ -359,6 +426,9 @@ not ACCEPT.
 * `dh.kalshi.normalize`: carry the strike fields of lifecycle `created`/`metadata_updated` into
   `KalshiMarketLifecycle` (the core event has the fields; replay_env parses the raw frames).
 * `.gitignore`: add `data/results/` (default output directory of `run_experiment.py`).
-* `dh.backtest` / replay: a hedge-venue simulator in `drive()` so E5 can rerun on replayed fills.
-* `dh.strategy.config`: a `fit_window` / `data_end_utc` for the fill and adverse-selection
-  parameters so the look-ahead check can cover them.
+* `dh.backtest` / replay: a hedge-venue simulator in `drive()` would additionally replay the
+  production hedge engine's feedback on quoting (E5 now evaluates the hedge policies on the replay's
+  fills with `HedgeVenueSim` outside `drive()`, which is what the decision needs: identical fills).
+* `dh.strategy.hedging` / `mm._hedge`: unwind the hedge of an event when it settles (E5 and
+  hedge_study do; the production engine only trades back to the band edge, so a residual hedge can
+  outlive its event).

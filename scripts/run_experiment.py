@@ -12,11 +12,13 @@ names
   e2         nowcast of the next BRTI print / settlement average (+ P&L hook)      dh.research.exp2_nowcast
   e3         fill toxicity: markouts, walk-forward models, cancel-rule replay     dh.research.exp3_toxicity
   e4         queue priority vs repricing: policy grid                              dh.research.exp4_queue
+  e5         hedge policy (none / per fill / mean-variance band) on the replay's    dh.research.exp5_hedge
+             realized fills, or a session's fills (--session-fills live|paper|L.csv)
   e67        net edge by tau / |z| / YES price                                     dh.research.exp67_segments
   e8         selective taking of stale quotes                                     dh.research.exp8_taker
   e9         quoting 1 vs 3 vs all strikes                                        dh.research.exp9_multistrike
   e10        capacity: clip size x1..x50                                          dh.research.exp10_capacity
-  all        e1 e2 e3 e4 e67 e8 e9 e10 in sequence
+  all        e1 e2 e3 e4 e5 e67 e8 e9 e10 in sequence
   synth      write a SYNTHETIC recording to --root (pipeline validation only)
   demo       synthetic recording + every experiment -> docs/research/synthetic_demo/
 
@@ -24,9 +26,10 @@ Times: ISO-8601 UTC ('2026-10-01', '2026-10-01T13:00') or epoch s/ms/us/ns; 'aut
 coverage of the kalshi.ws stream. Every P&L table is reported under fill policies B and C
 (--policies, A for reference only). Fitted inputs are checked for look-ahead against t0:
 --fv-config (fair-value parameters; default dh/models/data/fv_recommended.json) and
---flow-segments (taker flow; default the strategy config's) -- reports say "IN-SAMPLE" and warn
-when they were fitted on data that does not precede the window. See
-docs/research/EXPERIMENTS_RUNBOOK.md.
+--flow-segments (taker flow; default the strategy config's), and the strategy config's
+fill-intensity / adverse-selection parameters (their `provenance` blocks) -- reports say
+"IN-SAMPLE" (or "prior" for placeholders never fitted on data) and warn when they were fitted on
+data that does not precede the window. See docs/research/EXPERIMENTS_RUNBOOK.md.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ sys.path.insert(0, str(REPO))
 
 from dh.research.exp_common import fmt_ns, parse_policies, parse_time  # noqa: E402
 
-EXPERIMENTS = ("e1", "e2", "e3", "e4", "e67", "e8", "e9", "e10")
+EXPERIMENTS = ("e1", "e2", "e3", "e4", "e5", "e67", "e8", "e9", "e10")
 
 
 def coverage(root: str, stream: str = "kalshi.ws") -> tuple[int, int]:
@@ -98,6 +101,8 @@ CONSUMES: dict[str, set[str]] = {
     "e2": _REPLAY | {"step_ms", "split", "no_pnl", "no_replica", "jobs"},
     "e3": _REPLAY | {"split", "live_fills", "jobs"},
     "e4": _REPLAY | {"grid", "jobs"},
+    "e5": _REPLAY | {"jobs", "hedge_fee_bps", "hedge_fees_bps", "hedge_lams", "hedge_scales", "hedge_step_ms",
+                     "hedge_half_spread_bps", "hedge_venue", "session_fills"},
     "e67": _REPLAY | {"ledger", "confirm_t0", "confirm_t1", "split", "jobs"},
     "e8": _REPLAY | {"step_ms", "jobs"},
     "e9": _REPLAY | {"strikes", "jobs"},
@@ -105,7 +110,7 @@ CONSUMES: dict[str, set[str]] = {
     "synth": {"events", "spacing", "strike_delay", "overwrite"},
     "demo": {"jobs", "events", "spacing"},
 }
-CONSUMES["all"] = set().union(*(CONSUMES[e] for e in ("e1", "e2", "e3", "e4", "e67", "e8", "e9", "e10")))
+CONSUMES["all"] = set().union(*(CONSUMES[e] for e in EXPERIMENTS)) - {"session_fills"}
 _ALWAYS = {"name", "root", "t0", "t1", "out", "log_level"}
 
 
@@ -144,6 +149,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-scale-limits", action="store_true", help="E10: keep risk limits fixed as size grows")
     ap.add_argument("--strikes", default="1,3,0", help="E9: strikes per event (0 = all)")
     ap.add_argument("--ledger", action="append", default=[], help="E6/E7: analyze ledger CSV(s) instead of replaying")
+    ap.add_argument("--hedge-fee-bps", type=float, default=None,
+                    help="E5: the achieved hedge fee tier (bps per trade) of the decision policy (default cfg.hedge.fee_bps_maker)")
+    ap.add_argument("--hedge-fees-bps", default="0.6,1,5,12", help="E5: hedge fee tiers of the descriptive grid (bps)")
+    ap.add_argument("--hedge-lams", default="1e-4,1e-3,1e-2",
+                    help="E5: band risk aversions (1/$) of the descriptive grid; the configured cfg.lam is always added")
+    ap.add_argument("--hedge-scales", default="1", help="E5: what-if position scales on the same fills (1 = the decision)")
+    ap.add_argument("--hedge-step-ms", type=int, default=1000, help="E5: hedge decision step (ms of event time)")
+    ap.add_argument("--hedge-half-spread-bps", type=float, default=None,
+                    help="E5: hedge venue half spread (bps; the proxy book and the band cost; default cfg.hedge)")
+    ap.add_argument("--hedge-venue", default=None,
+                    help="E5: execute hedges against this recorded venue's top of book (e.g. kalshi_perp, coinbase) "
+                         "instead of a proxy book at BRTI +- half spread")
+    ap.add_argument("--session-fills", default=None,
+                    help="E5: evaluate a session's fills instead of replaying: live (private fill frames in kalshi.ws), "
+                         "paper (events.paper) or a ledger CSV path")
     ap.add_argument("--confirm-t0", default=None, help="E6/E7: start of a LATER, disjoint window confirming the buckets "
                                                       "selected on [t0, t1) (default: chronological split, --split)")
     ap.add_argument("--confirm-t1", default=None, help="E6/E7: end of the confirmation window")
@@ -221,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
           + ("  [SYNTHETIC DATA — pipeline validation only]" if uni.synthetic else ""))
     for n in uni.notes:
         print("note:", n)
-    imeta, iwarn = inputs_meta(uni, t0)
+    imeta, iwarn = inputs_meta(uni, t0, cfg, t1)
     lat = None
     if a.name not in ("flow", "universe"):
         print("; ".join(f"{k}: {v}" for k, v in imeta.items()))
@@ -291,6 +311,13 @@ def main(argv: list[str] | None = None) -> int:
 
             m.run(root, t0, t1, o, cfg=cfg, policies=policies, grid=a.grid, warm=a.warm, n_jobs=a.jobs, universe=uni,
                   seed=a.seed, progress=progress, latency=lat)
+        elif name == "e5":
+            from dh.research import exp5_hedge as m
+
+            m.run(root, t0, t1, o, cfg=cfg, policies=policies, warm=a.warm, universe=uni, seed=a.seed, n_jobs=a.jobs,
+                  progress=progress, latency=lat, fees_bps=a.hedge_fees_bps, decision_fee_bps=a.hedge_fee_bps,
+                  lams=a.hedge_lams, scales=a.hedge_scales, step_s=a.hedge_step_ms / 1000.0,
+                  half_spread_bps=a.hedge_half_spread_bps, hedge_venue=a.hedge_venue, session_fills=a.session_fills)
         elif name == "e67":
             from dh.research import exp67_segments as m
 

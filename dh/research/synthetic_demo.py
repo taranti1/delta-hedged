@@ -6,8 +6,8 @@
    Kalshi WS frames and REST records, normalized-event cache for the external venues) with
    injected effects: background-maker lag, informed (latency) takers, a delayed benchmark;
 2. rebuilds its market universe from the recorded REST/lifecycle records;
-3. runs every experiment (E1, E2, E3, E4, E6/E7, E8, E9, E10) through the same CLI code paths as for
-   real recordings, under fill policies B and C (A where the experiment reports it), and the
+3. runs every experiment (E1, E2, E3, E4, E5, E6/E7, E8, E9, E10) through the same CLI code paths as
+   for real recordings, under fill policies B and C (A where the experiment reports it), and the
    taker-flow calibration with its in-sample / out-of-sample split;
 4. writes the small CSV/markdown outputs plus README.md (index, known-answer checks, runtimes).
 The recording itself (tens of MB) goes to a scratch data root and is not committed; it is
@@ -30,6 +30,7 @@ from dh.research import (
     exp2_nowcast,
     exp3_toxicity,
     exp4_queue,
+    exp5_hedge,
     exp8_taker,
     exp9_multistrike,
     exp10_capacity,
@@ -43,6 +44,8 @@ from dh.sim.synthetic import SynthConfig
 
 DEMO_SYNTH = SynthConfig(n_strikes_each_side=4, mm_lag_s=1.5, informed=True, informed_edge_ticks=1.0, vol_ann=0.6,
                          mm_update_prob=0.3, noise_taker_rate_per_s=0.06, longshot_bias=0.2)
+DEMO_SYNTH_RECORDING = dict(synth=DEMO_SYNTH, strike_delay_s=15.0)  # + n_events, event_spacing_s, seed of run_demo
+E5_SCALES = (1.0, 25.0)  # E5 what-if scales on the same fills (hedging is a scaling tool: docs/research/05)
 
 
 def run_demo(out_dir: str | Path = "docs/research/synthetic_demo", data_root: str | Path | None = None, *,
@@ -52,8 +55,7 @@ def run_demo(out_dir: str | Path = "docs/research/synthetic_demo", data_root: st
     root = Path(data_root) if data_root else Path(tempfile.mkdtemp(prefix="dh_synth_demo_"))
     timings: dict[str, float] = {}
     t = time.perf_counter()
-    rc = SynthRecordingConfig(n_events=n_events, event_spacing_s=spacing_s, synth=DEMO_SYNTH, strike_delay_s=15.0,
-                              seed=seed)
+    rc = SynthRecordingConfig(n_events=n_events, event_spacing_s=spacing_s, seed=seed, **DEMO_SYNTH_RECORDING)
     info = write_synthetic_recording(root, rc, overwrite=True)
     timings["write_recording"] = time.perf_counter() - t
     t0, t1 = info.t0, info.t1
@@ -89,6 +91,8 @@ def run_demo(out_dir: str | Path = "docs/research/synthetic_demo", data_root: st
     stage("e2", lambda: exp2_nowcast.run(root, t0, t1, out / "e2", cfg=cfg, universe=uni, n_jobs=n_jobs))
     stage("e3", lambda: exp3_toxicity.run(root, t0, t1, out / "e3", cfg=cfg, universe=uni, n_jobs=n_jobs))
     stage("e4", lambda: exp4_queue.run(root, t0, t1, out / "e4", cfg=cfg, universe=uni, n_jobs=n_jobs))
+    stage("e5", lambda: exp5_hedge.run(root, t0, t1, out / "e5", cfg=cfg, universe=uni, n_jobs=n_jobs,
+                                       scales=E5_SCALES))
     stage("e67", lambda: exp67_segments.run(root, t0, t1, out / "e67", cfg=cfg, universe=uni, n_jobs=n_jobs))
     stage("e8", lambda: exp8_taker.run(root, t0, t1, out / "e8", cfg=cfg, universe=uni, n_jobs=n_jobs))
     stage("e9", lambda: exp9_multistrike.run(root, t0, t1, out / "e9", cfg=cfg, universe=uni, n_jobs=n_jobs))
@@ -118,6 +122,24 @@ def _e1_best(tab: pd.DataFrame) -> float:
     return float(d["response_ticks"].max()) if len(d) else math.nan
 
 
+def e5_headline(res: dict[str, Any]) -> str:
+    """README headline of an exp5_hedge.run result: the decision policy's turnover and utility gain
+    per fill policy, and the best band by utility gain at the largest what-if scale."""
+    dec, tab = res.get("decision"), res.get("table")
+    if dec is None or not len(dec):
+        return "no decision rows"
+    parts = [f"{r.policy}: {r.hedge_policy} turnover {_fmt(r.turnover_btc_per_event, 3)} BTC/event, utility gain "
+             f"{_fmt(r.d_util_usd)} $/event" for r in dec.itertuples()]
+    if tab is not None and len(tab):
+        k = float(tab["scale"].max())
+        b = tab[(tab["scale"] == k) & (tab["kind"] == "band") & (tab["policy"] == "B")]
+        if len(b):
+            best = b.sort_values("d_util_usd").iloc[-1]
+            parts.append(f"x{k:g} (B): best band {best.hedge_policy} utility gain {_fmt(best.d_util_usd)} $/event, "
+                         f"s.d. x{_fmt(math.sqrt(best.var_ratio_vs_none)) if best.var_ratio_vs_none >= 0 else 'nan'}")
+    return "; ".join(parts)
+
+
 def _verdict_rows(out: Path) -> list[str]:
     def cut(x: str) -> str:
         return ((x[:160] + "...") if len(x) > 160 else x).replace("|", "/")
@@ -140,7 +162,7 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
     bk = e10c[(e10c.level_c == 0.0) & (e10c.basis == "point")] if len(e10c) else e10c
     rep = r["replay"]
     fm = r["flow"].metrics.set_index("sample")
-    imeta, _ = inputs_meta(uni, info.t0)
+    imeta, _ = inputs_meta(uni, info.t0, cfg, info.t1)
     lines = [
         f"# Synthetic demo — {SYNTHETIC_BANNER}", "",
         SYNTHETIC_NOTE, "",
@@ -162,7 +184,9 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         f"* strategy config: `dh.research.synth_recording.synth_strategy_config` (quote cycle "
         f"{cfg.timers.quote_period_ms} ms, clip {cfg.quoting.clip_contracts:g}, research-only)",
         f"* fitted inputs (look-ahead guards, runbook section 2a): FV parameters: {imeta['FV parameters']}; "
-        f"taker flow in the replays: {imeta['taker flow']}", "",
+        f"taker flow in the replays: {imeta['taker flow']}; fill-intensity parameters: "
+        f"{imeta['fill-intensity parameters']}; adverse-selection parameters: {imeta['adverse-selection parameters']}",
+        "",
         "## Known-answer checks (asserted in tests/research/)", "",
         f"* **E2** benchmark published {info.config['injected']['brti_delay_ms']} ms after the venues move -> the "
         "walk-forward nowcast must beat the last print: ridge RMSE gain "
@@ -172,7 +196,11 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
            f"{_fmt(e8b.net_5s_c)} c/contract after fees" if e8b is not None else "n/a") + " (`e8/`). "
         "tests/research/test_experiments_synthetic.py compares a 0.2 s and a 3 s maker lag.",
         "* **E3** informed takers pick off stale quotes -> maker fills are adversely selected; the test compares "
-        "shadow-fill markouts with and without informed flow (`e3/`).", "",
+        "shadow-fill markouts with and without informed flow (`e3/`).",
+        "* **E5** (tests/research/test_e5_hedge.py, constructed fill streams): an injected linear delta with a known "
+        "optimal hedge is recovered (-D0 at zero cost: every event nets 0; at cost c the first trade is exactly "
+        "-(D0 - B) with B = 2 c S / (lam sigma^2 h)); zero-delta flow and a delta the Kalshi leg does not carry never "
+        "ACCEPT; above the break-even cost the band never trades (`e5/` runs the evaluator on the replayed fills).", "",
         "## Results index (synthetic; policies B and C unless noted)", "",
         f"Every event-based verdict below is reported INCONCLUSIVE: the window has {len(info.expirations)} settlement "
         "events (< 20, `exp_common.MIN_DECISION_EVENTS`); each report keeps the decision rule's outcome on this "
@@ -191,6 +219,7 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         f"| E3 toxicity | `e3/e3_toxicity.md` | {len(r['e3']['fills'].get('B', []))} B fills; net 10 s markout B "
         f"{_fmt(e3m[(e3m.policy == 'B') & (e3m.horizon == '10s')].net_markout_c.iloc[0]) if len(e3m) else 'n/a'} c | {timings['e3']:.0f} s |",
         f"| E4 queue | `e4/e4_queue.md` | {len(r['e4']['table'])} variant x policy rows | {timings['e4']:.0f} s |",
+        f"| E5 hedge | `e5/e5_hedge.md` | {e5_headline(r['e5'])} | {timings['e5']:.0f} s |",
         f"| E6/E7 segments | `e67/e67_segments.md` | tau/|z|/price buckets under A, B, C | {timings['e67']:.0f} s |",
         f"| E8 taker | `e8/e8_taker.md` | see known-answer check above | {timings['e8']:.0f} s |",
         f"| E9 multi-strike | `e9/e9_multistrike.md` | nearest 1 / 3 / all strikes | {timings['e9']:.0f} s |",
