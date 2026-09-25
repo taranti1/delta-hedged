@@ -29,6 +29,7 @@ class PlaceOrder:
     order_group_id: str = ""
     cancel_on_pause: bool = True
     reason: str = ""
+    time_in_force: str = "gtc"  # gtc | ioc | fok (maker quotes are always gtc + post_only)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,35 @@ class DecreaseOrder:
 class CancelAll:
     reason: str
     tickers: tuple[str, ...] = ()  # empty = everything
+
+
+@dataclass(frozen=True, slots=True)
+class CreateOrderGroup:
+    """Exchange-side fill-burst breaker: auto-cancels the group's orders once more than
+    contracts_limit contracts match within a rolling 15 seconds."""
+
+    order_group_id: str
+    contracts_limit: int  # qty units (0.01 contracts)
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ResetOrderGroup:
+    order_group_id: str
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateOrderGroupLimit:
+    order_group_id: str
+    contracts_limit: int
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteOrderGroup:
+    order_group_id: str
+    reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,4 +151,19 @@ class Log:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
-Action = PlaceOrder | CancelOrder | AmendOrder | DecreaseOrder | CancelAll | PlaceHedge | CancelHedge | Halt | Resume | Log
+Action = (
+    PlaceOrder
+    | CancelOrder
+    | AmendOrder
+    | DecreaseOrder
+    | CancelAll
+    | CreateOrderGroup
+    | ResetOrderGroup
+    | UpdateOrderGroupLimit
+    | DeleteOrderGroup
+    | PlaceHedge
+    | CancelHedge
+    | Halt
+    | Resume
+    | Log
+)

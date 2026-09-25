@@ -33,7 +33,17 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from dh.core.actions import AmendOrder, CancelAll, CancelOrder, DecreaseOrder, PlaceOrder
+from dh.core.actions import (
+    AmendOrder,
+    CancelAll,
+    CancelOrder,
+    CreateOrderGroup,
+    DecreaseOrder,
+    DeleteOrderGroup,
+    PlaceOrder,
+    ResetOrderGroup,
+    UpdateOrderGroupLimit,
+)
 from dh.core.book import KalshiBook
 from dh.core.events import (
     CancelAck,
@@ -55,7 +65,8 @@ from dh.execution.queue import QueueEstimator, QueueFill, normalize_policy
 
 FeeFn = Callable[[int, int, bool], int]  # (yes_px, qty, is_taker) -> fee in micro-dollars
 GROUP_WINDOW_NS = 15 * NS_PER_S
-KALSHI_ACTIONS = (PlaceOrder, CancelOrder, AmendOrder, DecreaseOrder, CancelAll)
+KALSHI_ACTIONS = (PlaceOrder, CancelOrder, AmendOrder, DecreaseOrder, CancelAll, CreateOrderGroup, ResetOrderGroup,
+                  UpdateOrderGroupLimit, DeleteOrderGroup)
 
 
 @dataclass(slots=True)
@@ -360,6 +371,14 @@ class KalshiExchangeSim:
                 for o in list(self._resting.values()):
                     if not a.tickers or o.ticker in a.tickers:
                         self._cancel(o, t, "cancel_all")
+            elif isinstance(a, CreateOrderGroup):
+                self.create_order_group(a.order_group_id, a.contracts_limit)
+            elif isinstance(a, ResetOrderGroup):
+                self.reset_order_group(a.order_group_id)
+            elif isinstance(a, UpdateOrderGroupLimit):
+                self.update_order_group_limit(a.order_group_id, a.contracts_limit)
+            elif isinstance(a, DeleteOrderGroup):
+                self.delete_order_group(a.order_group_id)
         elif kind == "expire":
             oid, exp = payload
             o = self.orders.get(oid)
@@ -462,6 +481,10 @@ class KalshiExchangeSim:
             reason = "already_filled"
         elif o.status == "canceled":
             reason = "already_canceled"
+        elif not self._open(m, t):
+            reason = "market_closed"
+        elif m.paused:
+            reason = "market_paused"
         elif a.book_side != o.book_side:
             reason = "invalid_side"
         elif a.total_qty <= o.filled:

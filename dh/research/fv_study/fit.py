@@ -14,7 +14,6 @@ import math
 import numpy as np
 from scipy import optimize, special
 
-from dh.models.tails import StudentT, VolMixture
 
 
 def fit_blend_qlike(X: np.ndarray, y: np.ndarray, max_iter: int = 500) -> np.ndarray:
@@ -129,8 +128,3 @@ def fit_vol_mixture(u: np.ndarray) -> tuple[float, float]:
         if best is None or res.fun < best.fun:
             best = res
     return math.exp(best.x[0]), float(max(best.x[1], 0.0))
-
-
-def tail_objects(c_t: float, nu: float, c_m: float, cv: float) -> tuple[StudentT, VolMixture]:
-    """Library tail objects for fitted parameters (the scale c is applied to sd by the caller)."""
-    return StudentT(nu), VolMixture(cv)

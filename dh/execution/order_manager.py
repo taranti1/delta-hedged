@@ -365,6 +365,9 @@ class OrderManager:
             o.cap += f.qty  # happened before the decrease: not part of the reported remaining
         if o.state is OrderState.PENDING_NEW:
             o.state = OrderState.RESTING  # a fill proves the order reached the book
+        elif o.state is OrderState.REJECTED:  # the exchange is authoritative: it did reach the book
+            o.state = self._working_state(o)
+            out.append(self._ev("reconcile_needed", o, f.ts, detail="fill_on_rejected"))
         out.append(self._ev("fill", o, f.ts, qty=f.qty, px=f.yes_px, is_taker=f.is_taker, fee=f.fee_micros))
         if o.fill_sum > o.cap:  # more fills than the order could have: our view of cap is wrong
             o.cap = o.fill_sum
@@ -486,6 +489,9 @@ class OrderManager:
                 return out
             if u.remaining_qty >= 0 and o.amend is None:
                 o.cap = min(o.cap, u.fill_qty + u.remaining_qty)
+            if o.state is OrderState.REJECTED:  # we were told "rejected" but it is resting
+                o.state = self._working_state(o)
+                out.append(self._ev("reconcile_needed", o, u.ts, detail="resting_after_reject"))
             if o.state is OrderState.PENDING_NEW:
                 o.state = OrderState.RESTING
                 out.insert(0, self._ev("accepted", o, u.ts, detail="via_update"))

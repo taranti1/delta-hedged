@@ -186,6 +186,20 @@ def simulate(
     return out
 
 
+def newey_west_se(x: np.ndarray, lags: int = 24) -> float:
+    """HAC standard error of the mean (Bartlett kernel). Hourly net P&L is autocorrelated
+    (the settlement unwind is booked in the next hour; daily vol clustering)."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 2:
+        return float("nan")
+    d = x - x.mean()
+    s = float(d @ d) / n
+    for L in range(1, min(lags, n - 1) + 1):
+        s += 2.0 * (1.0 - L / (lags + 1)) * float(d[L:] @ d[:-L]) / n
+    return float(np.sqrt(max(s, 0.0) / n))
+
+
 def summarize(res: pd.DataFrame, lams: tuple[float, ...] = (1e-4, 1e-3, 1e-2)) -> pd.DataFrame:
     g = res.groupby(["policy", "param"])
     s = pd.DataFrame({
@@ -197,7 +211,7 @@ def summarize(res: pd.DataFrame, lams: tuple[float, ...] = (1e-4, 1e-3, 1e-2)) -
         "contracts_per_h": g.contracts.mean(),
     })
     s["cost_c_per_contract"] = 100 * s.mean_hedge_cost / s.contracts_per_h
-    s["se_mean"] = s.sd_net / np.sqrt(s.hours)
+    s["se_mean"] = g.net.apply(lambda x: newey_west_se(x.to_numpy()))  # HAC (24 lags)
     for lam in lams:
         s[f"util_lam{lam:g}"] = s.mean_net - 0.5 * lam * s.sd_net**2
     return s.reset_index()

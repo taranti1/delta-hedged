@@ -175,3 +175,169 @@ Conditions and caveats:
 * Fills are ordered per order, not merely in total. `test_policies_actually_differ` checks that
   the policies really separate. On streams with multi-level sweeps every order eventually fills
   under every policy; they then differ in *when* they fill.
+
+## 6. Exchange behaviour simulated
+
+| feature | simulation | Kalshi source |
+|---|---|---|
+| Create validation | Rejects, checked in this order: `duplicate_client_order_id` (409), `invalid_side`, `invalid_count`, `invalid_price` (tick grid from `register_market(MarketSpec)`), `market_closed`, `market_paused`, `order_group_not_found`, `order_group_triggered`, `invalid_expiration`, `post_only_cross` | CreateOrderV2 |
+| Cancel | `CancelAck(canceled_qty = remaining)`. If the order was already filled: `OrderReject(request='cancel', reason='already_filled')`. Also `already_canceled` and `not_found` | CancelOrderV2 (`reduced_by`) |
+| Amend | `count` = filled + desired remaining. A size decrease keeps queue priority; a price change or size increase goes to the back of the new level. The response carries the new client_order_id and the same order_id. A price change that would cross is rejected | AmendOrderV2 note on priority |
+| Decrease | `reduce_to` keeps priority; 0 cancels the order | DecreaseOrderV2 |
+| CancelAll | Every resting order (optionally filtered by tickers) is canceled via user_orders updates. There is no per-order REST ack | DELETE /portfolio/events/orders |
+| GTT expiry | `expiration_ts` is floored to whole seconds, as the API takes seconds. The order is canceled at expiry | `expiration_time` |
+| Market close | The close time comes from `MarketSpec.close_ts` or lifecycle `created`/`close_date_updated`. At close, resting orders are auto-canceled and new orders rejected. No fills after close, and `determined`/`settled`/`Settlement` also close the market | market lifecycle |
+| Pause | Lifecycle `deactivated` / `is_deactivated`: orders with `cancel_on_pause` are canceled, the others stay but cannot fill, and new orders are rejected until `activated` | `cancel_order_on_pause` |
+| Order groups | `create_order_group(id, limit)`: matched qty over a rolling 15 s window is capped at the limit. Reaching the limit triggers the group: every order in it is canceled, new orders are rejected, and WS `KalshiOrderGroupUpdate('triggered')` is sent. `reset_order_group`, `update_order_group_limit` and `delete_order_group` are also supported. **Assumption to verify live:** the fill that reaches the limit is truncated at the limit | order groups (rolling 15 s `contracts_limit`) |
+| Messages | Each fill produces `KalshiFill` (trade_id unique, `post_position`, `fee_fn` fee) and `KalshiOrderUpdate` (user_orders). REST results are `OrderAck`, `OrderReject` and `CancelAck` | fill, user_orders |
+
+Order-group management has no `dh.core.actions` action yet, so these calls act immediately with
+no latency (see section 12).
+
+## 7. OrderManager (runs inside the Strategy, live and backtest)
+
+States: `PENDING_NEW -> RESTING -> {PENDING_CANCEL, PENDING_AMEND} -> {FILLED, CANCELED}`, plus
+`REJECTED`. `request_place`, `request_cancel`, `request_cancel_all`, `request_amend` and
+`request_decrease` only record intent; confirmed states change on events.
+`request_cancel` returns False when the CancelOrder must not be sent now. A cancel for an order
+without an order_id is **deferred**, and `on_event` later emits `cancel_ready` carrying the
+order_id.
+
+Quantity model per order:
+
+* `cap` = max fillable at the exchange;
+* `fill_sum` = sum of deduplicated fill messages;
+* `filled_rep` = the maximum filled qty reported by acks, updates or cancel acks;
+* `filled = max(fill_sum, filled_rep)`;
+* `remaining = cap - filled` while live;
+* `inflight = filled_rep - fill_sum`, i.e. fills that happened but whose message has not
+  arrived yet.
+
+`position(ticker)` comes **only** from fill messages. `worst_case_exposure(ticker, side)` is the
+position plus everything that could still fill or is in flight:
+
+* resting, pending-new and pending-cancel remaining;
+* the amend-up target;
+* in-flight fills;
+* for a terminal-but-unresolved order, its whole unfilled cap.
+
+Cash and fees are accumulated in micros.
+
+| race | handling |
+|---|---|
+| Fill before the create ack | A fill with our client_order_id attaches to the PENDING_NEW order, which becomes RESTING, or FILLED if complete. A fill without client_order_id is buffered by order_id (`orphan_fill`) while position updates immediately. The buffered fill is attached when an ack or update reveals the order_id |
+| Ack after a full fill | The ack reflects placement time (`fill_qty=0, remaining=qty`). Terminal states are absorbing and `cap = min(cap, fill + remaining)`, so the order stays FILLED |
+| Fills after a cancel request | They are counted normally. A fill that completes the order moves it to FILLED |
+| Cancel ack while fills are in flight | The final filled qty is `cap - canceled_qty`. This is exact, and the difference is tracked as in-flight until the fills arrive |
+| Cancel rejected because already filled | The order becomes FILLED with `filled_rep = cap`. Exposure keeps the in-flight fills |
+| Cancel rejected as not_found, already_canceled or gone | Without an order_id, the cancel overtook the create: the order stays PENDING_CANCEL and the cancel is re-armed. With an order_id, the order is CANCELED but *unresolved*: exposure keeps its unfilled cap and `reconcile_needed` is emitted until a terminal update arrives |
+| Transient cancel reject (rate limit, 5xx) | The order reverts to its working state |
+| Duplicate fills | Deduplicated by `trade_id` from WS, REST backfill and replays. They are counted in `stats` |
+| Amend ack | Re-keyed to the new client_order_id with the old one kept as an alias. `cap` becomes the amended count and the price becomes the new price. Fills that quote either id or the order_id resolve. An amend reject reverts, or finalizes on `already_filled` |
+| Out-of-order order updates | Terminal states are absorbing. `filled_rep` is a running maximum. A `resting` update is ignored when its `ts_exch` is older than one already applied, and `cap` only shrinks through updates |
+| Unknown-outcome create (timeout or 5xx reject, or no response after `ack_timeout_ns` on a `Timer`) | The order stays PENDING_NEW with `unknown_outcome`, its full qty counts in exposure, and `reconcile_needed` is emitted. It is resolved by an update or fill (the order exists), or by `reconcile_missing` (it never reached the book, so REJECTED) |
+| Position cross-check | A fill `post_position` that differs from ours, or a `KalshiPositionSnapshot` / `reconcile_position` mismatch, emits `position_mismatch`. The position is adopted only with `adopt=True` |
+| Order group triggered | `group_triggered` is emitted and `group_blocked(id)` holds until the group is reset. The member orders' cancel updates follow |
+
+`test_order_manager.py::test_any_delivery_order_converges` feeds every permutation hypothesis
+finds of an order's full message set, with duplicates, missing client ids and cancel requests
+at random points. It checks four things:
+
+* the position never exceeds the truth;
+* worst-case exposure never under-states the final position;
+* terminal states never resurrect;
+* the final state, position and filled qty converge.
+
+## 8. Hedge venue (`hedge_sim.py`)
+
+`HedgeVenueSim(venue, maker_bps, taker_bps, latency, seed, symbol=..., fill_policy=...)` consumes
+`ExtBookSnapshot`, `ExtBookDelta`, `ExtBBO`, `ExtTrade` and `PerpState`.
+
+* Market orders walk the book at arrival. Depth that is short leaves a partial fill, and the
+  rest is canceled with reason `insufficient_depth`.
+* Marketable limits take up to their limit and rest the remainder. Post-only limits that would
+  cross are rejected.
+* Resting orders queue behind the displayed size and fill on prints at or through their price,
+  with the same blocking rules as Kalshi. Unexplained size decreases move the queue by policy.
+  Prints are matched only to *later* decreases (trade-first).
+* Fees are bps of notional. `slippage_log` records the VWAP against the mid at decision and at
+  arrival.
+* Funding is paid at each `next_funding_ts` as `-position_btc * mark * funding_rate`, using the
+  latest announced rate, into `funding_usd` and the `on_funding` hook.
+* It emits `HedgeFill` and `HedgeOrderUpdate`.
+
+## 9. Markouts (`markout.py`)
+
+The signed markout in cents per contract (positive = good for us) is:
+
+* `100 * (fv(t+h) - px)` for bids;
+* `100 * (px - fv(t+h))` for asks.
+
+It is computed at horizons `[0.1, 0.5, 1, 5, 10, 30, 60]` s and to settlement (payout 1/0).
+`fv` can be any of:
+
+* a callable;
+* `(ts, values)` arrays, looked up as-of and NaN outside the series;
+* a per-ticker dict;
+* a `(ticker, ts)` callable.
+
+Fees are reported separately (`fee_c`). `summarize` gives the contract-weighted mean and the
+standard error per horizon.
+
+## 10. What is NOT modeled
+
+* **Market impact of our quotes.** Other participants do not see or react to our simulated
+  orders: they don't step ahead of or away from them, and flow does not change. Our fills do not
+  remove recorded liquidity, so "excess" print volume went to makers behind us in reality.
+* **Hidden or iceberg liquidity and off-book blocks.** Block trades (`is_block`) are ignored.
+* **Queue position after an amend or decrease at the exchange.** The model follows the
+  openapi note: decreases keep priority, everything else loses it. **This must be measured
+  live** with the queue_positions endpoint before relying on it.
+* **Deltas and trades caused by our real orders in recordings made while we were live.** They
+  are treated as other participants' activity. Before backtesting such periods, strip them using
+  `own_client_order_id` and our fill trade_ids.
+* **Cancel classification.** It is a policy assumption, not an observation: Kalshi does not
+  publish order-level data.
+* **Market-data jitter.** It is a constant offset; per-event md jitter should be folded into
+  the submit distribution.
+* **Exchange behaviour not modeled:**
+  * the fee-rounding carry per order (use an order-aware `fee_fn` if needed);
+  * rate limits;
+  * the "cancel-all also cancels orders placed within the next minute" behaviour;
+  * self-trade prevention mode `maker`;
+  * IOC/FOK time-in-force, since `PlaceOrder` has no time_in_force field.
+* **Crossing inference.** Rule (iii) assumes the aggressor behind a crossing level would have
+  traded with us. It may have been a post-only order that would have been rejected, which is why
+  C excludes it.
+
+## 11. Calibration from live data
+
+1. **Queue estimator.** In live trading, run `QueueCalibrator` (all three policies,
+   `book_includes_own=True`) on the real book. Our own positive `orderbook_delta` carrying our
+   client_order_id fixes each arrival queue exactly. Poll `GET /portfolio/orders/queue_positions`
+   and feed `ingest_exchange_queue_position`. `summary()` gives the bias, MAE and RMSE per
+   policy. Use the policy with the smallest bias as the "realistic" default, and keep C as the
+   acceptance bar.
+2. **Shadow orders.** Replay the live session's recording through `KalshiExchangeSim` with the
+   *same* orders we actually sent, at their real decision times. Compare simulated and real
+   fills per order: fill probability, time to fill and partial sizes. A persistent
+   `sim_fills > real_fills` means the policy is too optimistic.
+3. **Latency.** Log `decision -> REST response` and `engine ts_ms -> WS receipt` for every
+   request, and feed those samples to `Empirical`. Measure `md` from `ts_ms` against receive
+   time.
+4. **Match window.** Measure the distribution of |trade ts - matching delta ts| per match and
+   set `match_window_ns` to its 99th percentile.
+5. **Amend priority.** Place, then amend down, then query the queue position. Separately, amend
+   the price or size up and query again. Verify the decrease-keeps-priority rule.
+6. **Order-group limit semantics.** In the demo environment, check whether the limit-reaching
+   fill is truncated or completed.
+
+## 12. Requested `dh.core` changes (not made: core is frozen)
+
+* An action to manage Kalshi order groups (`CreateOrderGroup`, `ResetOrderGroup`,
+  `UpdateOrderGroupLimit`, `DeleteOrderGroup`), so the Strategy owns groups with latency like
+  any request. Today the simulator exposes direct methods.
+* A `PlaceOrder.time_in_force: 'gtc' | 'ioc' | 'fok'` field. IOC is the natural way to take
+  liquidity; without it, a non-post-only order rests its remainder.
+* An optional `KalshiFill.fill_id` separate from `trade_id` if the adapter ever sees
+  REST fills whose `trade_id` differs from the WS `trade_id` (dedupe key).

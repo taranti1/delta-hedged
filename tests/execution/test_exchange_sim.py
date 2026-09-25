@@ -285,3 +285,35 @@ def test_order_group_messages_reach_order_manager():
     sim.reset_order_group("g")
     run_interleaved([delta(2 * S, "yes", 4300, 1)], strat, [sim])
     assert not strat.om.group_blocked("g")
+
+
+def test_order_group_limit_update_and_delete():
+    from dh.core.events import KalshiOrderGroupUpdate
+
+    sim = make_sim()
+    sim.create_order_group("g", 1000)
+    sched = [(0, PlaceOrder("a", T, "bid", 4500, 1000, order_group_id="g")),
+             (0, PlaceOrder("b", T, "bid", 4400, 100, order_group_id="h"))]
+    sim.create_order_group("h", 1000)
+    evs = [snap(0, yes=((4300, 100),)), delta(1, "yes", 4300, 1), trade(1 * S, 4500, 400, "no")]
+    strat, out = run(sim, evs, sched)
+    sim.update_order_group_limit("g", 400)  # already matched 400 in the window -> triggers now
+    sim.delete_order_group("h")
+    out2 = run_interleaved([delta(2 * S, "yes", 4300, 1)], strat, [sim])
+    assert sim.order_status("a")["cancel_reason"] == "order_group_triggered"
+    assert sim.order_status("b")["cancel_reason"] == "order_group_deleted"
+    msgs = [(m.order_group_id, m.event_type) for m in out + out2 if isinstance(m, KalshiOrderGroupUpdate)]
+    assert msgs == [("g", "created"), ("h", "created"), ("g", "limit_updated"), ("g", "triggered"),
+                    ("h", "deleted")]
+    assert strat.om.working(T) == []
+
+
+def test_amend_rejected_while_paused():
+    sim = make_sim()
+    sched = [(0, PlaceOrder("k", T, "bid", 4400, 100, cancel_on_pause=False)),
+             (2 * S, AmendOrder("k", "k2", T, "", "bid", 4300, 100))]
+    evs = [snap(0), delta(1, "yes", 4300, 1), KalshiMarketLifecycle(1 * S, 0, T, "deactivated", is_deactivated=True),
+           delta(2 * S, "yes", 4300, 1)]
+    strat, out = run(sim, evs, sched)
+    assert [(r.client_order_id, r.reason, r.request) for r in of(out, OrderReject)] == [("k", "market_paused", "amend")]
+    assert strat.om.order("k").state is OrderState.RESTING and strat.om.order("k").px == 4400

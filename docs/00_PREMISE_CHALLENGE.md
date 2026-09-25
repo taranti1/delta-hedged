@@ -64,11 +64,12 @@ not the steps. The pin/jump risk at strikes near A is unhedgeable with a linear 
 controlled only by position limits per strike/event and by not accumulating inventory near the
 money close to expiry.
 
-Mean-variance hedge rule (used by the hedge engine; derivation in `docs/MODELS.md`): hedging an
-exposure of `D` BTC over horizon `h` removes variance `D^2 sigma_S^2 h` at cost `c |D| S`, so
-hedging is worth it only when
+Mean-variance hedge rule (used by the hedge engine; derivation in `docs/MODELS.md`): holding
+an exposure of `D` BTC over horizon `h` costs `(lambda/2) D^2 sigma_S^2 h` in mean-variance
+utility; hedging it costs `c |D| S` one way (the settlement unwind is a second leg, which the
+empirical band scale in Experiment 5 absorbs), so hedging is worth it only when
 
-    |D| > c * S / (lambda * sigma_S^2 * h)
+    |D| > 2 c S / (lambda * sigma_S^2 * h)
 
 where `lambda` is the risk-aversion implied by our daily risk budget. Small books sit inside the
 band and should **not** hedge; the band tightens as the book grows (variance ~ D^2, cost ~ |D|).

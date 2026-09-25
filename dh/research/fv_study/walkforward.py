@@ -170,7 +170,7 @@ def run_period(
             spot_ev = P.spot[ev_h, k]
             base_row = {"period": period, "month": ms, "tau_min": int(taus_s[k] // 60), "kappa": kappa, "n_train": int(tr_h.size)}
             w_s = w_r = None
-            if "blend" in need or any(m.vol == "blend" for m in models):
+            if "blend" in need:
                 w_s = fit_blend_qlike(Xs_tr, y_tr)
                 s2_tr = Xs_tr @ w_s
                 s2_ev = Xs_ev @ w_s

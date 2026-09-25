@@ -43,7 +43,7 @@ def test_multiplier_and_fork():
     assert p1[0] == p2[0]
     scaled = base.fork(9, multiplier=1.5)
     y = [scaled.submit_ns() for _ in range(20)]
-    assert all(abs(b - 1.5 * a) <= 1 for a, b in zip(x1, y))
+    assert all(abs(b - 1.5 * a) <= 1 for a, b in zip(x1, y, strict=True))
 
 
 def test_distributions():

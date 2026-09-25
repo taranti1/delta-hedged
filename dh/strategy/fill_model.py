@@ -76,7 +76,9 @@ class FillIntensityModel:
     segments: dict[tuple[str, str, str], SegmentFlow] = field(default_factory=dict)
 
     def flow(self, key: tuple[str, str, str]) -> SegmentFlow:
-        f = self.segments.get(key)
+        """Segment flow; unseen segments fall back to the pooled per-side estimate
+        ('*', '*', side) from calibration, and only then to the config default."""
+        f = self.segments.get(key) or self.segments.get(("*", "*", key[2]))
         if f is None:
             return SegmentFlow(self.cfg.taker_rate_per_s, self.cfg.taker_size_mean, self.cfg.taker_size_cv)
         return f

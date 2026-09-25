@@ -9,6 +9,13 @@ dh/models/data/fv_recommended.json and a markdown digest of the key numbers
 
 from __future__ import annotations
 
+import os
+
+# single-threaded BLAS: forked workers do not oversubscribe the cores, and floating-point
+# reduction order (hence every fitted number) does not depend on the machine's thread count
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
 import math

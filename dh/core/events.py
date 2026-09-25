@@ -131,6 +131,7 @@ class KalshiFill:
     fee_micros: int  # exchange-reported fee_cost (simulator: fee engine)
     post_position: int  # signed YES position after the fill (qty units), if known
     has_post_position: bool = True
+    fill_id: str = ""  # REST fill_id when known; dedupe key if WS/REST trade_ids ever differ
 
 
 @dataclass(frozen=True, slots=True)

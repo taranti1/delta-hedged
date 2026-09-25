@@ -158,7 +158,7 @@ class LatencyModel:
             int(s) for s in seed
         )
         children = np.random.SeedSequence(list(self.entropy)).spawn(len(KINDS))
-        self._rng = {k: np.random.default_rng(c) for k, c in zip(KINDS, children)}
+        self._rng = {k: np.random.default_rng(c) for k, c in zip(KINDS, children, strict=True)}
 
     # ------------------------------------------------------------------ constructors
     @classmethod

@@ -26,7 +26,7 @@ def test_conservation_and_consistency(seed, n, n_orders, policy, lat_seed, md_ms
     out = run_interleaved(events, strat, [sim])
 
     # delivery is time ordered
-    assert all(a.ts <= b.ts for a, b in zip(out, out[1:]))
+    assert all(a.ts <= b.ts for a, b in zip(out[:-1], out[1:], strict=True))
     # per order: fills never exceed the order, never precede arrival, never follow the order
     # leaving the book (cancel / close processed at the matching engine)
     filled = defaultdict(int)

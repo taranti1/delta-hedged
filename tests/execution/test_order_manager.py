@@ -9,7 +9,7 @@ from hypothesis import strategies as st
 from dh.core.actions import AmendOrder, CancelOrder, DecreaseOrder, PlaceOrder
 from dh.core.events import Timer
 from dh.execution.order_manager import EVENT_KINDS, TERMINAL, OrderManager, OrderState
-from tests.execution.helpers import MS, S, T, ack, cancel_ack, fill, reject, update
+from tests.execution.helpers import S, T, ack, cancel_ack, fill, reject, update
 
 P = PlaceOrder("c1", T, "bid", 4500, 1000)
 
@@ -295,3 +295,16 @@ def test_order_group_updates_and_position_snapshots():
     assert om.on_event(KalshiPositionSnapshot(5, 0, T, 300)) == []
     evs = om.on_event(KalshiPositionSnapshot(6, 0, T, 400))
     assert kinds(evs) == ["position_mismatch"] and om.position(T) == 300  # never adopted silently
+
+
+def test_exchange_evidence_overrides_a_wrong_reject():
+    om = placed()
+    om.on_event(reject(1, "c1", "bad_request"))
+    assert om.order("c1").state is OrderState.REJECTED
+    evs = om.on_event(fill(2, "c1", "X1", "bid", 4500, 100, "t1"))
+    assert kinds(evs) == ["reconcile_needed", "fill"] and om.order("c1").state is OrderState.RESTING
+    assert om.worst_case_exposure(T, "bid") == 1000
+    om2 = placed()
+    om2.on_event(reject(1, "c1", "bad_request"))
+    evs = om2.on_event(update(2, "c1", "X1", "resting", "bid", 4500, 1000, 0, 1000))
+    assert kinds(evs)[0] == "reconcile_needed" and om2.order("c1").state is OrderState.RESTING

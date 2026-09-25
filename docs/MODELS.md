@@ -21,12 +21,16 @@ principled tail-risk penalty.
 
 ## 2. Scenario-grid risk engine (handles every strike type and tail model)
 
-For each event (one expiration T) discretize A on a grid of N points (default 801) spanning
-quantiles 1e-6 to 1-1e-6 of the model distribution of A. That distribution is the known fixed
-sum plus m times the remaining-average distribution, with the configured tail model. The
-grid carries weights w_n. Then for the event's book:
+For each event (one expiration T) discretize the standardized remaining average on a uniform
+grid of 1,601 cells over [-10, 10] (tails folded into the end cells), plus a cell edge at every
+strike, so no cell straddles a strike. Cell masses are exact CDF differences of the SAME tail
+model object the pricer uses, and A = (sum_fixed + m R)/n. Then for the event's book:
 
-    PnL(A_n) = sum_i q_i (payoff_i(A_n) - c_i) + H_event (A_n - S)     c_i = cost basis
+    PnL(A_n) = sum_i q_i (payoff_i(A_n) - c_i) + H_event (R_n - S)     c_i = cost basis
+
+The hedge leg uses R (the average of the remaining prints), which is exact when the hedge is
+unwound as a TWAP across the remaining settlement prints; using A inside the window would
+overstate the BTC delta by n/m.
     E, Var, CVaR_95, WorstCase = moments / tail statistics over (PnL(A_n), w_n)
 
 The marginal risk charge of adding delta contracts in market k is computed exactly by
@@ -89,10 +93,12 @@ Lambda_sweep(p). The size distribution is empirical per segment.
 
 AS for a maker fill in segment g at horizon h (default 60 s, also to settlement):
 
-    AS_g(x) = a_g + b_g * max(0, r_ext * sgn_s) / sigma_1s + c_g * 1{tau < 120 s}
+    AS_g(x) = [a_g + b_g * max(0, dF_adverse) + c_g * 1{tau < 120 s}] * (behind_mult if the
+              quote rests behind the touch)
 
-where r_ext is the external composite return over the last 2 s signed toward our side and
-sigma_1s is 1-second vol. Coefficients start from maker markouts computed on *all* public
+where dF_adverse is the change of our fair value over the last 2 s in the direction that hurts
+the quote ($ per contract; b_g = fraction of that move expected to continue), and quotes behind
+the touch fill only on sweeps, which carry more information. Coefficients start from maker markouts computed on *all* public
 trades (Experiment 0/3). They are later refit on our own fills with a gradient-boosted model
 only if that improves out-of-sample realized net P&L (not only markout R^2).
 
@@ -136,10 +142,10 @@ may be quoted, since their fair value is pinned near 0 or 1. Experiment 6 revise
 | perp hedge notional | $10,000 | block hedge increases |
 | daily realized+marked P&L | -$75 | Halt(all) until manual reset |
 | loss on any single settlement | -$40 | Halt(quoting) for 1 hour |
-| BRTI tick age | > 3 s: cancel quotes with tau < 10 min; > 10 s: cancel all | resume after 30 s of fresh ticks |
+| BRTI tick age | > 3 s: no quotes with tau < 10 min; > 10 s: cancel all | an inter-tick gap > 10 s is an outage: resume only after 30 s of fresh ticks |
 | external composite age | > 2 s (any 2 of 3 major venues) | widen to model-only mode or cancel |
 | Kalshi WS disconnect / seq gap | immediate | cancel all via REST; resnapshot; resume after books valid 5 s |
-| hedge venue disconnect | immediate | stop quoting sides that increase \|D\| |
+| hedge venue disconnect | immediate | when hedging is enabled: stop quoting sides that increase \|D\| |
 | abnormal volatility | 1-min \|return\| > 6 sigma or realized 5-min vol > 3x 1-day | cancel all, pause 120 s |
 | fee reconciliation mismatch | any fill off by > rounding tolerance | Halt(quoting) |
 | position reconciliation mismatch | fills vs `GET /portfolio/positions` | Halt(all) |

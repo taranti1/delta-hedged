@@ -121,3 +121,13 @@ def test_behind_quotes_carry_more_adverse_selection():
     k = (">30m", "atm", "bid")
     assert am.expected(key=k, adverse_recent_move=0, tau_s=1000, position="behind") == pytest.approx(
         2 * am.expected(key=k, adverse_recent_move=0, tau_s=1000, position="touch"))
+
+
+def test_existing_order_canceled_when_capacity_shrinks_and_zero_remaining_skipped():
+    fm, am = FillIntensityModel(FillModelCfg()), AdverseSelectionModel(AdverseSelCfg())
+    # total allowed on the bid side is 3 contracts but the resting order has 5 remaining
+    ctx = _ctx(existing={"bid": [ExistingOrder("c1", 4800, 500, 3.0), ExistingOrder("c0", 4700, 0, 0.0)]},
+               capacity=3.0)
+    d = decide_side(ctx, "bid", fm, am, v_min=0.001, kappa_replace=0.0)
+    assert "c1" in d.cancel and "c0" not in d.cancel and d.keep == []
+    assert d.place is None or d.place.size <= 3.0

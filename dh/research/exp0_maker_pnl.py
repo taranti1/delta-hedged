@@ -33,6 +33,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from dh.research.kalshi_data import normalize_markets, normalize_trades
+
 PRICE_BUCKETS = [0, 500, 1000, 2000, 3500, 5000, 6500, 8000, 9000, 9500, 10001]  # px units
 TAU_BUCKETS = [0, 30, 60, 300, 600, 1800, 3600, 1e9]  # seconds
 TAU_LABELS = ["<30s", "30-60s", "1-5m", "5-10m", "10-30m", "30-60m", ">60m"]
@@ -41,8 +43,12 @@ Z_BUCKETS = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1e9]
 
 def prepare(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | None = None,
             vol_ann: float = 0.40, maker_rate: float = 0.0175) -> pd.DataFrame:
-    """Join trades to settlements and compute per-trade maker P&L columns (dollars/contract)."""
-    m = markets.set_index("ticker")
+    """Join trades to settlements and compute per-trade maker P&L columns (dollars/contract).
+
+    Accepts the downloader's schema (see dh.research.kalshi_data); block trades are dropped.
+    """
+    trades = normalize_trades(trades)
+    markets = normalize_markets(markets)
     df = trades.merge(markets[["ticker", "event_ticker", "expiration_ts_ms", "result", "strike_type",
                                "floor_strike", "cap_strike"]], on="ticker", how="inner")
     df = df[df.result.isin(["yes", "no"])].copy()
@@ -69,7 +75,6 @@ def prepare(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | Non
         sd = S * vol_ann * np.sqrt(np.maximum(df.tau_s.to_numpy() - 40.0, 20.0) / (365 * 24 * 3600.0))
         df["z"] = np.abs(K - S) / sd
         df["z_b"] = pd.cut(df.z, Z_BUCKETS, right=False)
-    del m
     return df
 
 

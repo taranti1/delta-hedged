@@ -183,32 +183,39 @@ def decide_side(
     v_min: float,
     kappa_replace: float,
 ) -> SideDecision:
-    """Choose to keep, replace, place or pull our quote on one side of one market."""
-    cap = ctx.capacity_contracts.get(side, 0.0)
-    size = min(ctx.clip_contracts, cap)
-    existing = ctx.existing.get(side, [])
+    """Choose to keep, replace, place or pull our quote on one side of one market.
+
+    ctx.capacity_contracts[side] is the TOTAL working quantity allowed on this side (limits
+    net of the current position), so existing orders that no longer fit (e.g. after the
+    near-expiry limit halves) are canceled (audit minor 3). One working order per side.
+    """
+    cap_total = max(0.0, ctx.capacity_contracts.get(side, 0.0))
+    existing = [o for o in ctx.existing.get(side, []) if o.remaining_qty > 0]
     ex_evals = [
         evaluate(ctx, side, flow, adverse, o.px, _position_of(ctx, side, o.px), o.queue_ahead,
                  o.remaining_qty / QTY_SCALE, existing_id=o.client_order_id)
         for o in existing
     ]
+    keep: list[str] = []
+    cancel: list[str] = [e.existing_id for e in ex_evals if e.value < 0.0]
+    good = sorted((e for e in ex_evals if e.value >= 0.0), key=lambda e: e.ev_rate, reverse=True)
+    top = None
+    for e in good:
+        if top is None and e.size <= cap_total + 1e-9:
+            top = e
+        else:
+            cancel.append(e.existing_id)  # duplicates, or no longer within capacity
+    kept_qty = top.size if top is not None else 0.0
+    size = min(ctx.clip_contracts, cap_total - kept_qty if top is None else cap_total)
     best: QuoteCandidate | None = None
-    if size > 0:
+    if size > 1e-9:
         for px, pos in _candidate_prices(ctx, side):
             queue = ctx.book.bid_qty(px) / QTY_SCALE if side == "bid" else ctx.book.ask_qty(px) / QTY_SCALE
             c = evaluate(ctx, side, flow, adverse, px, pos, queue, size)
             if c.value >= v_min and (best is None or c.ev_rate > best.ev_rate):
                 best = c
-    keep: list[str] = []
-    cancel: list[str] = []
     place: QuoteCandidate | None = None
-    good_existing = [e for e in ex_evals if e.value >= 0.0]
-    bad_existing = [e for e in ex_evals if e.value < 0.0]
-    cancel += [e.existing_id for e in bad_existing]
-    if good_existing:
-        top = max(good_existing, key=lambda e: e.ev_rate)
-        others = [e for e in good_existing if e is not top]
-        cancel += [e.existing_id for e in others]  # one working order per side
+    if top is not None:
         if best is not None and best.px != top.px and best.ev_rate > top.ev_rate + kappa_replace:
             cancel.append(top.existing_id)
             place = best

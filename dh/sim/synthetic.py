@@ -96,8 +96,10 @@ class SyntheticMarket:
     def __init__(self, cfg: SynthConfig) -> None:
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.seed)
-        self.sid = 1
+        self.sid = 1  # orderbook_delta subscription
         self.seq = 0
+        self.trade_sid = 2  # trade channel: its own sid and sequence counter (as on Kalshi)
+        self.trade_seq = 0
         self.markets: dict[str, _MktState] = {}
         self.true_price: list[tuple[int, float]] = []  # (ns, price) exchange time
         self.brti_prints: dict[int, float] = {}  # second (ns) -> value
@@ -169,9 +171,11 @@ class SyntheticMarket:
             left -= take
             yes_px = PX_SCALE - px if taker_yes else px
             ex = ts - self.cfg.kalshi_md_delay_ms * NS_PER_MS
+            self.trade_seq += 1
             out.append(KalshiTrade(ts=ts, ts_exch=ex, ticker=st.spec.ticker,
-                                   trade_id=f"T{self.seq}-{len(out)}", yes_px=yes_px, qty=take,
-                                   taker_side="yes" if taker_yes else "no", sid=self.sid, seq=self._next_seq()))
+                                   trade_id=f"T{self.trade_seq}", yes_px=yes_px, qty=take,
+                                   taker_side="yes" if taker_yes else "no", sid=self.trade_sid,
+                                   seq=self.trade_seq))
             out.append(KalshiBookDelta(ts=ts, ts_exch=ex, ticker=st.spec.ticker, sid=self.sid,
                                        seq=self._next_seq(), side="no" if taker_yes else "yes",
                                        px=px, delta=-take))

@@ -20,7 +20,7 @@
   variance: binary deltas vanish at settlement, so the hedge must too.
 * Utility per hour = mean - (lambda/2) var, for lambda in {1e-4, 1e-3, 1e-2} per $.
 
-## Results (200 contracts/hour unless stated; SE of means <= 0.14c/contract)
+## Results (200 contracts/hour unless stated; Newey-West (24-lag) SE of means <= 0.29c/contract)
 
 Net P&L in cents per Kalshi contract (hedge cost plus hedge P&L; Kalshi leg at fair value):
 
@@ -66,6 +66,9 @@ Scale effects (best policy by utility):
 
 ## Limitations
 
+Standard errors are Newey-West with 24 hourly lags: hourly net P&L is autocorrelated (lag-1
+about 0.37 for cost-heavy policies because the settlement unwind is booked in the next hour).
+Policy differences are many SEs apart, so conclusions are unaffected.
 1-minute resolution understates within-minute gamma near expiry. No market impact at large
 hedge sizes. The synthetic flow's strike and side distribution and its informed fraction are
 assumptions: rerun this study on recorded Kalshi fills (same code path, real fills) once

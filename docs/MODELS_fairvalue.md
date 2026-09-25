@@ -143,6 +143,13 @@ All are symmetric with unit variance, so `sd` keeps its meaning and only the sha
 In production the tail enters with a scale: `sd_used = c * sd_model`, with `(nu, c)`
 depending on the horizon (`TailSchedule` in `dh/models/fvmodel.py`).
 
+Evidence (`docs/research/01_fair_value_calibration.md`): on 15,005 out-of-sample hours of
+2025-26 BTC, a Gaussian with a well-calibrated volatility underprices tail events below 1% by
+1.6-7x and overprices 2-10% events by 12-24%; Student-t with `nu` = 4-6.5 (fitted monthly, `c`
+about 1.0) is calibrated within about 8% in every probability bucket and improves log loss by
+2.85 millinats per contract [2.61, 3.11] over the Gaussian on the same volatility. The vol
+mixture (`cv` about 0.4) and the empirical tail are statistically equivalent.
+
 **Fair-value band.** `digital_band(spec, ws, spot, sigma_abs_values, tails, drift_abs,
 nowcast_sd_values)` evaluates `P(YES)` over every combination of volatility, tail-model and
 nowcast-error scenarios and returns `(p_lo, p_hi, center)`, the band that `docs/MODELS.md`
