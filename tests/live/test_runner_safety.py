@@ -286,7 +286,9 @@ async def test_rest_backfill_goes_through_fee_check_and_ws_copy_is_dropped():
 async def test_periodic_fill_backfill_runs():
     s = RecordingStrategy()
     rest = FakeRest()
-    rest.fills = [fill_row("f-7", "o-7", TK, px="0.4500", count="1.00", created_ns=time.time_ns())]
+    now = time.time_ns()
+    rest.fills = [fill_row("f-7", "o-7", TK, px="0.4500", count="1.00", created_ns=now - 20 * NS_PER_S),
+                  fill_row("f-8", "o-8", TK, px="0.4500", count="1.00", created_ns=now)]  # young: WS's job
     r, venue, _ = live_runner(s, rest=rest, config=cfg(fills_backfill_interval_s=0.05))
     await r.run(duration_s=0.3)
     calls = rest.of("iter_fills")

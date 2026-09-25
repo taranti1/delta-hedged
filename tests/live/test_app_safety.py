@@ -278,3 +278,88 @@ async def test_live_session_with_a_ws_reconnect_replays_bit_for_bit(tmp_path):
     rep_a, rep_l = replayed_decisions(res, info.last_ts)
     assert any(a[1] == "PlaceOrder" for a in live_a)
     assert live_a == rep_a and live_l == rep_l
+
+
+async def test_external_feed_readers_yield_once_per_frame():
+    """M2: websockets returns buffered frames without suspending; the wrapped connection makes
+    an external feed reader yield to the event loop after every frame."""
+    import contextlib
+
+    from dh.live.app import yield_per_frame
+
+    class WS:
+        def __init__(self):
+            self.n = 0
+
+        async def recv(self, decode=True):
+            self.n += 1
+            return b"frame"
+
+        async def send(self, m):
+            return None
+
+    class Feed:
+        def __init__(self):
+            self.ws = WS()
+
+        def _ws_connect(self):
+            @contextlib.asynccontextmanager
+            async def cm():
+                yield self.ws
+            return cm()
+
+        async def run(self, out):
+            async with self._ws_connect() as ws:
+                while True:
+                    out.append(await ws.recv(decode=False))
+
+    feed = Feed()
+    assert yield_per_frame(feed) and not yield_per_frame(feed)  # idempotent
+    got: list = []
+    ticks = 0
+    task = asyncio.create_task(feed.run(got))
+    for _ in range(5):
+        await asyncio.sleep(0)
+        ticks += 1
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert 1 <= len(got) <= ticks + 1, "without the yield the reader would never give the loop back"
+
+
+async def test_live_session_with_a_lag_episode_replays_bit_for_bit(tmp_path):
+    """The runner's lag decisions (runner.lag stale/resumed, injected after the market event
+    that caused them) are recorded, so a session with a data-lag episode replays exactly."""
+    import time
+
+    from dh.live.replay import load_session, logged_decisions, replay_session, replayed_decisions
+
+    rest, fake, lcfg, scfg, tickers = _setup(tmp_path, "live", forbid_writes=False)
+    lcfg = replace(lcfg, loop=replace(lcfg.loop, max_lag_s=1.0, lag_resume_s=0.3, lag_confirm_s=0.0))
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
+    runner = await app.build()
+    rec = runner.recorder
+
+    async def brti():
+        start = time.monotonic()
+        while time.monotonic() - start < 5:
+            t = runner.clock_ns()
+            el = time.monotonic() - start
+            behind = int(1.5e9) if 1.0 < el < 1.6 else 0  # 0.6 s of ticks whose source time is 1.5 s old
+            ev = IndexTick(ts=t, ts_exch=t - behind, index_id="BRTI", value=84_000.0, feed="5hz")
+            rec.write_event("events.test", ev)
+            runner.push(ev)
+            await asyncio.sleep(0.03)
+
+    runner.add_source("brti", brti)
+    await runner.run(duration_s=2.6)
+    await app.close()
+    recs = _live_records(tmp_path)
+    assert [e.status for e in recs if getattr(e, "stream", "") == "runner.lag"] == ["stale", "resumed"]
+    info = load_session(tmp_path / "data")
+    res = replay_session(tmp_path / "data", scfg, extra_streams=("events.test",))
+    log = next((tmp_path / "logs").iterdir())
+    live_a, live_l = logged_decisions(log, info.last_ts)
+    rep_a, rep_l = replayed_decisions(res, info.last_ts)
+    assert any(a[1] == "PlaceOrder" for a in live_a)
+    assert any(a[1] == "CancelAll" and a[2].get("reason") == "runner_lag" for a in live_a)
+    assert live_a == rep_a and live_l == rep_l

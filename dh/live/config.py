@@ -116,6 +116,7 @@ class VenueCfg:
     ghost_sweep: bool = True  # cancel resting orders the strategy does not know about
     fills_backfill_interval_s: float = 60.0  # GET /portfolio/fills safety net (0 = off)
     fills_backfill_margin_s: float = 120.0  # look-back overlap of every fill back-fill
+    fills_backfill_min_age_s: float = 10.0  # periodic pass: leave younger fills to the WebSocket
     reconnect_settle_s: float = 2.0  # after a WS reconnect, let subscriptions settle, then reconcile
     reconcile_retry_max_s: float = 30.0
     startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start (live: required)

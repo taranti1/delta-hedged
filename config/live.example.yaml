@@ -13,10 +13,13 @@ kalshi_config: ""              # '' = config/kalshi.yaml, else config/kalshi.exa
 kalshi_env: ""                 # '' = the kalshi config's env (prod | demo)
 
 paths:
-  data_root: data/live         # raw capture of THIS process; never the collector's root
+  data_root: data/live         # raw capture of THIS process; never the collector's root.
+                               # One runner per data_root (flock on <data_root>/runner.lock)
   log_dir: data/live_logs      # JSON-lines: decisions (Log actions), actions, venue results
-  kill_file: /run/dh/KILL      # `touch /run/dh/KILL` -> cancel all + stop (dir must exist)
-  heartbeat_file: /run/dh/heartbeat.json   # read by scripts/watchdog.py
+  kill_file: /run/dh/KILL      # `touch /run/dh/KILL` -> cancel all + stop (dir must exist; stops paper too)
+  heartbeat_file: /run/dh/heartbeat.json   # the LIVE runner's; read by scripts/watchdog.py
+  paper_heartbeat_file: ""     # paper runner; '' = /run/dh/heartbeat.paper.json (never the live file)
+  risk_state_file: ""          # day P&L / carried halt / pause; '' = <data_root>/state/risk_state.<mode>.json
 
 metrics:
   enabled: true
@@ -27,22 +30,38 @@ loop:
   heartbeat_interval_s: 0.5
   kill_check_interval_s: 0.2
   metrics_refresh_s: 1.0
-  max_lag_s: 1.0               # consumer lag above this blocks NEW orders until it halves
-  shutdown_timeout_s: 10.0
-  strategy_error: stop         # stop | continue (never 'continue' in live mode)
+  max_lag_s: 1.0               # data lag (runner queue or exchange time) above this: NEW orders
+                               # blocked AND the strategy cancels its quotes (runner.lag stale)
+  lag_resume_s: 2.0            # ... until fresh data kept the lag < max_lag_s/2 this long
+  lag_window_s: 600.0          # trailing window of the exchange-time latency baseline
+  lag_confirm_s: 0.5           # exchange-time lag = smallest excess over this window (relay batching)
+  yield_items: 64              # the consumer yields to the event loop every N items / N ms,
+  yield_ms: 5.0                # and after every item that sent orders
+  shutdown_timeout_s: 10.0     # 'stopping' heartbeats stop after this (the watchdog takes over)
+  strategy_error: stop         # stop | continue ('continue' is refused in live mode)
   clock_sample_s: 60.0         # chrony/adjtimex sample -> 'clock' stream + dh_clock_offset_seconds
-  clock_alarm_ms: 5.0
+  clock_alarm_ms: 5.0          # |offset| above this: alarm
+  clock_block_ms: 250.0        # |offset| above this on clock_block_samples samples in a row:
+  clock_block_samples: 2       # new orders blocked (restart re-anchors the session clock)
+  risk_state_interval_s: 2.0   # persist the day's risk state this often (and on every halt)
 
 venue:
-  subaccount: null             # Kalshi subaccount number (null = primary). Use a DEDICATED
-                               # (sub)account: cancel-all and the ghost sweep act on all its orders.
+  subaccount: null             # Kalshi subaccount number (null / 0 = primary), sent EXPLICITLY on
+                               # every request (omitted = ALL subaccounts on GET orders/fills and
+                               # cancel-all). Use a DEDICATED (sub)account: cancel-all and the
+                               # ghost sweep act on all its orders; other subaccounts' WS events
+                               # are dropped.
   max_batch: 20                # places / cancels per batched request
   max_place_wait_s: 0.5        # quotes that would wait longer for write tokens are dropped
   self_trade_prevention: taker_at_cross
   reconcile_backoff_s: [0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0]
   reconcile_missing_after_s: 30.0
   reconcile_min_attempts: 3
-  max_cancel_retries: 5
+  create_match_skew_s: 2.0          # a lookup match must be created >= request time - this
+  missing_recheck_s: [10.0, 30.0]   # a create declared missing is looked for again (cancelled if resting)
+  max_cancel_retries: 5             # re-cancels of a still-resting order before the STUCK alarm
+                                    # (re-cancelling never stops while it rests)
+  recancel_backoff_max_s: 5.0
   queue_positions_interval_s: 2.0   # GET /portfolio/orders/queue_positions (0 = off)
   queue_positions_resync: false     # true overwrites the estimator (breaks replay parity)
   queue_positions_max_tickers: 20
@@ -50,8 +69,15 @@ venue:
   positions_interval_s: 30.0        # GET /portfolio/positions reconciliation (0 = off)
   position_confirm_s: 5.0           # a mismatch must persist this long before Halt(all)
   ghost_sweep: true                 # cancel resting orders the strategy does not know
-  startup_cancel_all: true          # cancel leftovers from a previous session before trading
-  exclude_events_with_positions: true
+  fills_backfill_interval_s: 60.0   # GET /portfolio/fills safety net (0 = off)
+  fills_backfill_margin_s: 120.0    # look-back overlap (duplicates are dropped by trade/fill id)
+  fills_backfill_min_age_s: 10.0    # the periodic pass leaves younger fills to the WebSocket
+  reconnect_settle_s: 2.0           # after a WS reconnect: wait, then back-fill fills + positions + orders
+  reconcile_retry_max_s: 30.0
+  startup_cancel_all: true          # cancel (and verify) leftovers BEFORE reading positions; required live
+  cancel_all_hold_s: 60.0           # Kalshi may cancel orders placed within 1 min of a cancel-all:
+                                    # new orders are held this long after one (start-up, kill, watchdog)
+  exclude_events_with_positions: true   # required live (held positions are not seeded into the strategy)
   shutdown_delete_group: true
   halt_on_fee_mismatch: true
 
@@ -87,16 +113,21 @@ paper:                         # shadow-trading simulator (dh.execution.exchange
   sigma: 0.4
   latency_multiplier: null
 
-feeds:                         # external venues for the risk engine's freshness check
+feeds:                         # external venues (OFF in M1, deliberately)
   config: config/feeds.yaml
-  only: []                     # e.g. [coinbase, kraken, bitstamp]; [] = none
+  # [] = none. M1 prices and detects jumps on BRTI alone; with no external feeds the risk
+  # engine's ">= 2 fresh external venues" rule is OFF and staleness is judged on BRTI receive
+  # AND source age (10 s; 3 s within 10 min of expiry). External order books would only add
+  # load to the single strategy consumer. If ever enabled: trade/ticker channels only.
+  only: []
 
-watchdog:                      # scripts/watchdog.py
+watchdog:                      # scripts/watchdog.py (locks onto the live runner it armed on)
   stale_s: 2.0
   poll_s: 0.25
   retry_s: 1.0
   repeat_s: 30.0
   max_repeats: 10
   only_live: true
+  stopping_grace_s: 5.0        # a 'stopping' runner older than its shutdown_timeout_s + this: cancel all
   key_id_env: KALSHI_WATCHDOG_KEY_ID
   private_key_path_env: KALSHI_WATCHDOG_PRIVATE_KEY_PATH

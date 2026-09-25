@@ -70,6 +70,41 @@ class StartupError(RuntimeError):
     """The runner refuses to start (exit code 2); the message says why."""
 
 
+class _YieldPerFrame:
+    """WebSocket proxy whose recv() always yields to the event loop once: a feed reader that
+    drains a full receive buffer (websockets returns buffered frames without suspending) can
+    then never starve the strategy consumer, the order requests or the heartbeat."""
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+
+    async def recv(self, *args: Any, **kw: Any) -> Any:
+        m = await self._ws.recv(*args, **kw)
+        await asyncio.sleep(0)
+        return m
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)
+
+
+def yield_per_frame(feed: Any) -> bool:
+    """Make an external FeedClient's reader yield once per frame (wraps its connection)."""
+    import contextlib
+
+    orig = getattr(feed, "_ws_connect", None)
+    if orig is None or getattr(feed, "_dh_yield_per_frame", False):
+        return False
+
+    @contextlib.asynccontextmanager
+    async def connect() -> Any:
+        async with orig() as ws:
+            yield _YieldPerFrame(ws)
+
+    feed._ws_connect = connect  # noqa: SLF001
+    feed._dh_yield_per_frame = True  # noqa: SLF001
+    return True
+
+
 @dataclass
 class Overrides:
     """Injection points for tests (no network): REST client, WS connect factory, signer...
@@ -312,7 +347,8 @@ class LiveApp:
             now = self.clock()
             rest_pnl = await derive_day_pnl(self.rest, now - now % (86_400 * NS_PER_S), positions, subaccount=venue.sub)
             self.info["day_pnl_rest"] = rest_pnl.summary()
-        seed = decide_seed(self.clock(), prev_state, rest_pnl, reset=self.reset_daily_halt)
+        seed_ts = self.clock()  # the seed's decision time AND event time (one UTC day, even at midnight)
+        seed = decide_seed(seed_ts, prev_state, rest_pnl, reset=self.reset_daily_halt)
         self.info["risk_seed"] = {"day_start_ns": seed.day_start_ns, "day_pnl_usd": round(seed.day_pnl_usd, 6),
                                   "halted": seed.halted, "halt_reason": seed.halt_reason,
                                   "pause_until_ns": seed.pause_until_ns, "notes": seed.notes,
@@ -370,7 +406,7 @@ class LiveApp:
             risk_store=store, cancel_all_marker=cancel_all_marker_path(hb) if mode == "live" else None)
         hedge.sink = runner.push_result
         # the first event: the day's risk state (before any Timer; recorded for replay)
-        runner.push_result(RiskStateSeed(self.clock(), 0, seed.day_start_ns, float(seed.day_pnl_usd), bool(seed.halted),
+        runner.push_result(RiskStateSeed(seed_ts, 0, seed.day_start_ns, float(seed.day_pnl_usd), bool(seed.halted),
                                          seed.halt_reason, int(seed.pause_until_ns)))
         store.save(RiskState(day_start_ns=seed.day_start_ns, day_pnl_usd=seed.day_pnl_usd, halted=seed.halted,
                              halt_reason=seed.halt_reason, pause_until_ns=seed.pause_until_ns, session=self.session_id,
@@ -426,6 +462,7 @@ class LiveApp:
             if not getattr(feed, "implemented", True):
                 log.warning("feed %s is a stub: skipped", name)
                 continue
+            yield_per_frame(feed)
             runner.add_source(name, (lambda f=feed: f.run(self.recorder.write)), stop=feed.stop)
 
     # ------------------------------------------------------------------ run

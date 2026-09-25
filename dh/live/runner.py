@@ -1034,6 +1034,9 @@ class LiveRunner:
             self._check_positions(item.ts, dict(item.payload or {}), partial=True)
         elif k == "fills":
             self._backfill_fills(item.ts, list(item.payload or ()))
+        elif k == "fills_periodic":
+            self._backfill_fills(item.ts, list(item.payload or ()),
+                                 min_age_ns=int(self.cfg.venue.fills_backfill_min_age_s * NS_PER_S))
         elif k == "resting":
             self._check_resting(item.ts, list(item.payload or ()))
         elif k == "resting_all":
@@ -1227,10 +1230,11 @@ class LiveRunner:
             if resync:
                 self.meta("queue_resync", ts, rows=applied)
 
-    def _backfill_fills(self, ts: int, rows: list[dict[str, Any]]) -> None:
+    def _backfill_fills(self, ts: int, rows: list[dict[str, Any]], *, min_age_ns: int = 0) -> None:
         """REST fills: feed those the WebSocket never delivered (after a reconnect, an
         own-channel gap, and periodically as a safety net), through the same bookkeeping as a
-        WS fill (fee check, metrics).
+        WS fill (fee check, metrics). ``min_age_ns`` (periodic pass): fills younger than this
+        are left to the WebSocket (the next pass overlaps and takes them if they never come).
 
         Dedupe: a REST Fill's ``trade_id`` is documented as the legacy name of ``fill_id``;
         both are checked against every fill already delivered, and a WS fill arriving after
@@ -1252,6 +1256,8 @@ class LiveRunner:
             try:
                 ev = rest_fill_to_event(row, ts)
             except (KeyError, ValueError, TypeError):
+                continue
+            if min_age_ns and (not ev.ts_exch or ts - ev.ts_exch < min_age_ns):
                 continue
             ev = dataclasses.replace(ev, trade_id=tid or fid, fill_id=fid, subaccount=self.subaccount)
             self.jlog("fill_backfilled", ts, ticker=ev.ticker, trade_id=ev.trade_id, order_id=ev.order_id, qty=ev.qty)
@@ -1564,7 +1570,7 @@ class LiveRunner:
                 self.jlog("reconcile_error", self._clock(), what="fills", error=f"{type(exc).__name__}: {exc}"[:300])
                 continue
             if rows:
-                self.push_side("fills", rows)
+                self.push_side("fills_periodic", rows)
 
     async def _risk_state_loop(self) -> None:
         iv = self.cfg.loop.risk_state_interval_s
