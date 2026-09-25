@@ -278,7 +278,7 @@ class LiveApp:
         kc = load_kalshi_config(_resolve(lcfg.kalshi_config) if lcfg.kalshi_config else None, env=lcfg.kalshi_env or None)
         signer = self.ov.signer if self.ov.signer is not None else kc.signer()
         if signer is None and self.ov.ws_connect is None:
-            raise StartupError("no Kalshi API credentials (KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH): the WebSocket "
+            raise StartupError(f"no Kalshi API credentials ({kc.credentials_hint()}): the WebSocket "
                                "requires authentication even for market data")
         paths = lcfg.paths
         self.locks = check_runtime_paths(lcfg, mode, now_ns=self.clock())

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import logging
 import os
 import platform
@@ -162,6 +163,11 @@ class KalshiSource:
         self.ws: Any = None
         self.rest: Any = None
         self._refresh_now = asyncio.Event()
+        # 'created' lifecycle events for markets that open LATER (Kalshi creates a day of
+        # KXBTC15M markets at once, found live 2026-09-25): ticker -> open time (ns). The
+        # refresh loop wakes shortly after each open instead of re-discovering on every event.
+        self.pending_open: dict[str, int] = {}
+        self._last_refresh_mono = 0.0
         self.series = [str(s) for s in kcfg.get("series") or []]
         self.events_found: set[str] = set()  # event tickers of discovered markets
         self.events_recorded: set[str] = set()  # events whose GET /events/{e} was recorded
@@ -177,11 +183,21 @@ class KalshiSource:
             await self.stop.wait()
             return
         kc = load_config(self.kcfg.get("config"), env=self.kcfg.get("env"))
+        if kc.env_file_report is not None:
+            log.info("kalshi: %s", kc.env_file_report.summary())  # variable names only
         self.series = self.series or list(kc.series)
         signer = kc.signer()
-        self.rest = KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write, **kc.rest_kwargs())
+        # read_only: the recorder never writes (any non-GET raises before it is signed or sent)
+        self.rest = KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write, read_only=True,
+                               **kc.rest_kwargs())
         tasks: list[asyncio.Task[Any]] = []
         try:
+            if signer is not None:
+                try:  # the account's real limits, scaled by rate_limits.account_share
+                    await self.rest.configure_rate_limits()
+                except Exception as exc:  # noqa: BLE001 - keep the (scaled) defaults
+                    log.warning("kalshi: account limits unavailable (%s): using configured defaults", exc)
+            log.info("kalshi: REST rate limiter %s", self.rest.limiter.describe())
             self.tickers = await self.discover()
             log.info("kalshi: %d open markets in %s", len(self.tickers), ",".join(self.series))
             await self.record_metadata()
@@ -191,8 +207,8 @@ class KalshiSource:
             if float(self.kcfg.get("cf_history_interval_s", 0) or 0) > 0:
                 tasks.append(asyncio.create_task(self.cf_history_loop(), name="kalshi:cf"))
             if signer is None:
-                log.error("kalshi: no API credentials (KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH): the WebSocket "
-                          "requires authentication, recording REST snapshots only")
+                log.error("kalshi: no API credentials (%s): the WebSocket requires authentication, "
+                          "recording REST snapshots only", kc.credentials_hint())
             else:
                 cap = int(self.kcfg.get("max_markets_per_subscription", 100) or 0)
                 subs = shard_market_subscriptions(
@@ -224,8 +240,22 @@ class KalshiSource:
     def on_event(self, ev: Event) -> None:
         self.monitor.on_kalshi_event(ev)
         if isinstance(ev, KalshiMarketLifecycle) and any(ev.ticker.startswith(s + "-") for s in self.series):
-            if ev.ticker not in self.tickers and ev.event_type in ("created", "activated"):
+            if ev.ticker in self.tickers or ev.event_type not in ("created", "activated"):
+                return
+            if ev.event_type == "created" and ev.open_ts > time.time_ns() + 5 * 10**9:
+                self.pending_open[ev.ticker] = ev.open_ts  # not open yet: refresh when it opens
+            else:
                 self._refresh_now.set()
+
+    def pending_due(self, retry_s: float = 10.0, give_up_s: float = 120.0) -> bool:
+        """True when a pending market opened >= 2 s ago and is not subscribed yet (retried at
+        most every ``retry_s``; given up ``give_up_s`` after its open time)."""
+        now = time.time_ns()
+        for t, open_ns in list(self.pending_open.items()):
+            if t in self.tickers or now > open_ns + int(give_up_s * 1e9):
+                del self.pending_open[t]
+        opened = any(now >= open_ns + 2 * 10**9 for open_ns in self.pending_open.values())
+        return opened and time.monotonic() - self._last_refresh_mono >= retry_s
 
     async def discover(self) -> list[str]:
         """Open markets of the configured series closing within the horizon."""
@@ -246,6 +276,28 @@ class KalshiSource:
                 out.add(str(t))
                 if m.get("event_ticker"):
                     self.events_found.add(str(m["event_ticker"]))
+            # Markets that open soon (next KXBTC15M, next hourly KXBTCD/KXBTC event, which opens
+            # one hour before it closes): refresh right after they open instead of waiting for
+            # the periodic refresh. Markets CLOSING within the look-ahead, any status (one page
+            # per series). status=unopened would list every future hourly market (5,640 per
+            # series on 2026-09-25, ~35 MB per scan) and cannot be combined with close-time
+            # filters (openapi GET /markets compatibility table).
+            ahead_s = float(self.kcfg.get("pending_lookahead_h", 3)) * 3600
+            now_ns = time.time_ns()
+            try:
+                async for m in self.rest.iter_markets(series_ticker=s, min_close_ts=now_ns // 10**9,
+                                                      max_close_ts=int(now_ns // 10**9 + ahead_s)):
+                    t, ot = m.get("ticker"), m.get("open_time")
+                    if not t or not ot or str(t) in out:
+                        continue
+                    try:
+                        open_ns = parse_rfc3339_ns(str(ot))
+                    except ValueError:
+                        continue
+                    if open_ns > now_ns:
+                        self.pending_open[str(t)] = open_ns
+            except Exception as exc:  # noqa: BLE001 - best effort; the periodic refresh still runs
+                log.debug("kalshi: upcoming markets of %s unavailable: %s", s, exc)
         return sorted(out)
 
     async def record_metadata(self) -> None:
@@ -276,13 +328,19 @@ class KalshiSource:
 
     async def refresh_loop(self) -> None:
         period = float(self.kcfg.get("market_refresh_s", 300))
+        min_gap = float(self.kcfg.get("min_refresh_gap_s", 15))  # event-triggered refreshes at most this often
+        self._last_refresh_mono = time.monotonic()  # run() discovered just before starting this loop
         while True:
             try:
-                await asyncio.wait_for(self._refresh_now.wait(), timeout=period)
-                await asyncio.sleep(2.0)  # debounce bursts of lifecycle events
+                await asyncio.wait_for(self._refresh_now.wait(), timeout=2.0)
+                gap = self._last_refresh_mono + min_gap - time.monotonic()
+                await asyncio.sleep(max(2.0, gap))  # debounce bursts of lifecycle events
             except asyncio.TimeoutError:
-                pass
+                # periodic refresh, or a market announced by a 'created' event has opened
+                if time.monotonic() - self._last_refresh_mono < period and not self.pending_due():
+                    continue
             self._refresh_now.clear()
+            self._last_refresh_mono = time.monotonic()
             try:
                 fresh = await self.discover()
             except Exception as exc:  # noqa: BLE001
@@ -338,6 +396,24 @@ def _ws_kwargs(ws: dict[str, Any]) -> dict[str, Any]:
 
 
 # ============================================================================ main
+def acquire_single_instance_lock(root: Path) -> Any:
+    """Exclusive, non-blocking flock on ``<root>/recorder.lock`` held for the process lifetime:
+    two recorders appending to the same store would interleave segment files (e.g. a manual
+    ``nohup`` run and the launchd agent). Returns the open file, or None if another holds it."""
+    root.mkdir(parents=True, exist_ok=True)
+    f = open(root / "recorder.lock", "a+")  # noqa: SIM115 - must stay open while running
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
+
+
 def session_meta(args: argparse.Namespace, cfg: dict[str, Any]) -> bytes:
     try:
         commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
@@ -354,6 +430,10 @@ async def amain(args: argparse.Namespace) -> int:
     root = Path(args.root or cfg.get("root") or "data")
     if not root.is_absolute() and not args.root:
         root = REPO / root  # config paths are relative to the repository
+    lock = acquire_single_instance_lock(root)
+    if lock is None:
+        log.error("another recorder already holds %s: refusing to start (stop it first)", root / "recorder.lock")
+        return 2
     rcfg = cfg.get("recorder") or {}
     recorder = Recorder(root, flush_interval_s=float(rcfg.get("flush_interval_s", 1.0)),
                         fsync_interval_s=float(rcfg.get("fsync_interval_s", 30.0)), zstd_level=int(rcfg.get("zstd_level", 3)))

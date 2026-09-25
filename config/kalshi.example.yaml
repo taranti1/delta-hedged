@@ -12,9 +12,14 @@ endpoints:
   demo:
     rest: https://external-api.demo.kalshi.co/trade-api/v2 # openapi servers[2]
     rest_alt: https://demo-api.kalshi.co/trade-api/v2
-    ws: wss://demo-api.kalshi.co/trade-api/ws/v2 # UNVERIFIED: asyncapi lists production only
+    ws: wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2 # docs.kalshi.com api_environments (recommended)
+    ws_alt: wss://demo-api.kalshi.co/trade-api/ws/v2 # "also supported"
 
 auth:
+  # Optional host-local KEY=VALUE file loaded into the environment before the lookups below
+  # (dh/kalshi/envfile.py): already-set variables win, ALLOW_* names are never loaded, values
+  # are never printed. Point it at an existing secrets file instead of copying keys around.
+  env_file: null # e.g. /path/to/.secrets/prod.env
   key_id_env: KALSHI_KEY_ID
   private_key_path_env: KALSHI_PRIVATE_KEY_PATH
   key_id: "" # PLACEHOLDER (env var wins when set)
@@ -45,6 +50,10 @@ ws:
 rate_limits: # conservative defaults, replaced by GET /account/limits at start-up
   read: { refill_rate: 100, bucket_capacity: 100 }
   write: { refill_rate: 50, bucket_capacity: 50 }
+  # Fraction of the ACCOUNT's budget this process may use (budgets are per account, shared by
+  # every key/process/FIX session of the account). 1.0 = all of it. Use e.g. 0.2 when another
+  # system trades on the same account.
+  account_share: 1.0
 
 fees:
   config: config/fees.yaml

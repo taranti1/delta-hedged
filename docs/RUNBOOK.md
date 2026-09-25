@@ -37,6 +37,29 @@ the day's risk state (section 8): a halt stays a halt, the daily-loss budget is 
   `sudo mkdir -p /run/dh && sudo chown $USER /run/dh`
   (permanent: a systemd-tmpfiles line `d /run/dh 0755 <user> <group> -`).
 
+#### 1.1a The macOS data-collection host (current, since 2026-09-25)
+The recorder currently runs on a Mac (Apple silicon, macOS 26, uv-managed CPython 3.12 venv:
+`.venv/bin/python`, installed with `-e '.[dev]'`). What differs from the Linux VM above:
+* **No `timeout`, `chronyc`, `timedatectl` or `adjtimex`.** `scripts/record.py`'s clock
+  sampler (`dh.store.recorder.sample_clock`) falls back to a query-only SNTP exchange
+  (`sntp -t 2 <server of /etc/ntp.conf, default time.apple.com>`, which never sets the clock)
+  and records `src: "sntp"`, `offset_s` (positive = local clock BEHIND), `est_error_s` (the
+  +/- bound) and `synced: null` every 60 s in stream `clock`. Measured on 2026-09-25: the Mac
+  ran **~33-37 ms behind** NTP (+/- ~20 ms) at 15:15 ET, drifting to ~47-51 ms by 16:15 ET
+  (macOS `timed` disciplines loosely). All `recv - exchange` latencies measured here
+  carry that bias (negative values for Kraken/Gemini/Coinbase are this offset, not time
+  travel); correct research latencies with the `clock` stream. If `sntp` is unavailable the
+  sample degrades to `src: "unknown"` (the recorder never crashes on it).
+* **The live runner will not trade from this Mac**: its clock gate trusts only `chronyc` /
+  `timedatectl` samples (`dh.live.runner.CLOCK_SOURCES`), so live mode blocks new orders here.
+  Paper mode and recording are fine. Live trading stays on the Linux VM of 1.1.
+* **Sleep**: run long jobs under `caffeinate -i` (prevents idle sleep; a closed laptop lid
+  still sleeps the machine). Check with `pmset -g assertions`.
+* `/run/dh` does not exist on macOS: the kill-file/heartbeat paths of `config/live.yaml` must
+  point elsewhere (e.g. `data/run/`) before any paper runner is started here.
+* Binance (HTTP 451) and Bybit (HTTP 403) are geo-blocked from this US host: both are
+  `enabled: false` in `config/feeds.yaml`.
+
 ### 1.2 Kalshi account and API keys
 1. Use a **dedicated account or subaccount** for the bot. Cancel-all, the ghost-order sweep and
    the position reconciliation act on every order/position of that (sub)account: manual
@@ -64,11 +87,45 @@ export KALSHI_WATCHDOG_KEY_ID=<watchdog key id>
 export KALSHI_WATCHDOG_PRIVATE_KEY_PATH=$HOME/.kalshi/watchdog.pem
 ```
 
+**Or reuse an existing credentials file without copying it** (how this Mac is set up): in
+`config/kalshi.yaml`
+```yaml
+auth:
+  env_file: /path/to/trading-strategy/Kalshi/.secrets/prod.env # read in place, never copied
+  key_id_env: KALSHI_PROD_API_KEY_ID
+  private_key_path_env: KALSHI_PROD_PRIVATE_KEY_PATH
+```
+`dh.kalshi.config.load_config` reads that KEY=VALUE file (`dh/kalshi/envfile.py`: `export`,
+quotes and `#` comments accepted, no shell expansion) into the process environment before
+the lookups: variables already set in the environment win, names starting with `ALLOW_` are
+**never** loaded (the other system's safety switches must not leak into this one), and only
+variable NAMES are ever logged (`kalshi: env file ...: loaded ['KALSHI_PROD_API_KEY_ID', ...]`).
+Every entry point that builds a Kalshi client goes through `load_config` (smoke_kalshi,
+record.py, verify_fee_schedule, download_kalshi_history, `dh.live.tools`, the runner, the
+watchdog), so they all see the same credentials. The key id is redacted from
+`KalshiSigner.__repr__`.
+
+**Shared account.** This key belongs to the same Kalshi account as the user's other, live
+trading system. REST budgets are per ACCOUNT (docs.kalshi.com "Rate Limits and Tiers": REST
+and FIX drain the same read/write buckets), so `config/kalshi.yaml` sets
+`rate_limits.account_share: 0.2`: the limiter reads `GET /account/limits` and keeps this
+process to 20% of the refill rate and bucket capacity (capacity floored at the largest single
+request cost). Observed 2026-09-25: tier **basic**, read 200 tokens/s (capacity 600), write
+100 tokens/s (capacity 100), default cost 10, CF passthrough 50, `GET /portfolio/orders/{id}`
+and cancels 2 -> this system: **read 40 tokens/s (cap 120), write 20/s (cap 30)**. Kalshi
+documents no WebSocket connection limit; every process here opens at most ONE Kalshi
+WebSocket (all subscriptions multiplexed on it). The recorder, smoke checks and `dh.live.tools`
+build their REST client with `read_only=True`: any non-GET raises before it is signed or sent.
+
 ### 1.4 Configuration files
 ```sh
 cp config/kalshi.example.yaml config/kalshi.yaml   # env: prod | demo, REST/WS settings
 cp config/live.example.yaml   config/live.yaml     # runner: mode, paths, venue, universe...
 ```
+Both copies are host-local and git-ignored (they may point at host secrets files). On this
+Mac `config/kalshi.yaml` exists (env file, `account_share: 0.2`,
+`fees.balance_precision_dollars: "0.0001"` from the fee check of section 2); `config/live.yaml`
+does not yet (`dh.live.tools` then falls back to `config/live.example.yaml`).
 * `config/m1.yaml` holds the strategy (sizes, limits, timers). Do not edit it casually: its
   digest is written on every log line and every session record.
 * `config/live.yaml`: keep `mode: paper` until section 5. Set `venue.subaccount` if you use a
@@ -105,23 +162,37 @@ cp config/live.example.yaml   config/live.yaml     # runner: mode, paths, venue,
 
 | Check | Command | Pass |
 |---|---|---|
-| Kalshi REST + WS + BRTI | `python scripts/smoke_kalshi.py --seconds 60` (`--demo` for demo) | all 8 checks PASS (status, limits, KXBTCD specs and fee type, orderbooks, WS subscriptions, WS books equal REST snapshots, BRTI rates and latency, no gaps) |
+| Kalshi REST + WS + BRTI | `python scripts/smoke_kalshi.py --seconds 60` (`--demo` for demo) | all 11 checks PASS (status, limits, KXBTCD discovery + specs, rules sanity, fee type, REST orderbooks, WS subscriptions, WS books equal REST snapshots, BRTI 1 Hz and 5 Hz rates and latency, no gaps) |
 | External venues | `python scripts/smoke_feeds.py --seconds 60` | every enabled venue PASS |
-| Benchmark back-fill (**verify live**) | `python -m dh.live.tools backfill` | `"ok": true`, coverage >= 0.9 |
+| Benchmark back-fill | `python -m dh.live.tools backfill` | `"ok": true`, coverage >= 0.9 |
 | Resting orders | `python -m dh.live.tools orders` | `0 resting orders` (exit 0) |
 | Fee schedule | `python scripts/verify_fee_schedule.py --days 14` | series fee types supported; once the account has fills: every fill matches (sets `fees.balance_precision_dollars`) |
-| Clock | `chronyc tracking` | offset < 1 ms |
+| Clock | `chronyc tracking` (Linux) / `sntp time.apple.com` (macOS, measure only) | offset < 1 ms (Linux) |
+
+**First live run, 2026-09-25, this Mac, prod, shared account (all read-only):**
+
+| Check | Result | Notes |
+|---|---|---|
+| `smoke_kalshi.py --seconds 60` | **11/11 PASS** first try | 6 KXBTCD markets; 14,900 WS frames, 0 gaps; WS books == REST; BRTI 1 Hz: 61 ticks (1.00/s), recv-source p50 60 ms, Kalshi hop 71 ms; 5 Hz: 305 ticks (4.99/s), p50 23 ms, hop 34 ms (both biased ~-35 ms by this Mac's clock) |
+| `smoke_feeds.py` | **all 9 enabled feeds PASS** after fixes | coinbase, kraken, bitstamp, gemini, cryptocom, deribit, deribit_options, okx, hyperliquid (see docs/ENVIRONMENT.md for the fixes) |
+| `dh.live.tools backfill` | **ok, coverage 1.0** | 49 hourly requests, 861,949 BRTI ticks (5 Hz), 2,880/2,880 minute points, 122 s at the 20% budget (50 tokens per request), peak RSS ~350 MB |
+| `dh.live.tools orders` | 0 resting orders (primary subaccount) | pure `GET /portfolio/orders` |
+| `verify_fee_schedule.py --days 14` | **OK** | KXBTCD, KXBTC, KXBTC15M: `quadratic` x1, no scheduled changes; the account's 40 fills (the other system's, non-BTC markets) all match exactly at balance precision **$0.0001** (22 exact / 16 trade-only / 2 within rounding at $0.01) -> `fees.balance_precision_dollars: "0.0001"` in `config/kalshi.yaml` |
 
 **Back-fill**: the fair-value model needs one half-life of every volatility EWMA, the longest
 being 1 day, before it quotes. At start-up the runner fetches 2 days of BRTI through Kalshi's
-CF Benchmarks passthrough, in hourly chunks, newest first:
-`GET /trade-api/v2/cfbenchmarks/history/values?id=BRTI&timespan=3600s&timestamp=<chunk end ms>`
-and down-samples it to one print per minute. The passthrough's parameter formats are not in
-Kalshi's openapi spec: if `tools backfill` returns no ticks, adjust `backfill.timespan` /
-`backfill.timestamp` in `config/live.yaml` (placeholders `{start_ms} {end_ms} {start_s} {end_s}
-{span_s} {span_ms}`, extra query parameters in `backfill.extra_params`) until it does. Without
-the history the runner still starts, logs `fair-value model NOT ready`, and **does not quote
-until it has seen >= 1 day of live BRTI ticks** (metric `dh_fv_ready` = 0).
+CF Benchmarks passthrough, one clock hour per request, newest first (verified live):
+`GET /trade-api/v2/cfbenchmarks/history/values?id=BRTI&timespan=HOUR&timestamp=2026-09-25T17:00:00.000Z`
+(the timestamp is the hour's START, truncated to the timespan as CF requires; `backfill.align:
+true`) -> `{"data": {"serverTime": ..., "payload": [{"time": <ms>, "value": "83737.50"}, ...]}}`,
+the hour's ticks at 5 Hz (18,000 rows, ~750 kB). The newest (current) hour may be partial or,
+within `backfill.recent_delay_s`, empty (CF: history can lag up to 15 min): an empty recent
+chunk is skipped, an empty older chunk stops the back-fill. Ticks are down-sampled to one
+print per minute. Placeholders for `backfill.timespan` / `backfill.timestamp`: `{start_ms}
+{end_ms} {start_s} {end_s} {span_s} {span_ms} {start_iso} {end_iso}`; extra query parameters in
+`backfill.extra_params`. Without the history the runner still starts, logs `fair-value model
+NOT ready`, and **does not quote until it has seen >= 1 day of live BRTI ticks** (metric
+`dh_fv_ready` = 0).
 
 ---------------------------------------------------------------------------------------------
 ## 3. Recorder (M1.0)
@@ -131,7 +202,69 @@ python scripts/record.py --config config/feeds.yaml
 ```
 Run it as a service for at least 7 days before trusting any analysis (BUILD_PLAN M1.0: fewer
 than 0.1% sequence gaps). It writes `data/raw/<stream>/<date>/<hour>.jsonl.zst` and never
-trades. The runner records its own session store separately (`paths.data_root`).
+trades (its Kalshi REST client is `read_only`). The runner records its own session store
+separately (`paths.data_root`). One recorder per store: it holds an exclusive `flock` on
+`<root>/recorder.lock` and a second instance exits with status 2.
+
+**What it records** (default `config/feeds.yaml`, verified live 2026-09-25):
+* Kalshi, ONE WebSocket: `orderbook_delta` + `trade` + `ticker` for **every open KXBTCD, KXBTC
+  and KXBTC15M market** (`market_horizon_h: 0`; ~360-640 markets depending on the hour: the
+  current and next hourly events, the next day's 17:00 event and a weekly event),
+  `market_lifecycle_v2` for all markets, BRTI on `cfbenchmarks_value` (1 Hz) and
+  `cfbenchmarks_value_5hz`. REST: order-book snapshots of all subscribed markets every 60 s,
+  series/event/fee metadata on every discovery. Discovery runs every 300 s; from 2 s after
+  the open time of each market closing within `pending_lookahead_h` (the next KXBTC15M, the
+  next hourly event: they open 15 min / 1 h before closing), retried every 10 s until listed
+  (observed: the 16:30 KXBTC15M market was subscribed 13 s after its open); and on lifecycle
+  `created`/`activated` events of already-open markets (at most every `min_refresh_gap_s`;
+  `created` events of markets that open later, e.g. a day of KXBTC15M created at once, are
+  parked until their open time instead of re-running discovery). Kalshi REST use measured:
+  105 GETs in 14 min = ~1.2 tokens/s, 3% of this system's 40 tokens/s share.
+* External venues (no credentials): Coinbase `level2` (full book) + trades, Kraken book 100 +
+  trades, Bitstamp diff book + trades, Gemini `l2`, Crypto.com book 50 + trades, Deribit
+  BTC-PERPETUAL book/ticker/trades/index/DVOL and option tickers (2 nearest expiries,
+  |K/S - 1| <= 5%), OKX swap books5/trades/funding/mark/OI/index/liquidations, Hyperliquid
+  l2Book (fast) + trades + asset context. Binance and Bybit are disabled (geo-blocked).
+* `clock` every 60 s (macOS: `sntp`, section 1.1a) and `meta` (session start/end, config).
+
+**Measured data rates** (this Mac, 2026-09-25 afternoon ET; zstd level 3, on-disk bytes):
+
+| Stream | msgs/s | raw MB/h | disk MB/h |
+|---|---|---|---|
+| kalshi.ws | 600-1,500 | 600-1,450 | 60-145 |
+| deribit.options (+/-5%, ~60 instruments) | ~52 | ~145 | ~18 (34 at +/-10%) |
+| coinbase.ws (full level2) | ~20 | ~70-245 | ~6-21 |
+| cryptocom.ws | ~46 | ~65-77 | ~10-13 |
+| kraken.ws | ~60-140 | ~40-100 | ~6-13 |
+| gemini.ws | ~45-190 | ~13-56 | ~2-10 |
+| deribit.ws | ~8 | ~16-27 | ~4-6 |
+| okx.ws | ~21-28 | ~22-27 | ~3-4 |
+| bitstamp.ws, hyperliquid.ws | ~3.5 each | ~5-12 | ~2-3 each |
+| kalshi.rest.* | <1 | ~15-45 | ~1-2 |
+| **total** | | **~1.0-2.4 GB/h** | **~120-250 MB/h = 3-6 GB/day** |
+
+Ranges are quiet vs busy periods (the minutes around an hourly expiry are the busiest). With
+~200 GB free that is roughly 5-8 weeks; plan to move `data/raw` off the machine or prune old
+hours before then (the store is append-only; nothing prunes it automatically). Reduced on
+2026-09-25: Deribit options narrowed from +/-10% to +/-5% moneyness (near-ATM IV is what M1
+needs; `agg2` is not sparser than `100ms`). Kept on purpose: Coinbase full-depth `level2`
+(largest BRTI constituent; the BRTI methodology uses order-book depth) and all Kalshi books.
+
+**Running it on this Mac** (until the launchd agent is installed):
+```sh
+cd /Users/thomast/Desktop/delta-hedged && mkdir -p data/logs
+nohup caffeinate -i .venv/bin/python scripts/record.py --config config/feeds.yaml >> data/logs/record.out 2>&1 &
+```
+`caffeinate` forks: the started PID becomes the recorder (python) and a child `caffeinate`
+holds the no-idle-sleep assertion until that PID exits. PIDs are kept in
+`data/logs/record.pid` (recorder) and `data/logs/record.caffeinate.pid`. Stop cleanly with
+`kill -TERM "$(cat data/logs/record.pid)"` (flush + fsync + segment indexes, ~5 s). The
+permanent setup is the launchd agent in `deploy/launchd/` (KeepAlive, caffeinate, logs in
+`data/logs/`; see its README; not installed yet).
+
+**Health**: a status line every 60 s in the log: per stream msgs/s, age of the last message,
+gaps / resyncs / reconnects / stale / errors (Kalshi: gaps, dups, connects), recorder MB and
+write errors, and the clock sample. `python scripts/replay_inspect.py --root data list | gaps | clock` inspects the store.
 
 ---------------------------------------------------------------------------------------------
 ## 4. Paper trading (M1.4): the strategy against the live book, no orders

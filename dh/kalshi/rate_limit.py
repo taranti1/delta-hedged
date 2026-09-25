@@ -16,7 +16,17 @@ notes, used until the server list is loaded):
   DELETE /portfolio/events/orders/batched            2 per order in the batch
   POST   /account/api_usage_level/upgrade            30
 
+  GET    /cfbenchmarks/...                            50  (CF Benchmarks passthrough, docs.kalshi.com)
+
 Bucket selection: GET/HEAD -> read; POST/PUT/PATCH/DELETE -> write.
+
+Budgets are per ACCOUNT (docs.kalshi.com "Rate Limits and Tiers": "your tier sets your
+budget"; REST and FIX drain the same buckets), so every process and every API key of the
+account shares them. ``account_share`` (0 < share <= 1, config ``rate_limits.account_share``)
+limits THIS process to that fraction of the account's refill rate and bucket capacity, leaving
+the rest to other systems on the same account. The scaled capacity is never below the largest
+single-request cost of the bucket (else such a request could never be sent) nor above the
+account's capacity.
 
 Conservative defaults (used only until ``update_from_limits`` is called with the account's
 real limits): read 100 tokens/s (capacity 100), write 50 tokens/s (capacity 50), i.e. at most
@@ -55,6 +65,8 @@ DOCUMENTED_COSTS: tuple[tuple[str, str, int], ...] = (
     ("POST", "/portfolio/events/orders/batched", 10),
     ("DELETE", "/portfolio/events/orders/batched", 2),
     ("POST", "/account/api_usage_level/upgrade", 30),
+    ("GET", "/cfbenchmarks/values", 50),
+    ("GET", "/cfbenchmarks/history/values", 50),
 )
 
 
@@ -163,10 +175,17 @@ class TokenBucket:
 
 
 def _route_regex(template: str) -> re.Pattern[str]:
+    """Route template -> regex. Segment forms: '{name}' (openapi) and ':name' (the server's
+    endpoint_costs list) match one segment; '*name' (server list, e.g.
+    'GET /trade-api/v2/cfbenchmarks/*endpoint', verified live 2026-09-25) matches one or more
+    remaining segments."""
     parts = []
-    for seg in normalize_route(template).split("/"):
+    segs = normalize_route(template).split("/")
+    for i, seg in enumerate(segs):
         if (seg.startswith("{") and seg.endswith("}")) or seg.startswith(":"):
             parts.append("[^/]+")
+        elif seg.startswith("*") and i == len(segs) - 1:
+            parts.append(".+")
         else:
             parts.append(re.escape(seg))
     return re.compile("^" + "/".join(parts) + "$")
@@ -189,13 +208,20 @@ class KalshiRateLimiter:
         endpoint_costs: list[tuple[str, str, int]] | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
+        account_share: float = 1.0,
     ) -> None:
-        self.read = TokenBucket(read, clock, sleep)
-        self.write = TokenBucket(write, clock, sleep)
+        share = float(account_share)
+        if not 0.0 < share <= 1.0:
+            raise ValueError(f"account_share must be in (0, 1], got {account_share!r}")
+        self.account_share = share
         self.default_cost = default_cost
         self.usage_tier = "unknown"
         self.limits_source = "default"  # 'default' until update_from_limits()
         self._costs: list[tuple[str, re.Pattern[str], int, str]] = []
+        # account-level (unscaled) limits; the buckets hold account_share of them
+        self.account_read, self.account_write = read, write
+        self.read = TokenBucket(read, clock, sleep)
+        self.write = TokenBucket(write, clock, sleep)
         self.set_endpoint_costs(list(DOCUMENTED_COSTS) + list(endpoint_costs or []))
 
     # ------------------------------------------------------------------ configuration
@@ -206,13 +232,41 @@ class KalshiRateLimiter:
             key = (method.upper(), normalize_route(template))
             table[key] = (method.upper(), _route_regex(template), int(cost), key[1])
         self._costs = list(table.values())
+        self._apply_share()
+
+    def max_single_cost(self, bucket: str) -> int:
+        """Largest single-request (one item) cost routed to ``bucket`` ('read'/'write')."""
+        costs = [c for m, _rx, c, _t in self._costs if self.bucket_name(m) == bucket]
+        return max([self.default_cost, *costs])
+
+    def scaled(self, limit: BucketLimit, bucket: str) -> BucketLimit:
+        """``limit`` scaled by account_share (capacity floored at the largest single cost)."""
+        if self.account_share >= 1.0:
+            return limit
+        cap = max(limit.bucket_capacity * self.account_share, float(self.max_single_cost(bucket)))
+        return BucketLimit(limit.refill_rate * self.account_share, min(cap, limit.bucket_capacity))
+
+    def _apply_share(self) -> None:
+        if not hasattr(self, "read"):
+            return
+        self.read.update_limit(self.scaled(self.account_read, "read"))
+        self.write.update_limit(self.scaled(self.account_write, "write"))
 
     def update_from_limits(self, body: dict[str, Any]) -> None:
-        """Apply GET /account/limits (GetAccountApiLimitsResponse)."""
-        self.read.update_limit(BucketLimit.from_json(body["read"]))
-        self.write.update_limit(BucketLimit.from_json(body["write"]))
+        """Apply GET /account/limits (GetAccountApiLimitsResponse), scaled by account_share."""
+        self.account_read = BucketLimit.from_json(body["read"])
+        self.account_write = BucketLimit.from_json(body["write"])
+        self._apply_share()
         self.usage_tier = str(body.get("usage_tier", "unknown"))
         self.limits_source = "account"
+
+    def describe(self) -> str:
+        """One line: account limits, share, and this process's effective buckets."""
+        r, w = self.read.limit, self.write.limit
+        return (f"tier={self.usage_tier} source={self.limits_source} share={self.account_share:g} "
+                f"account read={self.account_read.refill_rate:g}/s cap {self.account_read.bucket_capacity:g}, "
+                f"write={self.account_write.refill_rate:g}/s cap {self.account_write.bucket_capacity:g}; "
+                f"effective read={r.refill_rate:g}/s cap {r.bucket_capacity:g}, write={w.refill_rate:g}/s cap {w.bucket_capacity:g}")
 
     def update_endpoint_costs(self, body: dict[str, Any]) -> None:
         """Apply GET /account/endpoint_costs (GetAccountEndpointCostsResponse).

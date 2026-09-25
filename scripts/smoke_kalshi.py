@@ -2,6 +2,7 @@
 """Manual LIVE check of the Kalshi adapter (REST + WS + BRTI). Not part of pytest.
 
     export KALSHI_KEY_ID=<key id>  KALSHI_PRIVATE_KEY_PATH=~/.kalshi/key.pem
+    #   (or set auth.env_file / key_id_env / private_key_path_env in config/kalshi.yaml)
     python scripts/smoke_kalshi.py --seconds 30            # production
     python scripts/smoke_kalshi.py --demo --seconds 30     # demo environment
     python scripts/smoke_kalshi.py --record /tmp/kalshi_smoke.jsonl   # keep raw frames for replay
@@ -112,8 +113,10 @@ async def compare_books(rest: KalshiRest, books: dict[str, KalshiBook], attempts
 async def amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.config, env="demo" if args.demo else None)
     signer = cfg.signer()
+    if cfg.env_file_report is not None:
+        print(cfg.env_file_report.summary())
     if signer is None:
-        print("credentials required: set KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH", file=sys.stderr)
+        print(f"credentials required: {cfg.credentials_hint()}", file=sys.stderr)
         return 2
     results: list[tuple[str, bool]] = []
 
@@ -124,14 +127,16 @@ async def amain(args: argparse.Namespace) -> int:
     rec = JsonlRecorder(args.record) if args.record else None
     on_raw = rec.write if rec else None
     try:
-        async with KalshiRest(cfg.rest_url, signer, cfg.limiter(), on_raw=on_raw, **cfg.rest_kwargs()) as rest:
+        async with KalshiRest(cfg.rest_url, signer, cfg.limiter(), on_raw=on_raw, read_only=True, **cfg.rest_kwargs()) as rest:
             st = await rest.get_exchange_status()
             check("exchange status", bool(st.get("exchange_active")), orjson.dumps(st).decode()[:200])
             lim = await rest.configure_rate_limits()
             lm = lim["limits"]
             check("account limits", "read" in lm and "write" in lm,
                   f"tier={lm.get('usage_tier')} read={lm.get('read')} write={lm.get('write')} "
-                  f"default_cost={lim['endpoint_costs'].get('default_cost')}")
+                  f"default_cost={lim['endpoint_costs'].get('default_cost')} "
+                  f"non_default={[(e.get('method'), e.get('path'), e.get('cost')) for e in lim['endpoint_costs'].get('endpoint_costs') or []]}")
+            print(f"  rate limiter: {rest.limiter.describe()}")
 
             bundle = await fetch_series_bundle(rest, args.series, status="open")
             reg = MarketRegistry.from_bundles([bundle], cfg.fee_engine())

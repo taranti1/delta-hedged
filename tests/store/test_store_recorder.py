@@ -179,7 +179,7 @@ def test_validation_and_events(tmp_path):
     rec.write_event("status", st)
     sampler = ClockSampler(rec)
     sample = sampler.sample_once()
-    assert sample["src"] in ("chronyc", "timedatectl", "adjtimex", "unknown")
+    assert sample["src"] in ("chronyc", "timedatectl", "adjtimex", "sntp", "unknown")
     rec.close()
     got = {r.stream: r for r in iter_raw(tmp_path, None, 0, 2**63 - 1)}
     assert decode_event(got["status"].data) == st
@@ -203,3 +203,27 @@ def test_frames_straddling_read_chunks(tmp_path, monkeypatch):
         st = ReadStats()
         got = [orjson.loads(r.data)["n"] for r in read_segment(seg, st)]
         assert got == list(range(n)) and not st.truncated_files and not st.bad_lines, chunk
+
+
+def test_clock_sampler_macos_sntp_fallback(monkeypatch):
+    """Darwin has no chronyc/timedatectl/adjtimex: a query-only `sntp` exchange gives the offset
+    (real macOS output line, 2026-09-25); anything unparseable degrades to src='unknown'."""
+    import dh.store.recorder as r
+
+    out = ("sntp: Exchange failed: Timeout\n"
+           "+0.034883 +/- 0.021637 time.apple.com 2620:149:a10:4000::31\n")
+    calls: list[list[str]] = []
+
+    def fake_run(args, timeout=2.0):
+        calls.append(args)
+        return out if args[0] == "sntp" else None
+
+    monkeypatch.setattr(r, "SNTP_ENABLED", True)  # tests/conftest.py disables it suite-wide
+    monkeypatch.setattr(r, "_run_cmd", fake_run)
+    monkeypatch.setattr(r, "_adjtimex", lambda: None)
+    rec = r.sample_clock()
+    assert rec["src"] == "sntp" and rec["offset_s"] == 0.034883 and rec["est_error_s"] == 0.021637
+    assert rec["synced"] is None and rec["sntp"]["server"] == "time.apple.com"
+    assert calls[-1][:3] == ["sntp", "-t", "2"] and "-s" not in calls[-1] and "-S" not in calls[-1]  # never sets the clock
+    monkeypatch.setattr(r, "_run_cmd", lambda args, timeout=2.0: None)
+    assert r.sample_clock()["src"] == "unknown"

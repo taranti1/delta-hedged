@@ -162,21 +162,31 @@ class UniverseCfg:
 class BackfillCfg:
     """Benchmark history for the fair-value warm-up (dh.models.fvmodel needs >= 1 day).
 
-    Exact call, per chunk (chunk_end = now - k * chunk_s):
+    Exact call, per chunk, newest first:
         GET <rest>/cfbenchmarks/history/values?id=BRTI&timespan=<timespan>&timestamp=<timestamp>
-    with the templates below filled from {start_ms, end_ms, start_s, end_s, span_s, span_ms}.
-    The passthrough's parameter formats are NOT in the openapi spec: verify them once with
-    scripts/smoke_kalshi.py / a manual call and adjust the templates. Ticks are down-sampled
-    to one print per ``step_s`` before feeding the EWMAs.
+    with the templates below filled from {start_ms, end_ms, start_s, end_s, span_s, span_ms,
+    start_iso, end_iso} of the chunk.
+
+    VERIFIED LIVE 2026-09-25 (docs.kalshi.com "CF Benchmarks REST Passthrough" + CF Benchmarks
+    /api/v1/history/values): ``timespan=HOUR&timestamp=<hour START, ISO ms, e.g.
+    2026-09-25T17:00:00.000Z>`` returns {"data":{"serverTime":..,"payload":[{"time":<ms>,
+    "value":"83737.50"}, ...]}}: the hour's ticks at 5 Hz (18,000 rows, ~750 kB), ascending.
+    The timestamp must be truncated to the timespan granularity (``align``: chunk boundaries at
+    multiples of chunk_s). Recent values can be delayed up to 15 min: an empty chunk ending
+    within ``recent_delay_s`` of now is skipped instead of stopping the back-fill. Each request
+    costs 50 read tokens (48 for 2 days). Ticks are down-sampled to one print per ``step_s``
+    before feeding the EWMAs.
     """
 
     enabled: bool = True
     index_id: str = "BRTI"
     days: float = 2.0
     step_s: int = 60
-    chunk_s: int = 3600
-    timespan: str = "{span_s}s"
-    timestamp: str = "{end_ms}"
+    chunk_s: int = 3600  # must equal the timespan below (HOUR = 3600 s)
+    timespan: str = "HOUR"
+    timestamp: str = "{start_iso}"
+    align: bool = True  # chunk boundaries at multiples of chunk_s (CF: timestamp truncated to the timespan)
+    recent_delay_s: float = 1800.0  # an EMPTY chunk ending this close to now is skipped, not fatal
     extra_params: dict[str, Any] = field(default_factory=dict)
     min_coverage: float = 0.9  # fraction of the requested grid that must be present
 

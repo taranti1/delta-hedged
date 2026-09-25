@@ -1,0 +1,578 @@
+{
+  "captured": "2026-09-25 prod wss://external-api-ws.kalshi.com/trade-api/ws/v2 (public market data only; no account data)",
+  "control": [
+    {
+      "type": "subscribed",
+      "id": 1,
+      "msg": {
+        "channel": "orderbook_delta",
+        "sid": 1
+      }
+    },
+    {
+      "type": "subscribed",
+      "id": 1,
+      "msg": {
+        "channel": "trade",
+        "sid": 2
+      }
+    },
+    {
+      "type": "subscribed",
+      "id": 1,
+      "msg": {
+        "channel": "ticker",
+        "sid": 3
+      }
+    },
+    {
+      "type": "ok",
+      "id": 2,
+      "sid": 2,
+      "seq": 1,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 3,
+      "sid": 2,
+      "seq": 2,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "subscribed",
+      "id": 6,
+      "msg": {
+        "channel": "market_lifecycle_v2",
+        "sid": 4
+      }
+    },
+    {
+      "type": "ok",
+      "id": 4,
+      "sid": 2,
+      "seq": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "subscribed",
+      "id": 7,
+      "msg": {
+        "channel": "cfbenchmarks_value",
+        "sid": 5
+      }
+    },
+    {
+      "type": "ok",
+      "id": 2,
+      "sid": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 5,
+      "sid": 2,
+      "seq": 4,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "subscribed",
+      "id": 8,
+      "msg": {
+        "channel": "cfbenchmarks_value_5hz",
+        "sid": 6
+      }
+    },
+    {
+      "type": "ok",
+      "id": 2,
+      "sid": 1,
+      "seq": 1,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 3,
+      "sid": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 4,
+      "sid": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 5,
+      "sid": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 3,
+      "sid": 1,
+      "seq": 2,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 4,
+      "sid": 1,
+      "seq": 3,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    },
+    {
+      "type": "ok",
+      "id": 5,
+      "sid": 1,
+      "seq": 4,
+      "msg": {
+        "market_tickers": [
+          "KXBTC-26SEP2516-B74250",
+          "KXBTC-26SEP2516-B74350",
+          "KXBTC-26SEP2516-B74450"
+        ]
+      },
+      "_note": "market_tickers truncated to 3 of the real list"
+    }
+  ],
+  "snapshot": {
+    "type": "orderbook_snapshot",
+    "sid": 1,
+    "seq": 5,
+    "msg": {
+      "market_ticker": "KXBTC-26SEP2516-B74250",
+      "market_id": "ef0ce114-eb71-419d-9563-c670d1859d5d",
+      "no_dollars_fp": [
+        [
+          "0.0100",
+          "33338.00"
+        ],
+        [
+          "0.0200",
+          "5.00"
+        ],
+        [
+          "0.0300",
+          "5.00"
+        ],
+        [
+          "0.0400",
+          "17.00"
+        ],
+        [
+          "0.0500",
+          "5.00"
+        ],
+        [
+          "0.0600",
+          "2.00"
+        ],
+        [
+          "0.0700",
+          "2.00"
+        ],
+        [
+          "0.0800",
+          "2.00"
+        ],
+        [
+          "0.0900",
+          "2.00"
+        ],
+        [
+          "0.1000",
+          "3335.00"
+        ],
+        [
+          "0.1200",
+          "2.00"
+        ],
+        [
+          "0.1300",
+          "4.00"
+        ],
+        [
+          "0.1400",
+          "2.00"
+        ],
+        [
+          "0.1600",
+          "2.00"
+        ],
+        [
+          "0.1800",
+          "2.00"
+        ],
+        [
+          "0.2100",
+          "1.00"
+        ],
+        [
+          "0.2400",
+          "1.00"
+        ],
+        [
+          "0.2800",
+          "1.00"
+        ],
+        [
+          "0.3000",
+          "1114.00"
+        ],
+        [
+          "0.3100",
+          "4.00"
+        ],
+        [
+          "0.3400",
+          "3.00"
+        ],
+        [
+          "0.3500",
+          "3.00"
+        ],
+        [
+          "0.3600",
+          "2.00"
+        ],
+        [
+          "0.3700",
+          "3.00"
+        ],
+        [
+          "0.3900",
+          "2.00"
+        ],
+        [
+          "0.4100",
+          "3.00"
+        ],
+        [
+          "0.4400",
+          "1.00"
+        ],
+        [
+          "0.4600",
+          "2.00"
+        ],
+        [
+          "0.4800",
+          "1.00"
+        ],
+        [
+          "0.4900",
+          "2.00"
+        ],
+        [
+          "0.5000",
+          "666.00"
+        ],
+        [
+          "0.5100",
+          "1.00"
+        ],
+        [
+          "0.5200",
+          "1.00"
+        ],
+        [
+          "0.5500",
+          "1.00"
+        ],
+        [
+          "0.5600",
+          "2.00"
+        ],
+        [
+          "0.5800",
+          "1.00"
+        ],
+        [
+          "0.6100",
+          "1.00"
+        ],
+        [
+          "0.6500",
+          "1.00"
+        ],
+        [
+          "0.6600",
+          "1.00"
+        ],
+        [
+          "0.7000",
+          "477.00"
+        ],
+        [
+          "0.7100",
+          "1.00"
+        ],
+        [
+          "0.7600",
+          "2.00"
+        ],
+        [
+          "0.8000",
+          "416.00"
+        ],
+        [
+          "0.8100",
+          "2.00"
+        ],
+        [
+          "0.8500",
+          "1.00"
+        ],
+        [
+          "0.8600",
+          "1.00"
+        ],
+        [
+          "0.9000",
+          "371.00"
+        ],
+        [
+          "0.9100",
+          "1.00"
+        ],
+        [
+          "0.9500",
+          "350.00"
+        ],
+        [
+          "0.9600",
+          "2.00"
+        ],
+        [
+          "0.9900",
+          "17336.00"
+        ]
+      ]
+    }
+  },
+  "delta_same_market": {
+    "type": "orderbook_delta",
+    "sid": 1,
+    "seq": 41076,
+    "msg": {
+      "market_ticker": "KXBTC-26SEP2516-B74250",
+      "market_id": "ef0ce114-eb71-419d-9563-c670d1859d5d",
+      "price_dollars": "0.9600",
+      "delta_fp": "-2.00",
+      "side": "no",
+      "ts": "2026-09-25T19:13:44.342537Z",
+      "ts_ms": 1790363624342
+    }
+  },
+  "trade": {
+    "type": "trade",
+    "sid": 2,
+    "seq": 5,
+    "msg": {
+      "trade_id": "0723be0d-f459-a1b0-00f7-ff8e033dd61d",
+      "market_ticker": "KXBTC15M-26SEP251515-15",
+      "yes_price_dollars": "0.9840",
+      "no_price_dollars": "0.0160",
+      "count_fp": "148.78",
+      "taker_side": "yes",
+      "taker_outcome_side": "yes",
+      "taker_book_side": "bid",
+      "is_block_trade": false,
+      "ts": 1790363592,
+      "ts_ms": 1790363592101
+    }
+  },
+  "ticker": {
+    "type": "ticker",
+    "sid": 3,
+    "msg": {
+      "market_id": "746902ed-fc6e-4836-8ac7-e376cf837663",
+      "market_ticker": "KXBTCD-26SEP2516-T83399.99",
+      "price_dollars": "0.9900",
+      "yes_bid_dollars": "0.9900",
+      "yes_ask_dollars": "1.0000",
+      "volume_fp": "7950.52",
+      "open_interest_fp": "7333.62",
+      "dollar_volume": 3975,
+      "dollar_open_interest": 3666,
+      "yes_bid_size_fp": "1046.00",
+      "yes_ask_size_fp": "0.00",
+      "last_trade_size_fp": "0.99",
+      "ts": 1790363592,
+      "ts_ms": 1790363592125,
+      "time": "2026-09-25T19:13:12.125735Z"
+    }
+  },
+  "lifecycle_settled": {
+    "type": "market_lifecycle_v2",
+    "sid": 4,
+    "seq": 1,
+    "msg": {
+      "market_ticker": "KXTTELITEMATCH-26SEP251445RWIFDA-FDA",
+      "settled_ts": 1790363638,
+      "event_type": "settled"
+    }
+  },
+  "lifecycle_created": {
+    "type": "market_lifecycle_v2",
+    "sid": 4,
+    "seq": 23,
+    "msg": {
+      "market_ticker": "KXAFCONTOTAL-26SEP25MLICPV-7",
+      "exchange_index": 0,
+      "open_ts": 1790363733,
+      "close_ts": 1790535600,
+      "additional_metadata": {
+        "name": "Over 6.5 goals scored",
+        "title": "Will over 6.5 goals be scored?",
+        "yes_sub_title": "Over 6.5 goals scored",
+        "no_sub_title": "Over 6.5 goals scored",
+        "rules_primary": "If over 6.5 goals are scored in the Mali vs Cape Verde professional AFCON Qualifiers soccer game originally scheduled for Sep 25, 2026 after 90 minutes plus stoppage time (does not include extra time or penalties), then the market resolves to Yes.",
+        "rules_secondary": "Kalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with the Governing League. All trademarks, logos, and brand names are the property of their respective owners.",
+        "can_close_early": true,
+        "event_ticker": "KXAFCONTOTAL-26SEP25MLICPV",
+        "expected_expiration_ts": 1790384400,
+        "strike_type": "greater",
+        "floor_strike": 6.5
+      },
+      "event_type": "created",
+      "price_level_structure": "linear_cent",
+      "price_ranges": [
+        {
+          "start": "0.0000",
+          "end": "1.0000",
+          "step": "0.0100"
+        }
+      ]
+    }
+  },
+  "cf_1hz_first": {
+    "type": "cfbenchmarks_value",
+    "sid": 5,
+    "seq": 1,
+    "msg": {
+      "index_id": "BRTI",
+      "received_at": 1790363593053,
+      "data": "{\"type\":\"value\",\"time\":1790363593000,\"id\":\"BRTI\",\"value\":\"84018.87\"}",
+      "avg_60s_data": {
+        "value": "84018.87000000",
+        "window_size": 0,
+        "window_start_ts_ms": 1790363533000,
+        "window_end_ts_exclusive": 1790363593000
+      }
+    }
+  },
+  "cf_1hz_quarter_hour": {
+    "type": "cfbenchmarks_value",
+    "sid": 5,
+    "seq": 49,
+    "msg": {
+      "index_id": "BRTI",
+      "received_at": 1790363641073,
+      "data": "{\"type\":\"value\",\"time\":1790363641000,\"id\":\"BRTI\",\"value\":\"84033.39\"}",
+      "avg_60s_data": {
+        "value": "84023.75645833",
+        "window_size": 48,
+        "window_start_ts_ms": 1790363581000,
+        "window_end_ts_exclusive": 1790363641000
+      },
+      "last_60s_windowed_average_15min": {
+        "value": "84033.39000000",
+        "window_size": 1,
+        "window_start_ts_ms": 1790363640000,
+        "window_end_ts_exclusive": 1790363641000
+      }
+    }
+  },
+  "cf_5hz": {
+    "type": "cfbenchmarks_value_5hz",
+    "sid": 6,
+    "seq": 1,
+    "msg": {
+      "index_id": "BRTI",
+      "value_usd": "84017.28000000",
+      "source_ts_ms": 1790363592200,
+      "received_at": 1790363592237,
+      "data": "{\"type\":\"value\",\"time\":1790363592200,\"id\":\"BRTI\",\"value\":\"84017.28\"}"
+    }
+  }
+}

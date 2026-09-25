@@ -75,7 +75,7 @@ def _setup(tmp_path, mode: str, *, forbid_writes: bool):
         venue=VenueCfg(positions_interval_s=0.0, queue_positions_interval_s=0.0, fills_backfill_interval_s=0.0,
                        cancel_all_hold_s=0.3),
         universe=UniverseCfg(horizon_s=7200.0, discovery_interval_s=3600.0),
-        backfill=BackfillCfg(days=2.0, chunk_s=12 * 3600),
+        backfill=BackfillCfg(days=2.0, chunk_s=12 * 3600, timespan="{span_s}s", timestamp="{end_ms}", align=False),
     )
     scfg = load_config(REPO / "config" / "m1.yaml")
     # max_tau_s covers the chosen expiry at any minute of the hour (10 min .. 70 min away)

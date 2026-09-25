@@ -4,6 +4,12 @@ index, the DVOL volatility index, and BTC option tickers for the nearest expirie
 ASSUMED WIRE FORMAT (docs.deribit.com API v2 "Subscriptions" and "public/get_instruments";
 verify live with ``python scripts/smoke_feeds.py --venues deribit,deribit_options``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, no credentials): book/ticker/trades/index/dvol on
+BTC-PERPETUAL and option tickers (~100 instruments). Trade "direction" IS the taker side:
+0.94-0.98 consistent when compared with the book in EXCHANGE-TIME order. In arrival order
+it looks inverted (0.07-0.42) because trades.*.100ms batches arrive after the book/ticker
+notification that already reflects the sweep; replay/features must order by exchange time.
+
   endpoint   wss://www.deribit.com/ws/api/v2
   requests   {"jsonrpc":"2.0","id":N,"method":"public/subscribe","params":{"channels":[...]}}
              {"jsonrpc":"2.0","id":N,"method":"public/set_heartbeat","params":{"interval":30}}

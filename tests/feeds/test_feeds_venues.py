@@ -78,7 +78,8 @@ def test_coinbase():
     trades = of_type(ev, ExtTrade)
     # snapshot trades are history; duplicate id 812345672 emitted once
     assert [t.trade_id for t in trades] == ["812345672", "812345673"]
-    assert [t.aggressor for t in trades] == ["buy", "sell"]
+    # 'side' is the MAKER side (verified live 2026-09-25): BUY -> seller-initiated
+    assert [t.aggressor for t in trades] == ["sell", "buy"]
     gaps = [e for e in ev if isinstance(e, FeedStatus) and e.status == "gap"]
     assert len(gaps) == 1 and gaps[0].stream == "coinbase.book:BTC-USD" and "7 -> 9" in gaps[0].detail
     assert st.stats["deltas_suppressed"] == 2

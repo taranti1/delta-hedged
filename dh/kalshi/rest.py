@@ -82,6 +82,10 @@ class ResponseLostError(TransportError):
     """Timeout / disconnect after the request may have been sent: outcome unknown."""
 
 
+class ReadOnlyViolation(KalshiError):
+    """A write (non-GET) was attempted on a client created with ``read_only=True``."""
+
+
 class KalshiPaginationError(KalshiError):
     """Cursor pagination misbehaved (repeated cursor, page limit exceeded)."""
 
@@ -230,8 +234,12 @@ class KalshiRest:
         clock_ns: Callable[[], int] = time.time_ns,
         cf_history_path: str = DEFAULT_CF_HISTORY_PATH,
         trust_env: bool = True,
+        read_only: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        # read_only: every non-GET/HEAD request raises ReadOnlyViolation BEFORE anything is
+        # signed or sent (recorder, smoke checks and research tools never write).
+        self.read_only = read_only
         self.signer = signer
         self.limiter = limiter
         self.on_raw = on_raw
@@ -294,6 +302,8 @@ class KalshiRest:
         timeout_s: float,
         n_items: int = 1,
     ) -> HttpResponse:
+        if self.read_only and method.upper() not in ("GET", "HEAD"):
+            raise ReadOnlyViolation(f"{method} {path} refused: this client is read-only")
         if self.limiter is not None:
             await self.limiter.acquire(method, path, n_items)
         headers = {"Accept": "application/json", **self.cfg.extra_headers}
@@ -367,6 +377,8 @@ class KalshiRest:
         n_items: int = 1,
     ) -> dict[str, Any] | UnknownOutcome:
         """Non-idempotent request, never retried. See module docstring for outcomes."""
+        if self.read_only:
+            raise ReadOnlyViolation(f"{method} {path} refused: this client is read-only")
         try:
             resp = await self._send(method, path, params, json_body, stream, self.cfg.write_timeout_s, n_items)
         except NotSentError:

@@ -144,18 +144,36 @@ def evaluate(p: Probe, seconds: float, args: argparse.Namespace, median_mid: flo
     else:
         checks.append(Check("checksum", NA))
 
-    tr = BookTracker(track_kalshi=False)
-    trades_ok = trades_n = 0
+    def aggressor_score(order: list[Event]) -> tuple[int, int]:
+        tr_ = BookTracker(track_kalshi=False)
+        ok_ = n_ = 0
+        for e in order:
+            if isinstance(e, ExtTrade):
+                b = tr_.books.get((e.venue, e.symbol))
+                top = b.top() if b is not None and b.valid else None
+                bbo = tr_.bbo.get((e.venue, e.symbol))
+                mid = top.mid if top is not None else (0.5 * (bbo.bid + bbo.ask) if bbo is not None else None)
+                if mid is not None and e.aggressor:
+                    n_ += 1
+                    if (e.aggressor == "buy" and e.price >= mid) or (e.aggressor == "sell" and e.price <= mid):
+                        ok_ += 1
+            tr_.on_event(e)
+        return ok_, n_
+
+    trades_ok, trades_n = aggressor_score(ev)
+    agg_order = "arrival order"
+    # Venues that batch trades (Deribit trades.*.100ms) deliver them AFTER the book update that
+    # already reflects them: in arrival order a buy sweep is compared with the post-trade book.
+    # When every book/trade event carries an exchange timestamp, also score in exchange-time
+    # order (trade before same-timestamp book updates) and keep the better ordering.
+    market = [e for e in ev if isinstance(e, (ExtTrade, ExtBookSnapshot, ExtBookDelta, ExtBBO))]
+    if market and all(getattr(e, "ts_exch", 0) > 0 for e in market):
+        by_exch = sorted(market, key=lambda e: (e.ts_exch, 0 if isinstance(e, ExtTrade) else 1))
+        ok2, n2 = aggressor_score(by_exch)
+        if n2 and (not trades_n or ok2 / n2 > trades_ok / trades_n):
+            trades_ok, trades_n, agg_order = ok2, n2, "exchange-time order"
+    tr = BookTracker(track_kalshi=False)  # final books (arrival order) for the top-of-book check
     for e in ev:
-        if isinstance(e, ExtTrade):
-            b = tr.books.get((e.venue, e.symbol))
-            top = b.top() if b is not None and b.valid else None
-            bbo = tr.bbo.get((e.venue, e.symbol))
-            mid = top.mid if top is not None else (0.5 * (bbo.bid + bbo.ask) if bbo is not None else None)
-            if mid is not None and e.aggressor:
-                trades_n += 1
-                if (e.aggressor == "buy" and e.price >= mid) or (e.aggressor == "sell" and e.price <= mid):
-                    trades_ok += 1
         tr.on_event(e)
     tob: list[str] = []
     res = PASS if not options_feed else NA
@@ -195,7 +213,7 @@ def evaluate(p: Probe, seconds: float, args: argparse.Namespace, median_mid: flo
     if trades_n:
         score = trades_ok / trades_n
         ares = PASS if score >= 0.8 else (WARN if score >= 0.5 or trades_n < 20 else FAIL)
-        checks.append(Check("aggressor", ares, f"{score:.2f} of {trades_n} trades consistent with the book"))
+        checks.append(Check("aggressor", ares, f"{score:.2f} of {trades_n} trades consistent with the book ({agg_order})"))
     else:
         checks.append(Check("aggressor", NA, "no trades with a valid book"))
 

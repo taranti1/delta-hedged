@@ -47,7 +47,7 @@ def make_rest(lcfg: Any) -> Any:
     from dh.kalshi.rest import KalshiRest
 
     kc = load_config(_resolve(lcfg.kalshi_config) if lcfg.kalshi_config else None, env=lcfg.kalshi_env or None)
-    return KalshiRest(kc.rest_url, kc.signer(), kc.limiter(), **kc.rest_kwargs())
+    return KalshiRest(kc.rest_url, kc.signer(), kc.limiter(), read_only=True, **kc.rest_kwargs())  # tools never write
 
 
 # ============================================================================ commands

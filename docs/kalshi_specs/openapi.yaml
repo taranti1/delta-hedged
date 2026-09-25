@@ -1,7 +1,7 @@
 openapi: 3.0.0
 info:
   title: Kalshi Trade API Manual Endpoints
-  version: 3.30.0
+  version: 3.31.0
   description: Manually defined OpenAPI spec for endpoints being migrated to spec-first approach
 
 servers:
@@ -398,7 +398,7 @@ paths:
         | min_created_ts, max_created_ts | `unopened`, `open`, *empty* | |
         | min_close_ts, max_close_ts | `closed`, *empty* | |
         | min_settled_ts, max_settled_ts | `settled`, *empty* | |
-        | min_updated_ts | *empty* | Incompatible with all filters besides `mve_filter=exclude`. May be combined with `series_ticker`, which requires `mve_filter=exclude` |
+        | min_updated_ts, max_updated_ts | *empty* | Incompatible with all filters besides `mve_filter=exclude`. May be combined with `series_ticker`, which requires `mve_filter=exclude` |
 
         Markets that settled before the historical cutoff are only available via `GET /historical/markets`. See [Historical Data](https://docs.kalshi.com/getting_started/historical_data) for details.
 
@@ -412,6 +412,7 @@ paths:
         - $ref: '#/components/parameters/MinCreatedTsQuery'
         - $ref: '#/components/parameters/MaxCreatedTsQuery'
         - $ref: '#/components/parameters/MinUpdatedTsQuery'
+        - $ref: '#/components/parameters/MaxUpdatedTsQuery'
         - $ref: '#/components/parameters/MaxCloseTsQuery'
         - $ref: '#/components/parameters/MinCloseTsQuery'
         - $ref: '#/components/parameters/MinSettledTsQuery'
@@ -1808,13 +1809,16 @@ paths:
     get:
       operationId: GetPositions
       summary: Get Positions
-      description: 'Restricts the positions to those with any of following fields with non-zero values, as a comma separated list. The following values are accepted: position, total_traded'
+      description: |
+        Restricts the positions to those with any of following fields with non-zero values, as a comma separated list. The following values are accepted: position, total_traded.
+        Registered partners may also use a user OAuth access token with the explicitly granted read::compliance_partner scope.
       tags:
         - portfolio
       security:
         - kalshiAccessKey: []
           kalshiAccessSignature: []
           kalshiAccessTimestamp: []
+        - kalshiOauthAccessToken: []
       parameters:
         - $ref: '#/components/parameters/PositionsCursorQuery'
         - $ref: '#/components/parameters/PositionsLimitQuery'
@@ -1955,6 +1959,7 @@ paths:
       summary: Get Fills
       description: |
         Endpoint for getting all fills for the member. A fill is when a trade you have is matched.
+        Registered partners may also use a user OAuth access token with the explicitly granted read::compliance_partner scope.
         Fills that occurred before the historical cutoff are only available via `GET /historical/fills`. See [Historical Data](https://docs.kalshi.com/getting_started/historical_data) for details.
       tags:
         - portfolio
@@ -1962,6 +1967,7 @@ paths:
         - kalshiAccessKey: []
           kalshiAccessSignature: []
           kalshiAccessTimestamp: []
+        - kalshiOauthAccessToken: []
       parameters:
         - $ref: '#/components/parameters/TickerQuery'
         - $ref: '#/components/parameters/OrderIdQuery'
@@ -2718,7 +2724,7 @@ paths:
     post:
       operationId: CreateApiKey
       summary: Create API Key
-      description: ' Endpoint for creating a new API key with a user-provided public key.  This endpoint allows users with Premier or Market Maker API usage levels to create API keys by providing their own RSA public key. The platform will use this public key to verify signatures on API requests.'
+      description: ' Endpoint for creating a new API key with a user-provided public key.  This endpoint allows users with Premier or Market Maker API usage levels to create API keys by providing their own RSA or Ed25519 public key in PEM format. The platform will use this public key to verify signatures on API requests: RSA-PSS with SHA-256 for RSA keys, Ed25519 for Ed25519 keys.'
       tags:
         - api-keys
       security:
@@ -2753,7 +2759,7 @@ paths:
     post:
       operationId: GenerateApiKey
       summary: Generate API Key
-      description: ' Endpoint for generating a new API key with an automatically created key pair.  This endpoint generates both a public and private RSA key pair. The public key is stored on the platform, while the private key is returned to the user and must be stored securely. The private key cannot be retrieved again.'
+      description: ' Endpoint for generating a new API key with an automatically created key pair.  This endpoint generates a key pair of the requested key_type (RSA when omitted). The public key is stored on the platform, while the private key is returned to the user and must be stored securely. The private key cannot be retrieved again.'
       tags:
         - api-keys
       security:
@@ -3619,6 +3625,38 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /fcm/fills:
+    get:
+      operationId: GetFCMFills
+      summary: Get FCM Fills
+      description: |
+        Returns fills across the authenticated FCM's subtraders. Requires FCM member access.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/MinTsQuery'
+        - $ref: '#/components/parameters/MaxTsQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+      responses:
+        '200':
+          description: Fills retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetFcmFillsResponse'
+        '400':
+          description: Bad request
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden - requires an unrestricted FCM member API key
+        '500':
+          description: Internal server error
+
   /fcm/orders:
     get:
       operationId: GetFCMOrders
@@ -3627,6 +3665,9 @@ paths:
         Endpoint for FCM members to get orders for their subtraders.
         This endpoint requires FCM member access level. At least one of `subtrader_id` or
         `client_order_ids` is required; supplying both returns only the orders matching both filters.
+        API keys bound to a single FCM subtrader may also call this endpoint: `subtrader_id` may be
+        omitted and defaults to the key's bound subtrader, and if supplied it must equal the bound
+        subtrader or the request is rejected.
       tags:
         - fcm
       security:
@@ -3636,7 +3677,7 @@ paths:
       parameters:
         - name: subtrader_id
           in: query
-          description: Restricts the response to orders for a specific subtrader (FCM members only). Required unless client_order_ids is supplied.
+          description: Restricts the response to orders for a specific subtrader (FCM members only). Required unless client_order_ids is supplied. For an API key bound to a subtrader, defaults to the bound subtrader when omitted and must equal it when supplied.
           schema:
             type: string
             x-go-type-skip-optional-pointer: true
@@ -3685,12 +3726,41 @@ paths:
           description: Bad request
         '401':
           description: Unauthorized
+        '403':
+          description: Forbidden - the API key is bound to a different FCM subtrader
         '404':
           description: Not found
         '500':
           description: Internal server error
 
   /fcm/subtraders:
+    get:
+      operationId: ListFCMSubtraders
+      summary: List FCM Subtraders
+      description: |
+        Lists the authenticated FCM's event-contract subtraders, including accounts with
+        no trades. Exchange metadata is asynchronous, so newly created accounts may not
+        appear immediately. Trading block status includes firm-wide and Kalshi restrictions;
+        fcm_trading_blocked identifies the FCM's own per-subtrader restriction.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Event-contract subtraders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListFCMSubtradersResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
     post:
       operationId: CreateFCMSubtrader
       summary: Create FCM Subtrader
@@ -3742,6 +3812,9 @@ paths:
         reservations persist for as long as their orders remain open, including across the reset.
         Returns 404 when the subtrader has no cap configured — in that state every order placed
         through the subtrader's bound API keys is rejected.
+        API keys bound to a single FCM subtrader may also call this endpoint: `subtrader_id` may be
+        omitted and defaults to the key's bound subtrader, and if supplied it must equal the bound
+        subtrader or the request is rejected.
       tags:
         - fcm
       security:
@@ -3751,10 +3824,10 @@ paths:
       parameters:
         - name: subtrader_id
           in: query
-          required: true
-          description: The subtrader whose daily cap should be returned. Must belong to the requesting FCM.
+          description: The subtrader whose daily cap should be returned. Must belong to the requesting FCM. Required unless the API key is bound to a subtrader, in which case it defaults to the bound subtrader when omitted and must equal it when supplied.
           schema:
             type: string
+            x-go-type-skip-optional-pointer: true
       responses:
         '200':
           description: Daily cap retrieved successfully
@@ -3849,6 +3922,82 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /fcm/subtraders/blocked_categories:
+    get:
+      operationId: GetFCMSubtraderBlockedCategories
+      summary: Get FCM Subtrader Blocked Categories
+      description: |
+        Returns the event categories an FCM member has blocked for one of its
+        subtraders. The subtrader must belong to the requesting FCM. A subtrader
+        with no blocks returns an empty list.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - name: subtrader_id
+          in: query
+          required: true
+          description: The subtrader whose blocked categories should be returned. Must belong to the requesting FCM.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Blocked categories retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetFCMSubtraderBlockedCategoriesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      operationId: UpdateFCMSubtraderBlockedCategories
+      summary: Update FCM Subtrader Blocked Categories
+      description: |
+        Adds one event category to, or removes one from, the set an FCM member
+        has blocked for one of its subtraders. The subtrader must belong to the
+        requesting FCM. Blocks apply prospectively: new orders the subtrader
+        places through its bound API credentials are rejected in markets whose
+        event belongs to a blocked category, while orders already resting are
+        not cancelled. Returns the subtrader's full resulting blocked set.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFCMSubtraderBlockedCategoriesRequest'
+      responses:
+        '200':
+          description: Blocked categories updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateFCMSubtraderBlockedCategoriesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /portfolio/target_balance_allocation:
     get:
       operationId: GetTargetBalanceAllocation
@@ -3915,6 +4064,9 @@ paths:
       description: |
         Endpoint for FCM members to get market positions filtered by subtrader ID.
         This endpoint requires FCM member access level and allows filtering positions by subtrader ID.
+        API keys bound to a single FCM subtrader may also call this endpoint: `subtrader_id` may be
+        omitted and defaults to the key's bound subtrader, and if supplied it must equal the bound
+        subtrader or the request is rejected.
       tags:
         - fcm
       security:
@@ -3924,10 +4076,10 @@ paths:
       parameters:
         - name: subtrader_id
           in: query
-          required: true
-          description: Restricts the response to positions for a specific subtrader (FCM members only)
+          description: Restricts the response to positions for a specific subtrader (FCM members only). Required unless the API key is bound to a subtrader, in which case it defaults to the bound subtrader when omitted and must equal it when supplied.
           schema:
             type: string
+            x-go-type-skip-optional-pointer: true
         - name: ticker
           in: query
           description: Ticker of desired positions
@@ -3974,6 +4126,8 @@ paths:
           description: Bad request
         '401':
           description: Unauthorized
+        '403':
+          description: Forbidden - the API key is bound to a different FCM subtrader
         '404':
           description: Not found
         '500':
@@ -4058,19 +4212,24 @@ paths:
     get:
       operationId: GetFillsHistorical
       summary: Get Historical Fills
-      description: ' Endpoint for getting all historical fills for the member. A fill is when a trade you have is matched.'
+      description: |
+        Endpoint for getting all historical fills for the member. A fill is when a trade you have is matched.
+        API keys restricted to a subaccount return only that subaccount's fills. If supplied, `subaccount` must match the key's restriction.
+        Registered partners may also use a user OAuth access token with the explicitly granted read::compliance_partner scope.
       tags:
         - historical
       security:
         - kalshiAccessKey: []
           kalshiAccessSignature: []
           kalshiAccessTimestamp: []
+        - kalshiOauthAccessToken: []
       parameters:
         - $ref: '#/components/parameters/TickerQuery'
         - $ref: '#/components/parameters/MinTsQuery'
         - $ref: '#/components/parameters/MaxTsQuery'
         - $ref: '#/components/parameters/LimitQuery'
         - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/SubaccountQuery'
       responses:
         '200':
           description: Fills retrieved successfully
@@ -4091,7 +4250,9 @@ paths:
     get:
       operationId: GetHistoricalOrders
       summary: Get Historical Orders
-      description:  ' Endpoint for getting orders that have been archived to the historical database.'
+      description: |
+        Endpoint for getting orders that have been archived to the historical database.
+        API keys restricted to a subaccount return only that subaccount's orders. If supplied, `subaccount` must match the key's restriction.
       tags:
         - historical
       security:
@@ -4104,6 +4265,7 @@ paths:
         - $ref: '#/components/parameters/MaxTsQuery'
         - $ref: '#/components/parameters/LimitQuery'
         - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/SubaccountQuery'
       responses:
         '200':
           description: Historical orders retrieved successfully
@@ -4227,6 +4389,10 @@ paths:
 
 components:
   securitySchemes:
+    kalshiOauthAccessToken:
+      type: http
+      scheme: bearer
+      description: User OAuth access token with read::compliance_partner, issued to an explicitly authorized partner. Accepted only on current and historical fills and current portfolio positions endpoints; generic read and partner client-credentials tokens do not grant access.
     kalshiAccessKey:
       type: apiKey
       in: header
@@ -4236,7 +4402,7 @@ components:
       type: apiKey
       in: header
       name: KALSHI-ACCESS-SIGNATURE
-      description: RSA-PSS signature of the request
+      description: Base64 signature of the pre-sign text (timestamp + method + path) made with the API key's algorithm - RSA-PSS with SHA-256 for RSA keys, Ed25519 for Ed25519 keys
     kalshiAccessTimestamp:
       type: apiKey
       in: header
@@ -4551,7 +4717,15 @@ components:
     MinUpdatedTsQuery:
       name: min_updated_ts
       in: query
-      description: Return markets with metadata updated later than this Unix timestamp. Tracks non-trading changes only. Incompatible with any other filters except mve_filter=exclude. May be combined with series_ticker, which requires mve_filter=exclude.
+      description: Return markets with metadata updated later than this Unix timestamp (in seconds). Tracks non-trading changes only. May be combined with max_updated_ts and mve_filter=exclude. May also be combined with series_ticker, which requires mve_filter=exclude. Incompatible with other filters.
+      schema:
+        type: integer
+        format: int64
+
+    MaxUpdatedTsQuery:
+      name: max_updated_ts
+      in: query
+      description: Return markets with metadata updated at or before this Unix timestamp (in seconds). Tracks non-trading changes only. May be combined with min_updated_ts and mve_filter=exclude. May also be combined with series_ticker, which requires mve_filter=exclude. Incompatible with other filters.
       schema:
         type: integer
         format: int64
@@ -4804,9 +4978,15 @@ components:
 
     ApiKeyScope:
       type: string
-      enum: ['read', 'write', 'read::block_trade_accept', 'read::portfolio_balance', 'write::trade', 'write::transfer', 'write::block_trade_accept']
-      x-enum-varnames: ['ApiKeyScopeRead', 'ApiKeyScopeWrite', 'ApiKeyScopeReadBlockTradeAccept', 'ApiKeyScopeReadPortfolioBalance', 'ApiKeyScopeWriteTrade', 'ApiKeyScopeWriteTransfer', 'ApiKeyScopeWriteBlockTradeAccept']
-      description: Scope granted to an API key. Parent scopes grant broad access; for example, `read` grants all read endpoints and `write` grants all write endpoints. Child scopes such as `read::block_trade_accept`, `read::portfolio_balance`, `write::trade`, `write::transfer`, and `write::block_trade_accept` grant only their specific endpoint group and can be granted without the parent scope.
+      enum: ['read', 'write', 'read::block_trade_accept', 'read::portfolio_balance', 'write::trade', 'write::transfer', 'write::fcm_risk', 'write::block_trade_accept']
+      x-enum-varnames: ['ApiKeyScopeRead', 'ApiKeyScopeWrite', 'ApiKeyScopeReadBlockTradeAccept', 'ApiKeyScopeReadPortfolioBalance', 'ApiKeyScopeWriteTrade', 'ApiKeyScopeWriteTransfer', 'ApiKeyScopeWriteFCMRisk', 'ApiKeyScopeWriteBlockTradeAccept']
+      description: Scope granted to an API key. Parent scopes grant broad access; for example, `read` grants all read endpoints and `write` grants all write endpoints. Child scopes such as `read::block_trade_accept`, `read::portfolio_balance`, `write::trade`, `write::transfer`, `write::fcm_risk` (FCM subtrader creation, trading blocks, daily premium caps, and margin caps), and `write::block_trade_accept` grant only their specific endpoint group and can be granted without the parent scope.
+
+    ApiKeyType:
+      type: string
+      enum: ['rsa', 'ed25519']
+      x-enum-varnames: ['ApiKeyTypeRsa', 'ApiKeyTypeEd25519']
+      description: Signature algorithm of an API key pair. `rsa` - 2048-bit RSA; requests are signed with RSA-PSS SHA-256. `ed25519` - Ed25519 (RFC 8032) signatures over the same pre-sign text, with lower client-side signing cost. Defaults to `rsa` when omitted from a generate request, for compatibility with existing clients.
 
     ApiKey:
       type: object
@@ -4864,7 +5044,7 @@ components:
           description: Name for the API key. This helps identify the key's purpose
         public_key:
           type: string
-          description: RSA public key in PEM format. This will be used to verify signatures on API requests
+          description: RSA or Ed25519 public key in PEM format (`-----BEGIN PUBLIC KEY-----`). This will be used to verify signatures on API requests - RSA-PSS with SHA-256 for RSA keys, Ed25519 for Ed25519 keys
         scopes:
           type: array
           description: List of scopes to grant to the API key. If the broad `write` parent scope is included, `read` must also be included. Child scopes may be granted without the broad parent scope. Defaults to full access (`read`, `write`) if not provided.
@@ -4877,7 +5057,7 @@ components:
           description: If set, restricts the API key to a single sub-account (0-63) that you own. A restricted key may only read and trade on that sub-account; it cannot act on other sub-accounts, transfer funds between sub-accounts, or create sub-accounts. Omit to leave the key unrestricted. Mutually exclusive with fcm_subtrader_id.
         fcm_subtrader_id:
           type: string
-          description: FCM members only. If set, binds the API key to a single FCM subtrader that you own, spelled {your_user_id}_{suffix} with a suffix of 1-16 lowercase alphanumeric characters. The subtrader must already exist. A bound key is the institution's trading credential for that subtrader - FIX order-entry and market-data sessions, plus margin WebSocket sessions scoped to the subtrader's own data - and is denied on every REST endpoint, including key management. Mutually exclusive with subaccount.
+          description: FCM members only. If set, binds the API key to a single FCM subtrader that you own, spelled {your_user_id}_{suffix} with a suffix of 1-16 case-sensitive ASCII alphanumeric characters. The subtrader must already exist. A bound key is the institution's trading credential for that subtrader - FIX order-entry and market-data sessions, plus margin WebSocket sessions scoped to the subtrader's own data - and is denied on every REST endpoint, including key management. Mutually exclusive with subaccount.
 
     CreateApiKeyResponse:
       type: object
@@ -4900,6 +5080,8 @@ components:
         name:
           type: string
           description: Name for the API key. This helps identify the key's purpose
+        key_type:
+          $ref: '#/components/schemas/ApiKeyType'
         scopes:
           type: array
           description: List of scopes to grant to the API key. If the broad `write` parent scope is included, `read` must also be included. Child scopes may be granted without the broad parent scope. Defaults to full access (`read`, `write`) if not provided.
@@ -4912,7 +5094,7 @@ components:
           description: If set, restricts the API key to a single sub-account (0-63) that you own. A restricted key may only read and trade on that sub-account; it cannot act on other sub-accounts, transfer funds between sub-accounts, or create sub-accounts. Omit to leave the key unrestricted. Mutually exclusive with fcm_subtrader_id.
         fcm_subtrader_id:
           type: string
-          description: FCM members only. If set, binds the API key to a single FCM subtrader that you own, spelled {your_user_id}_{suffix} with a suffix of 1-16 lowercase alphanumeric characters. The subtrader must already exist. A bound key is the institution's trading credential for that subtrader - FIX order-entry and market-data sessions, plus margin WebSocket sessions scoped to the subtrader's own data - and is denied on every REST endpoint, including key management. Mutually exclusive with subaccount.
+          description: FCM members only. If set, binds the API key to a single FCM subtrader that you own, spelled {your_user_id}_{suffix} with a suffix of 1-16 case-sensitive ASCII alphanumeric characters. The subtrader must already exist. A bound key is the institution's trading credential for that subtrader - FIX order-entry and market-data sessions, plus margin WebSocket sessions scoped to the subtrader's own data - and is denied on every REST endpoint, including key management. Mutually exclusive with subaccount.
 
     GenerateApiKeyResponse:
       type: object
@@ -4923,9 +5105,11 @@ components:
         api_key_id:
           type: string
           description: Unique identifier for the newly generated API key
+        key_type:
+          $ref: '#/components/schemas/ApiKeyType'
         private_key:
           type: string
-          description: RSA private key in PEM format. This must be stored securely and cannot be retrieved again after this response
+          description: Private key in PEM format - PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`) for `rsa`, PKCS#8 (`-----BEGIN PRIVATE KEY-----`) for `ed25519`. This must be stored securely and cannot be retrieved again after this response
         warning:
           type: string
           nullable: true
@@ -6723,6 +6907,12 @@ components:
         cursor:
           type: string
 
+    OutcomeSide:
+      type: string
+      enum: ['yes', 'no']
+      x-enum-varnames: ['OutcomeSideYes', 'OutcomeSideNo']
+      description: Outcome side.
+
     Fill:
       type: object
       required:
@@ -6772,8 +6962,7 @@ components:
           description: |
             Deprecated. Use `outcome_side` (or `book_side`) instead. See [Order direction](/getting_started/order_direction). This field will not be removed before May 14, 2026.
         outcome_side:
-          type: string
-          enum: ['yes', 'no']
+          $ref: '#/components/schemas/OutcomeSide'
           description: |
             The outcome side this fill positioned the user for. buy-yes and sell-no produce 'yes'; buy-no and sell-yes produce 'no'.
 
@@ -6815,6 +7004,56 @@ components:
           format: int64
           description: Unix timestamp when this fill was executed (legacy field name)
 
+    FcmFill:
+      type: object
+      required:
+        - fill_id
+        - exchange_index
+        - ticker
+        - taker_outcome_side
+        - count_fp
+        - yes_price_dollars
+      properties:
+        fill_id:
+          type: string
+          description: Fill ID.
+        exchange_index:
+          $ref: '#/components/schemas/ExchangeIndex'
+        ticker:
+          type: string
+          description: Market ticker.
+        taker_outcome_side:
+          $ref: '#/components/schemas/OutcomeSide'
+          description: Taker outcome side. The maker has the opposite outcome.
+        count_fp:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Filled contract count.
+        yes_price_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: YES price in dollars.
+        created_time:
+          type: string
+          format: date-time
+          description: Fill execution time.
+        maker_order_id:
+          type: string
+          description: Maker order ID when owned by the FCM.
+        maker_subtrader_id:
+          type: string
+          description: Maker subtrader ID when owned by the FCM.
+        maker_fee_cost:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Maker fee in dollars when owned by the FCM.
+        taker_order_id:
+          type: string
+          description: Taker order ID when owned by the FCM.
+        taker_subtrader_id:
+          type: string
+          description: Taker subtrader ID when owned by the FCM.
+        taker_fee_cost:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Taker fee in dollars when owned by the FCM.
+
     GetFillsResponse:
       type: object
       required:
@@ -6825,6 +7064,19 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Fill'
+        cursor:
+          type: string
+
+    GetFcmFillsResponse:
+      type: object
+      required:
+        - fills
+        - cursor
+      properties:
+        fills:
+          type: array
+          items:
+            $ref: '#/components/schemas/FcmFill'
         cursor:
           type: string
 
@@ -6875,6 +7127,44 @@ components:
           $ref: '#/components/schemas/StructuredTarget'
 
     # Order Group schemas
+    FCMSubtrader:
+      type: object
+      required:
+        - subtrader_id
+        - exchange_indices
+        - trading_blocked
+        - fcm_trading_blocked
+        - propagation_pending
+      properties:
+        subtrader_id:
+          type: string
+          description: Full subtrader identifier owned by the authenticated FCM.
+        exchange_indices:
+          type: array
+          description: Exchange indices where this subtrader has been observed.
+          items:
+            type: integer
+            format: int32
+        trading_blocked:
+          type: boolean
+          description: Effective trading block, including firm-wide and Kalshi restrictions.
+        fcm_trading_blocked:
+          type: boolean
+          description: Whether an FCM-owned per-subtrader trading block is configured.
+        propagation_pending:
+          type: boolean
+          description: Whether a configured per-subtrader block is awaiting engine application.
+
+    ListFCMSubtradersResponse:
+      type: object
+      required:
+        - subtraders
+      properties:
+        subtraders:
+          type: array
+          items:
+            $ref: '#/components/schemas/FCMSubtrader'
+
     CreateFCMSubtraderRequest:
       type: object
       required:
@@ -6882,7 +7172,7 @@ components:
       properties:
         subtrader_suffix:
           type: string
-          description: Suffix for the new subtrader, 1-16 lowercase alphanumeric characters ([a-z0-9]). The full subtrader id becomes {your_account_id}_{suffix}.
+          description: Suffix for the new subtrader, 1-16 case-sensitive ASCII alphanumeric characters ([A-Za-z0-9]). The full subtrader id becomes {your_account_id}_{suffix}.
 
     CreateFCMSubtraderResponse:
       type: object
@@ -6929,6 +7219,45 @@ components:
         limit:
           $ref: '#/components/schemas/FixedPointDollars'
 
+    GetFCMSubtraderBlockedCategoriesResponse:
+      type: object
+      required:
+        - categories
+      properties:
+        categories:
+          type: array
+          description: The event categories blocked for the subtrader, sorted ascending. Empty when no categories are blocked.
+          items:
+            type: string
+
+    UpdateFCMSubtraderBlockedCategoriesRequest:
+      type: object
+      required:
+        - subtrader_id
+        - category
+        - blocked
+      properties:
+        subtrader_id:
+          type: string
+          description: The subtrader whose blocked categories should be updated. Must belong to the requesting FCM.
+        category:
+          type: string
+          description: A single event category to add to or remove from the blocked set, 1-100 characters (e.g. "Politics").
+        blocked:
+          type: boolean
+          description: True adds the category to the blocked set; false removes it. Removing a category that is not blocked is a no-op.
+
+    UpdateFCMSubtraderBlockedCategoriesResponse:
+      type: object
+      required:
+        - categories
+      properties:
+        categories:
+          type: array
+          description: The subtrader's full resulting blocked set, sorted ascending.
+          items:
+            type: string
+
     EmptyResponse:
       type: object
       description: An empty response body
@@ -6973,10 +7302,11 @@ components:
 
     RestingMarginReservation:
       type: string
-      enum: [max, sum]
-      x-enum-varnames: [RestingMarginReservationMax, RestingMarginReservationSum]
+      enum: [none, max, sum]
+      x-enum-varnames: [RestingMarginReservationNone, RestingMarginReservationMax, RestingMarginReservationSum]
       description: |
-        Collateral an automatic rebalance leaves behind for resting orders. `max` reserves the
+        Collateral an automatic rebalance leaves behind for resting orders. `none` reserves no
+        collateral for resting orders. `max` reserves the
         largest single market-side commitment. `sum` reserves the summed margin of every resting order.
 
     GetTargetBalanceAllocationResponse:
@@ -7009,7 +7339,7 @@ components:
             - $ref: '#/components/schemas/RestingMarginReservation'
           description: Defaults to `sum` when omitted.
           x-oapi-codegen-extra-tags:
-            validate: omitempty,oneof=max sum
+            validate: omitempty,oneof=none max sum
           x-go-type-skip-optional-pointer: true
 
     IntraExchangeInstanceTransferRequest:
@@ -9052,10 +9382,15 @@ components:
           description: Full title of the event.
         collateral_return_type:
           type: string
-          description: Specifies how collateral is returned when markets settle (e.g., 'binary' for standard yes/no markets).
+          description: |
+            Collateral-return netting type for this event: `MECNET` for mutually exclusive markets, `DIRECNET` for directional netting, or an empty string for no collateral-return netting.
+            Netting applies within this event, not across all events in its series, and also requires netting to be enabled for the trading account or subtrader.
+            Use `with_nested_markets=true` to retrieve the markets associated with each event.
         mutually_exclusive:
           type: boolean
-          description: If true, only one market in this event can resolve to 'yes'. If false, multiple markets can resolve to 'yes'.
+          description: |
+            True when `collateral_return_type` is `MECNET`: at most one market in this event can resolve to 'yes'.
+            False for both `DIRECNET` and an empty collateral-return type. A false value does not mean collateral-return netting is unavailable. Use `collateral_return_type` to distinguish these cases.
         category:
           type: string
           description: Event category (deprecated, use series-level category instead).
@@ -9463,12 +9798,6 @@ components:
         previous_price_dollars:
           $ref: '#/components/schemas/FixedPointDollars'
           description: Price for the last traded YES contract on this market a day ago in dollars
-        liquidity_dollars:
-          allOf:
-            - $ref: '#/components/schemas/FixedPointDollars'
-          deprecated: true
-          x-go-type-skip-optional-pointer: true
-          description: 'DEPRECATED: This field is deprecated and will always return "0.0000".'
         settlement_value_dollars:
           $ref: '#/components/schemas/FixedPointDollars'
           nullable: true

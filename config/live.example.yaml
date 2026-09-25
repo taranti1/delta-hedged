@@ -1,6 +1,7 @@
 # Live / paper runner configuration (dh.live.config.load_live_config). Copy to
 # config/live.yaml and edit. Unknown keys are errors. No secrets in here: the Kalshi key id and
-# private-key PATH come from the environment (KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH), see
+# private-key PATH come from the environment (KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH, or the
+# names/env file set in config/kalshi.yaml auth.*), see
 # config/kalshi.example.yaml and docs/RUNBOOK.md.
 #
 # Strategy parameters (sizes, limits, timers) are NOT here: they live in config/m1.yaml.
@@ -104,12 +105,15 @@ backfill:                      # fair-value warm-up (>= 1 day needed; 2 days at 
   index_id: BRTI
   days: 2.0
   step_s: 60
-  chunk_s: 3600
+  chunk_s: 3600                # = the timespan (HOUR)
   # GET /cfbenchmarks/history/values?id=BRTI&timespan=<timespan>&timestamp=<timestamp>
-  # placeholders: {start_ms} {end_ms} {start_s} {end_s} {span_s} {span_ms}. The passthrough's
-  # formats are undocumented: confirm once against the live API and adjust.
-  timespan: "{span_s}s"
-  timestamp: "{end_ms}"
+  # placeholders: {start_ms} {end_ms} {start_s} {end_s} {span_s} {span_ms} {start_iso} {end_iso}.
+  # VERIFIED LIVE 2026-09-25: timespan=HOUR & timestamp=<hour START, ISO ms "...T17:00:00.000Z">
+  # -> that hour's BRTI ticks at 5 Hz. CF requires the timestamp truncated to the timespan: align.
+  timespan: "HOUR"
+  timestamp: "{start_iso}"
+  align: true
+  recent_delay_s: 1800         # CF publishes history with up to 15 min delay: empty newest chunk skipped
   extra_params: {}
   min_coverage: 0.9
 

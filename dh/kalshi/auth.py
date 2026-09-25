@@ -134,4 +134,5 @@ class KalshiSigner:
         )
 
     def __repr__(self) -> str:
-        return f"KalshiSigner(key_id={self.key_id!r}, key=<redacted>)"
+        # the key id identifies an account credential too: never shown
+        return "KalshiSigner(key_id=<redacted>, key=<redacted>)"

@@ -1,0 +1,3779 @@
+openapi: 3.0.0
+info:
+  title: Kalshi Trade API Manual Endpoints
+  version: 0.0.1
+  description: Manually defined OpenAPI spec for endpoints being migrated to spec-first approach
+
+servers:
+  - url: https://external-api.kalshi.com/trade-api/v2
+    description: Production perps REST API server
+  - url: https://external-api.demo.kalshi.co/trade-api/v2
+    description: Demo perps REST API server
+
+paths:
+  /margin/fcm/subtraders:
+    post:
+      operationId: CreateMarginFCMSubtrader
+      summary: Create Margin FCM Subtrader
+      description: Endpoint for FCM members to create a margin subtrader.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMarginFCMSubtraderRequest'
+      responses:
+        '201':
+          description: Subtrader created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMarginFCMSubtraderResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/fcm/subtraders/risk_controls:
+    get:
+      operationId: GetFCMSubtraderRiskControls
+      summary: Get FCM Subtrader Risk Controls
+      description: |
+        Returns the risk controls configured for an FCM member's subtrader on the margined
+        exchange: the FCM-set initial margin caps in `risk_controls`, and the admin-set notional
+        value risk limits in `notional_limits` — one call returns the subtrader's complete limit
+        picture. A cap with neither market_ticker nor asset_class applies across all markets; the
+        remaining caps are scoped to a single market or a single asset class each. A
+        notional_limits entry without a market_ticker is the whole-subtrader (all-markets) limit;
+        the rest are per-market. Every cap or limit in scope for an order is enforced
+        independently. Markets without a cap are omitted.
+        API keys bound to a single FCM subtrader may also call this endpoint: `subtrader_id` may be
+        omitted and defaults to the key's bound subtrader, and if supplied it must equal the bound
+        subtrader or the request is rejected.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - name: subtrader_id
+          in: query
+          required: false
+          description: The subtrader whose risk controls and notional value risk limits should be returned. Must belong to the requesting FCM; newly created subtrader IDs take the form {your_account_id}_{suffix}, and any subtrader ID of yours (including legacy UUID-form IDs) is accepted. Required unless the API key is bound to a subtrader, in which case it defaults to the bound subtrader when omitted and must equal it when supplied.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+        - name: market_ticker
+          in: query
+          required: false
+          description: Restricts the response to the cap scoped to this market when supplied.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+        - name: asset_class
+          in: query
+          required: false
+          description: Restricts the response to the cap scoped to this asset class when supplied. Mutually exclusive with market_ticker.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+            enum: [Crypto, Equities, Metals]
+      responses:
+        '200':
+          description: Risk controls retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetFCMSubtraderRiskControlsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      operationId: UpdateFCMSubtraderRiskControls
+      summary: Update FCM Subtrader Risk Controls
+      description: Sets the initial margin cap for an FCM member's subtrader on the margined exchange.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFCMSubtraderRiskControlsRequest'
+      responses:
+        '200':
+          description: Risk controls updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteFCMSubtraderRiskControls
+      summary: Delete FCM Subtrader Risk Controls
+      description: Removes the initial margin cap for an FCM member's subtrader on the margined exchange.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - name: subtrader_id
+          in: query
+          required: true
+          description: The subtrader whose initial margin cap should be removed. Must belong to the requesting FCM.
+          schema:
+            type: string
+        - name: market_ticker
+          in: query
+          required: false
+          description: Scopes the initial margin cap removal to this market when supplied.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+        - name: asset_class
+          in: query
+          required: false
+          description: Scopes the initial margin cap removal to this asset class when supplied. Mutually exclusive with market_ticker.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+            enum: [Crypto, Equities, Metals]
+      responses:
+        '200':
+          description: Risk controls deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/fcm/notional_risk_limit:
+    put:
+      operationId: UpdateFCMNotionalRiskLimit
+      summary: Update FCM Notional Risk Limit
+      description: |
+        Sets the calling FCM member's own account-level notional value risk limit on the margined
+        exchange. The limit is stored separately from the limit Kalshi administration sets on the
+        same account; the exchange accepts any value and always enforces the smaller of the two,
+        so this value can tighten but never raise the effective limit. As a courtesy, a value
+        above the current Kalshi-set limit is rejected with a 400 naming that ceiling — a larger
+        value would never govern. Lowering the limit cancels resting orders until the account is
+        back within it, exactly like an administrative lowering.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFCMNotionalRiskLimitRequest'
+      responses:
+        '200':
+          description: Notional risk limit updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteFCMNotionalRiskLimit
+      summary: Delete FCM Notional Risk Limit
+      description: |
+        Clears the calling FCM member's own account-level notional value risk limit on the
+        margined exchange. Any limit Kalshi administration has set on the account remains in
+        force; clearing the member-set value never cancels resting orders, since it can only
+        raise the effective limit.
+      tags:
+        - fcm
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Notional risk limit deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /account/limits/perps:
+    get:
+      operationId: GetPerpsAccountApiLimits
+      summary: Get Perps Account API Limits
+      description: ' Endpoint to retrieve the Perps (margin) API tier limits associated with the authenticated user.'
+      tags:
+        - account
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Perps account API tier limits retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetAccountApiLimitsResponse'
+        '401':
+          description: Unauthorized
+        '500':
+          description: Internal server error
+
+  /margin/exchange/status:
+    get:
+      operationId: GetMarginExchangeStatus
+      summary: Get Exchange Status
+      description: 'Endpoint for getting the margin exchange status.'
+      tags:
+        - exchange
+      responses:
+        '200':
+          description: Margin exchange status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExchangeStatus'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExchangeStatus'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExchangeStatus'
+        '504':
+          description: Gateway timeout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExchangeStatus'
+
+  /margin/risk_parameters:
+    get:
+      operationId: GetMarginRiskParameters
+      summary: Get Risk Parameters
+      description: 'Returns system-wide margin risk parameters including liquidation thresholds and per-market initial margin multipliers.'
+      tags:
+        - risk
+      responses:
+        '200':
+          description: Margin risk parameters retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginRiskParametersResponse'
+
+  /margin/orders:
+    get:
+      operationId: GetMarginOrders
+      summary: Get Orders
+      description: 'Endpoint for listing margin orders with optional filtering.'
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/TickerQuery'
+        - $ref: '#/components/parameters/MinTsQuery'
+        - $ref: '#/components/parameters/MaxTsQuery'
+        - $ref: '#/components/parameters/StatusQuery'
+        - $ref: '#/components/parameters/MarginOrdersLimitQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/SubaccountQuery'
+      responses:
+        '200':
+          description: Orders retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginOrdersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      operationId: CreateMarginOrder
+      summary: Create Order
+      description: Endpoint for submitting orders in a market.
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMarginOrderRequest'
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMarginOrderResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      operationId: CancelAllMarginOrders
+      summary: Cancel All Orders
+      description: Cancels all resting margin orders for the authenticated Direct member. If `subaccount` is omitted, matching orders may come from any subaccount. If it is provided, only orders for that subaccount are eligible. Newly placed orders may also be cancelled during the minute after the request.
+      x-mint:
+        content: |
+          <Note>
+          **Rate limit:** 10 tokens per request, the same cost as cancelling one margin order. See `GET /trade-api/v2/account/endpoint_costs` for current non-default endpoint costs.
+          </Note>
+      tags:
+        - orders
+      parameters:
+        - $ref: '#/components/parameters/SubaccountQuery'
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '204':
+          description: All matching resting margin orders were cancelled
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/orders/{order_id}:
+    get:
+      operationId: GetMarginOrder
+      summary: Get Order
+      description: Endpoint for retrieving a specific margin order.
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: Order retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginOrderResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      operationId: CancelMarginOrder
+      summary: Cancel Order
+      description: Endpoint for canceling an order. Cancels all remaining resting contracts and returns the canceled order details.
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      responses:
+        '200':
+          description: Order cancelled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelMarginOrderResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/orders/{order_id}/decrease:
+    post:
+      operationId: DecreaseMarginOrder
+      summary: Decrease Order
+      description: Endpoint for decreasing the number of contracts in an existing order. Exactly one of `reduce_by` or `reduce_to` must be provided. Canceling an order is equivalent to decreasing to zero.
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecreaseMarginOrderRequest'
+      responses:
+        '200':
+          description: Order decreased successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecreaseMarginOrderResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/orders/{order_id}/amend:
+    post:
+      operationId: AmendMarginOrder
+      summary: Amend Order
+      description: Endpoint for amending the price and/or max number of fillable contracts in an existing margin order.
+      x-mint:
+        content: |
+          <Note>
+          Amending a resting order preserves queue position only when the amendment decreases size. All other amendments — like increasing size or changing price forfeit queue position and place the order at the back of the queue.
+          </Note>
+      tags:
+        - orders
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AmendMarginOrderRequest'
+      responses:
+        '200':
+          description: Order amended successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmendMarginOrderResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/markets:
+    get:
+      operationId: GetMarginMarkets
+      summary: Get Markets
+      description: Endpoint for listing available margin markets.
+      tags:
+        - market
+      parameters:
+        - in: query
+          name: status
+          required: false
+          schema:
+            $ref: '#/components/schemas/MarginMarketStatus'
+          x-go-type-skip-optional-pointer: true
+          description: Filter by market status (e.g. active, inactive, closed)
+      responses:
+        '200':
+          description: Markets retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginMarketsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/markets/{ticker}:
+    get:
+      operationId: GetMarginMarket
+      summary: Get Market
+      description: Endpoint for fetching a margin market with trading stats (price, volume, open interest).
+      tags:
+        - market
+      parameters:
+        - in: path
+          name: ticker
+          required: true
+          schema:
+            type: string
+          description: Ticker of the market
+      responses:
+        '200':
+          description: Market retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarginMarketResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/markets/{ticker}/orderbook:
+    get:
+      operationId: GetMarginMarketOrderbook
+      summary: Get Market Orderbook
+      description: Endpoint for getting the orderbook for a margin market.
+      tags:
+        - market
+      parameters:
+        - in: path
+          name: ticker
+          required: true
+          schema:
+            type: string
+          description: Ticker of the market
+        - name: depth
+          in: query
+          description: Depth of the orderbook to retrieve (0 means all levels)
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: aggregation_tick_size
+          in: query
+          description: Tick size in dollars for aggregating price levels (e.g., 0.10 for 10 cent buckets)
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Orderbook retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarginOrderbookResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/markets/{ticker}/candlesticks:
+    get:
+      operationId: GetMarginMarketCandlesticks
+      summary: Get Market Candlesticks
+      description: Endpoint for fetching candlestick data for a margin market.
+      tags:
+        - market
+      parameters:
+        - in: path
+          name: ticker
+          required: true
+          schema:
+            type: string
+          description: Ticker of the margin market
+        - name: start_ts
+          in: query
+          required: true
+          description: Start timestamp (Unix timestamp). Candlesticks will include those ending on or after this time.
+          schema:
+            type: integer
+            format: int64
+        - name: end_ts
+          in: query
+          required: true
+          description: End timestamp (Unix timestamp). Candlesticks will include those ending on or before this time.
+          schema:
+            type: integer
+            format: int64
+        - name: period_interval
+          in: query
+          required: true
+          description: Time period length of each candlestick in minutes. Valid values are 1 (1 minute), 60 (1 hour), or 1440 (1 day).
+          schema:
+            type: integer
+            enum: [1, 60, 1440]
+          x-oapi-codegen-extra-tags:
+            validate: "required,oneof=1 60 1440"
+        - name: include_latest_before_start
+          in: query
+          required: false
+          description: |
+            If true, prepends the latest candlestick available before the start_ts. This synthetic candlestick is created by:
+            1. Finding the most recent real candlestick before start_ts
+            2. Projecting it forward to the first period boundary (calculated as the next period interval after start_ts)
+            3. Setting all OHLC prices to null, and `price.previous` to the close price from the real candlestick
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Candlesticks retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginMarketCandlesticksResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/fills:
+    get:
+      operationId: GetMarginFills
+      summary: Get Fills
+      description: |
+        Endpoint for retrieving the authenticated user's margin fills.
+        Registered partners may also use a user OAuth access token with the explicitly granted read::compliance_partner scope.
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+        - kalshiOauthAccessToken: []
+      parameters:
+        - name: subaccount
+          in: query
+          required: false
+          description: Subaccount number (0 for primary, 1-63 for subaccounts)
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: Number of results per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          x-go-type-skip-optional-pointer: true
+        - name: cursor
+          in: query
+          required: false
+          description: Pagination cursor from a previous response
+          schema:
+            type: string
+          x-go-type-skip-optional-pointer: true
+        - name: min_ts
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Filter fills after this Unix timestamp
+        - name: max_ts
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Filter fills before this Unix timestamp
+      responses:
+        '200':
+          description: Fills retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginFillsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/positions:
+    get:
+      operationId: GetMarginPositions
+      summary: Get Positions
+      description: |
+        Endpoint for retrieving the authenticated user's margin positions.
+        Registered partners may also use a user OAuth access token with the explicitly granted read::compliance_partner scope.
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+        - kalshiOauthAccessToken: []
+      parameters:
+        - name: subaccount
+          in: query
+          required: false
+          description: Subaccount number (0 for primary, 1-63 for subaccounts)
+          schema:
+            type: integer
+        - name: ticker
+          in: query
+          required: false
+          description: Filter positions by market ticker
+          schema:
+            type: string
+          x-go-type-skip-optional-pointer: true
+      responses:
+        '200':
+          description: Positions retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginPositionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/trades:
+    get:
+      operationId: GetMarginTrades
+      summary: Get Trades
+      description: 'Endpoint for retrieving public margin trades for a given market ticker. Returns a paginated response. Use the cursor value from the previous response to get the next page.'
+      tags:
+        - market
+      parameters:
+        - name: ticker
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Market ticker to retrieve trades for
+        - name: limit
+          in: query
+          required: false
+          description: Number of results per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          x-go-type-skip-optional-pointer: true
+        - name: cursor
+          in: query
+          required: false
+          description: Pagination cursor from a previous response
+          schema:
+            type: string
+          x-go-type-skip-optional-pointer: true
+        - name: min_ts
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Filter trades after this Unix timestamp
+        - name: max_ts
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Filter trades before this Unix timestamp
+      responses:
+        '200':
+          description: Trades retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginTradesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/enabled:
+    get:
+      operationId: GetMarginEnabled
+      summary: Get Enabled Status
+      description: Endpoint for checking if margin trading is enabled for the authenticated user.
+      tags:
+        - exchange
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Margin enabled status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarginEnabledResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/notional_risk_limit:
+    get:
+      operationId: GetMarginNotionalRiskLimit
+      summary: Get Notional Risk Limit
+      description: |
+        Endpoint for retrieving the notional value risk limits for the authenticated margin user.
+        Direct members and FCM members may read their own account's limits. For an FCM member the
+        account-level limit covers the whole omnibus account: exposure across all client accounts
+        is aggregated against it.
+      tags:
+        - risk
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Notional risk limit retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotionalRiskLimitResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/balance:
+    get:
+      operationId: GetMarginBalance
+      summary: Get Balance
+      description: 'Endpoint for retrieving the balance breakdown for the authenticated direct margin user. Returns cash balance (aggregate and per-subaccount), position value, total balance, and maintenance margin requirement.'
+      x-mint:
+        content: |
+          <Note>
+          **Rate limit:** 5 tokens per request, or 50 tokens when `compute_available_balance=true` (the available-balance computation scans all resting orders). See `GET /trade-api/v2/account/endpoint_costs` for current non-default endpoint costs.
+          </Note>
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - name: compute_available_balance
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          x-go-type-skip-optional-pointer: true
+          description: 'When true, computes available_balance per subaccount at an increased rate limit cost. Available balance is 0 when the flag is false or omitted.'
+      responses:
+        '200':
+          description: Margin balance retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginBalanceResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/risk:
+    get:
+      operationId: GetMarginRisk
+      summary: Get Risk
+      description: 'Endpoint for retrieving leverage and liquidation price data for the authenticated direct margin user. Returns account-level leverage plus per-position leverage and liquidation prices, grouped by subaccount and market.'
+      tags:
+        - risk
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Margin risk data retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginRiskResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/fee_tiers:
+    get:
+      operationId: GetMarginFeeTiers
+      summary: Get Fee Tiers
+      description: 'Endpoint for retrieving the effective margin fee rates for the authenticated direct margin user. Returns maps of margin market tickers to maker and taker fee rates as decimal fractions; no tier numbers are returned. Use Get Fee Tier Rates for the fee schedule itself.'
+      tags:
+        - fees
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Fee tiers retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginFeeTiersResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/fee_tier_rates:
+    get:
+      operationId: GetMarginFeeTierRates
+      summary: Get Fee Tier Rates
+      description: 'Returns the fee schedule that applies to the authenticated margin-enabled account, as tier numbers with maker and taker fee rates ordered from the entry tier upward.'
+      tags:
+        - fees
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '200':
+          description: Fee tier rates retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginFeeTierRatesResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          description: The account is not margin-enabled or no fee schedule applies to it
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/funding_history:
+    get:
+      operationId: GetMarginFundingHistory
+      summary: Get Funding History
+      description: 'Endpoint for retrieving the authenticated user''s historical margin funding payments joined with funding rates for a specific market, or across all markets when ticker is empty, over an inclusive UTC date range.'
+      tags:
+        - funding
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - name: ticker
+          in: query
+          required: false
+          description: Market ticker for funding history. Leave empty to query across all markets.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+        - name: start_date
+          in: query
+          required: true
+          description: Inclusive UTC start date for funding history range (YYYY-MM-DD format)
+          schema:
+            type: string
+            format: date
+            x-go-type-skip-optional-pointer: true
+            x-oapi-codegen-extra-tags:
+              validate: required
+        - name: end_date
+          in: query
+          required: true
+          description: Inclusive UTC end date for funding history range (YYYY-MM-DD format)
+          schema:
+            type: string
+            format: date
+            x-go-type-skip-optional-pointer: true
+            x-oapi-codegen-extra-tags:
+              validate: required
+        - $ref: '#/components/parameters/SubaccountQuery'
+      responses:
+        '200':
+          description: Funding history retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginFundingHistoryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/funding_rates/historical:
+    get:
+      operationId: GetMarginHistoricalFundingRates
+      summary: Get Historical Funding Rates
+      description: Endpoint for retrieving historical margin funding rates for a market, or across all markets when ticker is empty.
+      tags:
+        - funding
+      parameters:
+        - name: ticker
+          in: query
+          required: false
+          description: Market ticker. Leave empty to query across all markets.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+        - name: start_ts
+          in: query
+          required: false
+          description: Start timestamp (Unix timestamp in seconds). If omitted, defaults to the earliest available data.
+          schema:
+            type: integer
+            format: int64
+        - name: end_ts
+          in: query
+          required: false
+          description: End timestamp (Unix timestamp in seconds). If omitted, defaults to the current time.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Historical funding rates retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginHistoricalFundingRatesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/funding_rates/estimate:
+    get:
+      operationId: GetMarginFundingRateEstimate
+      summary: Get Funding Rate Estimate
+      description: |
+        Returns the estimated funding rate for the current, in-progress funding period. The value is a time-weighted average of the premium index computed over `[last_funding_time, now)`, so it continues to move as new data accumulates through the window and is only finalized at `next_funding_time`.
+      tags:
+        - funding
+      parameters:
+        - name: ticker
+          in: query
+          required: true
+          description: Market ticker
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: true
+            x-oapi-codegen-extra-tags:
+              validate: required
+      responses:
+        '200':
+          description: Funding rate estimate retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetMarginFundingRateEstimateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /portfolio/intra_exchange_instance_transfer:
+    post:
+      operationId: IntraExchangeInstanceTransfer
+      summary: Intra Account Transfer
+      description: 'Endpoint for transferring funds within the same account.'
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+        - kalshiAccessSignature: []
+        - kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IntraExchangeInstanceTransferRequest'
+      responses:
+        '200':
+          description: Transfer request accepted. The transfer is processed asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntraExchangeInstanceTransferResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /portfolio/margin/subaccounts:
+    post:
+      operationId: CreateMarginSubaccount
+      summary: Create Subaccount
+      description: 'Creates a new subaccount for the authenticated user in the margin exchange. Subaccounts are numbered sequentially starting from 1. Maximum 63 numbered subaccounts per user (64 including the primary account).'
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      responses:
+        '201':
+          description: Margin subaccount created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSubaccountResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /portfolio/margin/subaccounts/transfer:
+    post:
+      operationId: ApplyMarginSubaccountTransfer
+      summary: Transfer Between Subaccounts
+      description: 'Transfers funds between the authenticated user''s margin subaccounts. Use 0 for the primary account, or 1-63 for numbered subaccounts.'
+      tags:
+        - portfolio
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplySubaccountTransferRequest'
+      responses:
+        '200':
+          description: Transfer completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplySubaccountTransferResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups:
+    get:
+      operationId: GetMarginOrderGroups
+      summary: Get Order Groups
+      description: 'Retrieves all order groups for the authenticated user on the margin exchange.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/SubaccountQuery'
+      responses:
+        '200':
+          description: Order groups retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetOrderGroupsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups/create:
+    post:
+      operationId: CreateMarginOrderGroup
+      summary: Create Order Group
+      description: 'Creates a new order group on the margin exchange with a contracts limit measured over a rolling window. When the limit is hit, all orders in the group are cancelled and no new orders can be placed until reset.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderGroupRequest'
+      responses:
+        '201':
+          description: Order group created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderGroupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups/{order_group_id}:
+    get:
+      operationId: GetMarginOrderGroup
+      summary: Get Order Group
+      description: 'Retrieves details for a single order group on the margin exchange including all order IDs and auto-cancel status.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderGroupIdPath'
+        - $ref: '#/components/parameters/SubaccountQuery'
+      responses:
+        '200':
+          description: Order group retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetOrderGroupResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteMarginOrderGroup
+      summary: Delete Order Group
+      description: 'Deletes an order group on the margin exchange and cancels all orders within it.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderGroupIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      responses:
+        '200':
+          description: Order group deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups/{order_group_id}/reset:
+    put:
+      operationId: ResetMarginOrderGroup
+      summary: Reset Order Group
+      description: 'Resets the order group matched contracts counter to zero on the margin exchange, allowing new orders to be placed again after the limit was hit.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderGroupIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyResponse'
+      responses:
+        '200':
+          description: Order group reset successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups/{order_group_id}/trigger:
+    put:
+      operationId: TriggerMarginOrderGroup
+      summary: Trigger Order Group
+      description: 'Triggers the order group on the margin exchange, canceling all orders in the group and preventing new orders until the group is reset.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderGroupIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyResponse'
+      responses:
+        '200':
+          description: Order group triggered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/isolated/positions/{ticker}/exit_trigger:
+    put:
+      operationId: SetIsolatedMarginExitTrigger
+      summary: Set Isolated Exit Trigger
+      description: >-
+        Endpoint for setting a stop-loss / take-profit bracket or a trailing stop on the isolated
+        margin position for a market. Requires an open position, closes it in full, and fires
+        reduce-only orders.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetIsolatedExitTriggerRequest'
+      responses:
+        '200':
+          description: Exit trigger set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExitTrigger'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      operationId: GetIsolatedMarginExitTriggers
+      summary: Get Isolated Exit Triggers
+      description: >-
+        Endpoint for retrieving the live exit triggers on the isolated margin position for a
+        market.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/ExitTriggerKindQuery'
+      responses:
+        '200':
+          description: Exit triggers retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetExitTriggersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteIsolatedMarginExitTrigger
+      summary: Cancel Isolated Exit Trigger
+      description: >-
+        Endpoint for cancelling exit triggers on the isolated margin position for a market.
+        Succeeds even when nothing is live. The position itself is unaffected.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/ExitTriggerKindQuery'
+      responses:
+        '204':
+          description: Exit trigger canceled
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/cross/positions/{ticker}/exit_trigger:
+    put:
+      operationId: SetCrossMarginExitTrigger
+      summary: Set Cross Exit Trigger
+      description: >-
+        Endpoint for setting a stop-loss / take-profit bracket or a trailing stop on a
+        non-isolated margin position. A position holds one trailing stop and up to 20 brackets,
+        so long as their counts fit the position. Requires an open position unless
+        `anchor_order_id` is supplied, and fires reduce-only orders.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetCrossExitTriggerRequest'
+      responses:
+        '200':
+          description: Exit trigger set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExitTrigger'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      operationId: GetCrossMarginExitTriggers
+      summary: Get Cross Exit Triggers
+      description: >-
+        Endpoint for retrieving the live exit triggers on a non-isolated margin position.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+        - $ref: '#/components/parameters/ExitTriggerKindQuery'
+      responses:
+        '200':
+          description: Exit triggers retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetExitTriggersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteCrossMarginExitTrigger
+      summary: Cancel Cross Exit Triggers
+      description: >-
+        Endpoint for cancelling exit triggers on a non-isolated margin position, including
+        partial and order-anchored brackets. Succeeds even when nothing is live; use the
+        `{trigger_id}` route to cancel a single bracket.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+        - $ref: '#/components/parameters/ExitTriggerKindQuery'
+      responses:
+        '204':
+          description: Exit triggers canceled
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/cross/positions/{ticker}/exit_trigger/{trigger_id}:
+    put:
+      operationId: UpdateCrossMarginExitTrigger
+      summary: Update Cross Exit Trigger
+      description: >-
+        Endpoint for updating one bracket's leg prices, leaving any others on the position
+        untouched. At least one leg is required; cancel with `DELETE`. Trailing stops are not
+        addressed by id — use the collection route with `kind=trailing`.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/ExitTriggerIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateExitTriggerRequest'
+      responses:
+        '200':
+          description: Exit trigger set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExitTrigger'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      operationId: DeleteCrossMarginExitTriggerById
+      summary: Cancel Cross Exit Trigger by ID
+      description: >-
+        Endpoint for cancelling one bracket, leaving any others on the position live. Trailing
+        stops are not addressed by id — use the collection route with `kind=trailing`.
+      tags:
+        - exit-triggers
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/ExitTriggerTickerPath'
+        - $ref: '#/components/parameters/ExitTriggerIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      responses:
+        '204':
+          description: Exit trigger canceled
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /margin/order_groups/{order_group_id}/limit:
+    put:
+      operationId: UpdateMarginOrderGroupLimit
+      summary: Update Order Group Limit
+      description: 'Updates the order group contracts limit on the margin exchange. If the updated limit would immediately trigger the group, all orders in the group are canceled and the group is triggered.'
+      tags:
+        - order-groups
+      security:
+        - kalshiAccessKey: []
+          kalshiAccessSignature: []
+          kalshiAccessTimestamp: []
+      parameters:
+        - $ref: '#/components/parameters/OrderGroupIdPath'
+        - $ref: '#/components/parameters/SubaccountQueryDefaultPrimary'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderGroupLimitRequest'
+      responses:
+        '200':
+          description: Order group limit updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    kalshiOauthAccessToken:
+      type: http
+      scheme: bearer
+      description: User OAuth access token with read::compliance_partner, issued to an explicitly authorized partner. Accepted only on margin fills and margin positions in this lane; generic read and partner client-credentials tokens do not grant access.
+    kalshiAccessKey:
+      type: apiKey
+      in: header
+      name: KALSHI-ACCESS-KEY
+      description: Your API key ID
+    kalshiAccessSignature:
+      type: apiKey
+      in: header
+      name: KALSHI-ACCESS-SIGNATURE
+      description: Base64 signature of the pre-sign text (timestamp + method + path) made with the API key's algorithm - RSA-PSS with SHA-256 for RSA keys, Ed25519 for Ed25519 keys
+    kalshiAccessTimestamp:
+      type: apiKey
+      in: header
+      name: KALSHI-ACCESS-TIMESTAMP
+      description: Request timestamp in milliseconds
+  responses:
+    BadRequestError:
+      description: Bad request - invalid input
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ConflictError:
+      description: Conflict - resource already exists or cannot be modified
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ForbiddenError:
+      description: Forbidden - insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimitError:
+      description: 'Rate limit exceeded. The default cost is 10 tokens per request. Use GET /trade-api/v2/account/endpoint_costs to list non-default endpoint costs.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnauthorizedError:
+      description: Unauthorized - authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    CreateMarginFCMSubtraderRequest:
+      type: object
+      required:
+        - subtrader_suffix
+      properties:
+        subtrader_suffix:
+          type: string
+          pattern: '^[A-Za-z0-9]{1,16}$'
+          description: Suffix for the new subtrader. The full subtrader id is composed server-side as {user_id}_{subtrader_suffix}.
+
+    CreateMarginFCMSubtraderResponse:
+      type: object
+      required:
+        - subtrader_id
+      properties:
+        subtrader_id:
+          type: string
+          description: The full id of the created subtrader, in the form {user_id}_{subtrader_suffix}.
+
+    ApplySubaccountTransferRequest:
+      type: object
+      required:
+        - client_transfer_id
+        - from_subaccount
+        - to_subaccount
+        - amount_cents
+      properties:
+        client_transfer_id:
+          type: string
+          format: uuid
+          description: Unique client-provided transfer ID for idempotency.
+          x-oapi-codegen-extra-tags:
+            validate: "required"
+        from_subaccount:
+          type: integer
+          description: Source subaccount number (0 for primary, 1-63 for numbered subaccounts).
+        to_subaccount:
+          type: integer
+          description: Destination subaccount number (0 for primary, 1-63 for numbered subaccounts).
+        amount_cents:
+          type: integer
+          format: int64
+          description: Amount to transfer in cents.
+    ApplySubaccountTransferResponse:
+      type: object
+      description: Empty response indicating successful transfer.
+    CreateOrderGroupRequest:
+      type: object
+      properties:
+        subaccount:
+          type: integer
+          minimum: 0
+          description: Optional subaccount number to use for this order group (0 for primary, 1-63 for subaccounts). Subaccount-restricted API keys must omit this field or pass their locked subaccount.
+        contracts_limit:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Specifies the maximum number of contracts that can be matched within this group over a rolling 15-second window. Whole contracts only. Provide contracts_limit or contracts_limit_fp; if both provided they must match.
+          x-go-type-skip-optional-pointer: true
+          x-oapi-codegen-extra-tags:
+            validate: omitempty,gte=1
+        contracts_limit_fp:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          description: String representation of the maximum number of contracts that can be matched within this group over a rolling 15-second window. Provide contracts_limit or contracts_limit_fp; if both provided they must match.
+        exchange_index:
+          allOf:
+            - $ref: '#/components/schemas/ExchangeIndex'
+          default: 0
+          description: The market group this order group is bound to (default 0). All orders placed into this order group must be for markets whose exchange_index matches this value.
+          x-go-type-skip-optional-pointer: true
+    CreateOrderGroupResponse:
+      type: object
+      required:
+        - order_group_id
+        - subaccount
+      properties:
+        order_group_id:
+          type: string
+          description: The unique identifier for the created order group
+        subaccount:
+          type: integer
+          minimum: 0
+          description: Subaccount number that owns the created order group (0 for primary, 1-63 for subaccounts).
+          x-go-type-skip-optional-pointer: true
+        exchange_index:
+          allOf:
+            - $ref: '#/components/schemas/ExchangeIndex'
+          x-go-type-skip-optional-pointer: true
+    CreateSubaccountResponse:
+      type: object
+      required:
+        - subaccount_number
+      properties:
+        subaccount_number:
+          type: integer
+          description: The sequential number assigned to this subaccount (1-63).
+    UpdateFCMNotionalRiskLimitRequest:
+      type: object
+      required:
+        - notional_value_risk_limit
+      properties:
+        notional_value_risk_limit:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: A non-negative fixed-point US dollar amount with up to 4 decimal places. A value above the current Kalshi-set limit on the account gets a courtesy 400, since it would never govern.
+          pattern: '^[0-9]+(\.[0-9]{1,4})?$'
+          maxLength: 20
+          example: "5000.0000"
+    UpdateFCMSubtraderRiskControlsRequest:
+      type: object
+      required:
+        - subtrader_id
+        - im_cap
+      properties:
+        subtrader_id:
+          type: string
+          description: The subtrader whose initial margin cap should be updated. Must belong to the requesting FCM.
+        market_ticker:
+          type: string
+          description: Scopes the initial margin cap to this market when supplied.
+          x-go-type-skip-optional-pointer: true
+        asset_class:
+          type: string
+          description: Scopes the initial margin cap to this asset class when supplied. Mutually exclusive with market_ticker.
+          x-go-type-skip-optional-pointer: true
+          enum: [Crypto, Equities, Metals]
+        im_cap:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: A non-negative fixed-point US dollar amount with up to 4 decimal places.
+          pattern: '^[0-9]+(\.[0-9]{1,4})?$'
+          maxLength: 20
+          example: "100.0000"
+    GetFCMSubtraderRiskControlsResponse:
+      type: object
+      required:
+        - risk_controls
+        - notional_limits
+      properties:
+        risk_controls:
+          type: array
+          description: One entry per configured initial margin cap.
+          items:
+            $ref: '#/components/schemas/FCMSubtraderRiskControls'
+        notional_limits:
+          type: array
+          description: The admin-set notional value risk limits for the same subtrader as the rest of the response, sorted by market_ticker. An entry without a market_ticker is the whole-subtrader (all-markets) limit and sorts first; the rest are per-market. Set by exchange administration and read-only through this API; markets without a configured limit are omitted, and the market_ticker/asset_class filters apply only to risk_controls. Newly created subtrader IDs take the form {your_account_id}_{suffix}; legacy UUID-form subtraders are included as well.
+          items:
+            $ref: '#/components/schemas/FCMSubtraderNotionalRiskLimit'
+    FCMSubtraderRiskControls:
+      type: object
+      required:
+        - subtrader_id
+        - im_cap
+        - current_im
+      properties:
+        subtrader_id:
+          type: string
+          description: The subtrader the initial margin cap applies to.
+        market_ticker:
+          type: string
+          description: Present only on a market-scoped cap.
+          x-go-type-skip-optional-pointer: true
+        asset_class:
+          type: string
+          description: Present only on an asset-class-scoped cap. A cap with neither market_ticker nor asset_class applies across all markets.
+          x-go-type-skip-optional-pointer: true
+          enum: [Crypto, Equities, Metals]
+        im_cap:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: A non-negative fixed-point US dollar amount with up to 4 decimal places.
+          example: "100.0000"
+        current_im:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            The initial margin currently attributable to this cap's scope, in fixed-point US dollars — the value the
+            exchange compares against im_cap when admitting an order. Computed from the exchange's read model
+            (positions plus resting orders), so it excludes orders still in flight and may slightly trail the engine.
+            A market-scoped cap prices that market standalone; an asset-class cap prices the class-filtered portfolio,
+            so hedged positions within the class margin jointly rather than summing per-market.
+          example: "42.0000"
+    FCMSubtraderNotionalRiskLimit:
+      type: object
+      required:
+        - subtrader_id
+        - notional_value_risk_limit
+        - current_notional
+      properties:
+        subtrader_id:
+          type: string
+          description: The subtrader the notional value risk limit applies to.
+        market_ticker:
+          type: string
+          description: The market the notional value risk limit applies to. Absent on the whole-subtrader (all-markets) limit.
+          x-go-type-skip-optional-pointer: true
+        notional_value_risk_limit:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: The notional value risk limit as a fixed-point US dollar string with 4 decimal places.
+          example: "5000.0000"
+        current_notional:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            The notional currently consumed against this limit, in fixed-point US dollars. Per market it is the larger
+            of the subtrader's long side (position plus resting bids) and short side (position minus resting asks),
+            over the signed net position; a whole-subtrader entry carries that value summed across every market the
+            subtrader touches. Every term is priced through the market's risk-notional model, the same pricing the
+            exchange's limit check uses: the cached mark for positions and the limit price for resting orders on
+            mark-model asset classes, quantity times the fixed DV01 base on Rates. Computed from the exchange's read
+            model, so it excludes orders still in flight and may slightly trail the engine.
+          example: "1250.0000"
+    # Order Group schemas
+    EmptyResponse:
+      type: object
+      description: An empty response body
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: string
+          description: Additional details about the error, if available
+    ExchangeIndex:
+      type: integer
+      description: "Identifier for an exchange shard. Defaults to 0 if unspecified."
+      example: 0
+    ExchangeInstance:
+      type: string
+      enum: ['event_contract', 'margined']
+      description: The exchange instance type
+    BucketLimit:
+      type: object
+      description: |
+        Token-bucket budget for one rate-limit bucket. Each request deducts
+        tokens equal to its endpoint cost; the bucket refills at refill_rate
+        tokens per second up to bucket_capacity. A request is allowed if the
+        bucket holds enough tokens to cover its cost; otherwise the request
+        is rejected with HTTP 429.
+      required:
+        - refill_rate
+        - bucket_capacity
+      properties:
+        refill_rate:
+          type: integer
+          description: Tokens added to the bucket per second.
+        bucket_capacity:
+          type: integer
+          description: |
+            Maximum tokens the bucket can hold. When equal to refill_rate the
+            bucket holds one second of budget; larger values represent burst
+            headroom that idle clients accumulate and can spend in a single
+            pulse (e.g. write buckets at non-Basic tiers hold two seconds of
+            budget).
+    GetAccountApiLimitsResponse:
+      type: object
+      required:
+        - usage_tier
+        - read
+        - write
+        - grants
+      properties:
+        usage_tier:
+          type: string
+          description: User's API usage tier.
+        read:
+          $ref: '#/components/schemas/BucketLimit'
+        write:
+          $ref: '#/components/schemas/BucketLimit'
+        grants:
+          type: array
+          description: The caller's active API usage level grants across exchange lanes, where each grant applies to its exchange_instance and usage_tier reflects the effective tier for the lane reported by this endpoint.
+          items:
+            $ref: '#/components/schemas/ApiUsageLevelGrant'
+    ApiUsageLevelGrant:
+      type: object
+      required:
+        - exchange_instance
+        - level
+        - source
+      properties:
+        exchange_instance:
+          $ref: '#/components/schemas/ExchangeInstance'
+        level:
+          type: string
+          description: API usage level this grant confers (e.g. premier, paragon, prime).
+        expires_ts:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix timestamp (seconds) when the grant expires. Absent for permanent grants.
+        source:
+          type: string
+          description: 'How the grant was created: "volume" (earned from trading volume) or "manual" (assigned by Kalshi).'
+    FixedPointCount:
+      type: string
+      description: Fixed-point contract count string (2 decimals, e.g., "10.00"; referred to as "fp" in field names). Requests accept 0-2 decimal places (e.g., "10", "10.0", "10.00"); responses always emit 2 decimals. Fractional contract values (e.g., "2.50") are supported; the minimum granularity is 0.01 contracts.
+      example: "10.00"
+    ExitTriggerKind:
+      type: string
+      description: >-
+        Trigger family. `bracket` is a stop-loss / take-profit pair; `trailing` is a trailing stop
+        whose stop level ratchets with the liquidation mark.
+      enum:
+        - bracket
+        - trailing
+    ExitTriggerStatus:
+      type: string
+      description: >-
+        `pending_on_entry` awaits an initial or further fill from the anchor order before
+        arming — an order-anchored trigger returns here after closing its current quantity, so
+        this status can follow `active` and carries a non-zero `filled_count` when it does.
+        `active` is live and evaluated against the mark each tick. `filled`, `failed`, and
+        `canceled` are terminal.
+      enum:
+        - pending_on_entry
+        - active
+        - filled
+        - failed
+        - canceled
+        - unknown
+    ExitTriggerLeg:
+      type: string
+      description: Which leg of a bracket fired. Present only once a leg has fired.
+      enum:
+        - stop_loss
+        - take_profit
+    ExitTriggerReason:
+      type: string
+      description: Why the trigger reached its terminal status.
+      enum:
+        - user_canceled
+        - position_closed
+        - entry_not_filled
+        - order_rejected
+        - position_flipped
+    UpdateExitTriggerRequest:
+      type: object
+      description: >-
+        At least one leg is required and a leg you omit is cleared; cancel with `DELETE`.
+      properties:
+        stop_loss_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the stop-loss leg fires.
+        take_profit_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the take-profit leg fires.
+    SetCrossExitTriggerRequest:
+      type: object
+      description: >-
+        For `bracket`, supply `stop_loss_price` and/or `take_profit_price`. For `trailing`,
+        supply exactly one of `trail_amount` or `trail_bps`. Fields belonging to the other kind
+        are rejected, as is a body that sets neither — cancel with `DELETE`. A leg you omit is cleared.
+      properties:
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: >-
+            Contracts this trigger closes when it fires. Omit it to cover the whole position,
+            which then requires that no partial or anchored trigger already covers part of it.
+            If supplied, it must be a whole number of contracts.
+        anchor_order_id:
+          type: string
+          description: >-
+            Ties the trigger to an order: its size follows that order's cumulative fill, and it
+            stays pending until the order first fills. Bracket only; mutually exclusive with
+            `count`. If the order cannot currently be validated, the request returns `409` with
+            error code `anchor_order_unavailable` before writing anything, so retrying is safe.
+        client_trigger_id:
+          type: string
+          maxLength: 64
+          x-oapi-codegen-extra-tags:
+            validate: "omitempty,max=64"
+          description: >-
+            Your own identifier, required on a `count` or `anchor_order_id` create because those
+            append a trigger rather than replace one; rejected on every other write. Replaying a
+            key returns the trigger the first request made, in whatever state it has since
+            reached. Keys are single-use per account and belong to the position they created on:
+            reusing one returns the original even once it is `canceled`, and presenting it for
+            another subaccount or ticker returns `409` with error code
+            `idempotency_key_already_used`.
+        kind:
+          allOf:
+            - $ref: '#/components/schemas/ExitTriggerKind'
+          default: bracket
+          description: Which trigger family this write targets. Defaults to `bracket`.
+        stop_loss_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the stop-loss leg fires. Bracket only.
+        take_profit_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the take-profit leg fires. Bracket only.
+        trail_amount:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Absolute trailing distance in dollars. Trailing only; mutually exclusive with `trail_bps`.
+        trail_bps:
+          type: integer
+          minimum: 1
+          maximum: 9999
+          description: >-
+            Trailing distance in basis points of the tracked watermark (not the entry price).
+            Trailing only; mutually exclusive with `trail_amount`.
+    SetIsolatedExitTriggerRequest:
+      type: object
+      description: >-
+        For `bracket`, supply `stop_loss_price` and/or `take_profit_price`. For `trailing`,
+        supply exactly one of `trail_amount` or `trail_bps`. Fields belonging to the other kind
+        are rejected, as is a body that sets neither — cancel with `DELETE`. A leg you omit is cleared.
+      properties:
+        kind:
+          allOf:
+            - $ref: '#/components/schemas/ExitTriggerKind'
+          default: bracket
+          description: Which trigger family this write targets. Defaults to `bracket`.
+        stop_loss_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the stop-loss leg fires. Bracket only.
+        take_profit_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at which the take-profit leg fires. Bracket only.
+        trail_amount:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Absolute trailing distance in dollars. Trailing only; mutually exclusive with `trail_bps`.
+        trail_bps:
+          type: integer
+          minimum: 1
+          maximum: 9999
+          description: >-
+            Trailing distance in basis points of the tracked watermark (not the entry price).
+            Trailing only; mutually exclusive with `trail_amount`.
+    ExitTrigger:
+      type: object
+      required:
+        - id
+        - ticker
+        - kind
+        - status
+        - count
+        - filled_count
+        - created_time
+        - updated_time
+      properties:
+        id:
+          type: string
+          description: Unique identifier for this trigger.
+        ticker:
+          type: string
+          description: Market the protected position is on.
+        kind:
+          $ref: '#/components/schemas/ExitTriggerKind'
+        status:
+          $ref: '#/components/schemas/ExitTriggerStatus'
+        status_reason:
+          $ref: '#/components/schemas/ExitTriggerReason'
+        triggered_leg:
+          $ref: '#/components/schemas/ExitTriggerLeg'
+          description: Leg that fired the last time the trigger fired.
+        triggered_order_id:
+          type: string
+          description: >-
+            Order placed the last time the trigger fired. An order-anchored trigger keeps it
+            after returning to `pending_on_entry`, so its presence does not mean the trigger is
+            done.
+        anchor_order_id:
+          type: string
+          description: >-
+            Order this trigger follows, for order-anchored triggers. Cleared once that order
+            reaches a terminal state, so use `client_trigger_id` to correlate a trigger with the
+            request that made it.
+        client_trigger_id:
+          type: string
+          description: The idempotency key the create supplied, for appending creates.
+        stop_loss_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Stop-loss leg price. Bracket triggers only.
+        take_profit_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Take-profit leg price. Bracket triggers only.
+        trail_amount:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Absolute trailing distance. Trailing triggers only.
+        trail_bps:
+          type: integer
+          description: Trailing distance in basis points of the watermark. Trailing triggers only.
+        watermark_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            Most favorable liquidation mark seen since creation — the peak for long positions, the
+            trough for short. Trailing triggers only.
+        effective_stop_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            Level whose breach fires the stop: watermark minus the trail for longs, plus for
+            shorts. Trailing triggers only.
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Contracts this trigger closes when it fires. `0` means the whole position.
+        filled_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Contracts closed so far across fire attempts.
+        created_time:
+          type: string
+          format: date-time
+        updated_time:
+          type: string
+          format: date-time
+    GetExitTriggersResponse:
+      type: object
+      required:
+        - exit_triggers
+      properties:
+        exit_triggers:
+          type: array
+          description: Live triggers on this position slot. Empty when none are set.
+          items:
+            $ref: '#/components/schemas/ExitTrigger'
+    # Common schemas
+    FixedPointDollars:
+      type: string
+      description: Fixed-point US dollar string. Most request fields accept 2-4 decimal places (e.g., "0.56", "0.5600"); responses emit up to 6. Valid quote intervals for a given market are constrained by that market's price level structure.
+      example: "0.5600"
+    GetOrderGroupResponse:
+      type: object
+      required:
+        - is_auto_cancel_enabled
+        - orders
+      properties:
+        is_auto_cancel_enabled:
+          type: boolean
+          description: Whether auto-cancel is enabled for this order group
+        contracts_limit_fp:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: String representation of the current maximum contracts allowed over a rolling 15-second window.
+          x-go-type-skip-optional-pointer: true
+        orders:
+          type: array
+          items:
+            type: string
+          description: List of order IDs that belong to this order group
+          x-go-type-skip-optional-pointer: true
+        exchange_index:
+          allOf:
+            - $ref: '#/components/schemas/ExchangeIndex'
+          x-go-type-skip-optional-pointer: true
+    GetOrderGroupsResponse:
+      type: object
+      properties:
+        order_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderGroup'
+          x-go-type-skip-optional-pointer: true
+    IntraExchangeInstanceTransferRequest:
+      type: object
+      required:
+        - source
+        - destination
+        - amount
+      properties:
+        source:
+          $ref: '#/components/schemas/ExchangeInstance'
+          description: The source exchange instance
+        destination:
+          $ref: '#/components/schemas/ExchangeInstance'
+          description: The destination exchange instance
+        amount:
+          type: integer
+          format: int64
+          description: The amount to transfer in centicents
+        source_exchange_shard:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 0
+          x-go-type-skip-optional-pointer: true
+          description: Source exchange shard index (default 0)
+          x-oapi-codegen-extra-tags:
+            validate: "gte=0,lte=100"
+        destination_exchange_shard:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 0
+          x-go-type-skip-optional-pointer: true
+          description: Destination exchange shard index (default 0)
+          x-oapi-codegen-extra-tags:
+            validate: "gte=0,lte=100"
+    IntraExchangeInstanceTransferResponse:
+      type: object
+      required:
+        - transfer_id
+      properties:
+        transfer_id:
+          type: string
+          description: The ID of the transfer that was created
+    OrderGroup:
+      type: object
+      required:
+        - id
+        - is_auto_cancel_enabled
+      properties:
+        id:
+          type: string
+          description: Unique identifier for the order group
+          x-go-type-skip-optional-pointer: true
+        contracts_limit_fp:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: String representation of the current maximum contracts allowed over a rolling 15-second window.
+          x-go-type-skip-optional-pointer: true
+        is_auto_cancel_enabled:
+          type: boolean
+          description: Whether auto-cancel is enabled for this order group
+          x-go-type-skip-optional-pointer: true
+        exchange_index:
+          allOf:
+            - $ref: '#/components/schemas/ExchangeIndex'
+          x-go-type-skip-optional-pointer: true
+    # Market Orderbook schemas
+    PriceLevelDollarsCountFp:
+      type: array
+      minItems: 2
+      maxItems: 2
+      example: ["0.1500", "100.00"]
+      items:
+        type: string
+      description: Price level in dollars represented as [dollars_string, fp] where dollars_string is like "0.1500" and fp is a FixedPointCount string (fixed-point contract count). The second element is the contract quantity (not price).
+    SelfTradePreventionType:
+      type: string
+      enum: ['taker_at_cross', 'maker']
+      description: |
+        The self-trade prevention type for orders. `taker_at_cross` cancels the taker order when it would trade against another order from the same user; execution stops and any partial fills already matched are executed. `maker` cancels the resting maker order and continues matching.
+    UpdateOrderGroupLimitRequest:
+      type: object
+      properties:
+        contracts_limit:
+          type: integer
+          format: int64
+          minimum: 1
+          description: New maximum number of contracts that can be matched within this group over a rolling 15-second window. Whole contracts only. Provide contracts_limit or contracts_limit_fp; if both provided they must match.
+          x-go-type-skip-optional-pointer: true
+          x-oapi-codegen-extra-tags:
+            validate: omitempty,gte=1
+        contracts_limit_fp:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          description: String representation of the new maximum number of contracts that can be matched within this group over a rolling 15-second window. Provide contracts_limit or contracts_limit_fp; if both provided they must match.
+    ExchangeStatus:
+      type: object
+      required:
+        - exchange_active
+        - trading_active
+      properties:
+        exchange_active:
+          type: boolean
+          description: False if the exchange is no longer taking any state changes at all. True unless under maintenance.
+        trading_active:
+          type: boolean
+          description: True if trading is currently permitted on the exchange. False outside exchange hours or during pauses.
+
+    GetMarginRiskParametersResponse:
+      type: object
+      required:
+        - liquidation_margin_ratio_threshold
+        - queue_entry_margin_ratio_threshold
+        - initial_margin_multiplier
+      properties:
+        liquidation_margin_ratio_threshold:
+          type: number
+          format: double
+          description: Margin ratio at which a position is liquidated.
+        queue_entry_margin_ratio_threshold:
+          type: number
+          format: double
+          description: Margin ratio at which a position enters the liquidation queue.
+        initial_margin_multiplier:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: Map of market ticker to initial margin multiplier. The initial margin requirement is the maintenance margin multiplied by this value.
+    CreateMarginOrderRequest:
+      type: object
+      required:
+        - ticker
+        - client_order_id
+        - side
+        - count
+        - price
+        - time_in_force
+        - self_trade_prevention_type
+      properties:
+        ticker:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: required,min=1
+        client_order_id:
+          type: string
+          x-go-type-skip-optional-pointer: true
+        side:
+          $ref: '#/components/schemas/BookSide'
+          x-oapi-codegen-extra-tags:
+            validate: required,oneof=bid ask
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: String representation of the order quantity in contracts.
+        price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Price for the order in fixed-point dollars.
+          x-go-type-skip-optional-pointer: true
+        expiration_time:
+          type: integer
+          format: int64
+        time_in_force:
+          type: string
+          enum: ['fill_or_kill', 'good_till_canceled', 'immediate_or_cancel']
+          x-oapi-codegen-extra-tags:
+            validate: required,oneof=fill_or_kill good_till_canceled immediate_or_cancel
+          x-go-type-skip-optional-pointer: true
+        post_only:
+          type: boolean
+        self_trade_prevention_type:
+          allOf:
+            - $ref: '#/components/schemas/SelfTradePreventionType'
+          x-oapi-codegen-extra-tags:
+            validate: required,oneof=taker_at_cross maker
+          x-go-type-skip-optional-pointer: true
+        cancel_order_on_pause:
+          type: boolean
+          description: If this flag is set to true, the order will be canceled if the order is open and trading on the exchange is paused for any reason.
+        reduce_only:
+          type: boolean
+          description: Specifies whether the order place count should be capped by the member's current position. Orders with reduce_only set to true will be rejected unless time_in_force is immediate_or_cancel or fill_or_kill.
+        subaccount:
+          type: integer
+          minimum: 0
+          default: 0
+          description: The subaccount number to use for this margin order. 0 is the primary subaccount.
+          x-go-type-skip-optional-pointer: true
+        order_group_id:
+          type: string
+          description: The order group this order is part of
+          x-go-type-skip-optional-pointer: true
+
+    CreateMarginOrderResponse:
+      type: object
+      required:
+        - order_id
+        - fill_count
+        - remaining_count
+      properties:
+        order_id:
+          type: string
+        client_order_id:
+          type: string
+        fill_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts filled immediately upon placement.
+        remaining_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts remaining after placement. For IOC orders, this reflects the final state after unfilled contracts are canceled.
+        average_fill_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Volume-weighted average fill price. Only present when fill_count > 0.
+        average_fee_paid:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Volume-weighted average fee paid per contract for fills resulting from this request. Only present when fill_count > 0.
+
+    GetMarginOrderResponse:
+      type: object
+      required:
+        - order
+      properties:
+        order:
+          $ref: '#/components/schemas/MarginOrder'
+
+    GetMarginOrdersResponse:
+      type: object
+      required:
+        - orders
+        - cursor
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginOrder'
+        cursor:
+          type: string
+
+    MarginOrder:
+      type: object
+      required:
+        - order_id
+        - user_id
+        - client_order_id
+        - ticker
+        - side
+        - price
+        - fill_count
+        - remaining_count
+        - last_update_reason
+      properties:
+        order_id:
+          type: string
+        user_id:
+          type: string
+          description: Unique identifier for users
+        client_order_id:
+          type: string
+        ticker:
+          type: string
+        side:
+          $ref: '#/components/schemas/BookSide'
+        last_update_reason:
+          $ref: '#/components/schemas/LastUpdateReason'
+        price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Price for the order in fixed-point dollars.
+        fill_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Fixed-point contract count for filled quantity
+        remaining_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Fixed-point contract count for remaining quantity
+        expiration_time:
+          type: string
+          format: date-time
+          nullable: true
+        created_time:
+          type: string
+          format: date-time
+          nullable: true
+          x-omitempty: false
+        last_update_time:
+          type: string
+          format: date-time
+          nullable: true
+          x-omitempty: true
+          description: The last update to an order (modify, cancel, fill)
+        self_trade_prevention_type:
+          $ref: '#/components/schemas/SelfTradePreventionType'
+          nullable: true
+          x-omitempty: false
+        cancel_order_on_pause:
+          type: boolean
+          description: If this flag is set to true, the order will be canceled if the order is open and trading on the exchange is paused for any reason.
+        order_group_id:
+          type: string
+          description: The order group this order is part of
+        order_source:
+          $ref: '#/components/schemas/OrderSource'
+          description: The source of the order. Indicates whether the order was placed by the user or by the system on behalf of the user.
+        order_reason:
+          $ref: '#/components/schemas/OrderReason'
+          description: The reason for a system-generated order, when applicable.
+
+    CancelMarginOrderResponse:
+      type: object
+      required:
+        - order_id
+        - reduced_by
+      properties:
+        order_id:
+          type: string
+        client_order_id:
+          type: string
+        reduced_by:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts that were canceled (i.e. the remaining count at time of cancellation).
+
+    DecreaseMarginOrderRequest:
+      type: object
+      properties:
+        reduce_by:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          description: String representation of the number of contracts to reduce by. Exactly one of `reduce_by` or `reduce_to` must be provided.
+        reduce_to:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          description: String representation of the number of contracts to reduce to. Exactly one of `reduce_by` or `reduce_to` must be provided.
+
+    DecreaseMarginOrderResponse:
+      type: object
+      required:
+        - order_id
+        - remaining_count
+      properties:
+        order_id:
+          type: string
+        client_order_id:
+          type: string
+        remaining_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts remaining after the decrease.
+
+    AmendMarginOrderRequest:
+      type: object
+      required:
+        - ticker
+        - side
+        - price
+        - count
+      properties:
+        ticker:
+          type: string
+          description: Market ticker
+          x-oapi-codegen-extra-tags:
+            validate: required,min=1
+        side:
+          $ref: '#/components/schemas/BookSide'
+          description: Side of the order
+          x-oapi-codegen-extra-tags:
+            validate: required,oneof=bid ask
+        price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Updated price for the order in fixed-point dollars.
+          x-go-type-skip-optional-pointer: true
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: String representation of the updated quantity for the order.
+          x-go-type-skip-optional-pointer: true
+        client_order_id:
+          type: string
+          description: The original client-specified order ID to be amended
+          x-go-type-skip-optional-pointer: true
+        updated_client_order_id:
+          type: string
+          description: The new client-specified order ID after amendment
+          x-go-type-skip-optional-pointer: true
+
+    AmendMarginOrderResponse:
+      type: object
+      required:
+        - order_id
+      properties:
+        order_id:
+          type: string
+        client_order_id:
+          type: string
+        remaining_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          x-omitempty: false
+          description: Number of contracts remaining after the amend. Only present when the amend caused a fill or changed the resting size.
+        fill_count:
+          $ref: '#/components/schemas/FixedPointCount'
+          nullable: true
+          x-omitempty: false
+          description: Number of contracts filled as a result of the amend crossing the book. Only present when fills occurred or remaining size changed.
+        average_fill_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          x-omitempty: false
+          description: Volume-weighted average fill price for fills resulting from the amend. Only present when fills occurred.
+        average_fee_paid:
+          $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          x-omitempty: false
+          description: Volume-weighted average fee paid per contract for fills resulting from the amend. Only present when fills occurred.
+
+    MarginOrderbookCount:
+      type: object
+      required:
+        - bids
+        - asks
+      properties:
+        bids:
+          type: array
+          description: Bid price levels, ordered from best bid downward. Each level is [price, quantity].
+          items:
+            $ref: '#/components/schemas/PriceLevelDollarsCountFp'
+        asks:
+          type: array
+          description: Ask price levels, ordered from best ask upward. Each level is [price, quantity].
+          items:
+            $ref: '#/components/schemas/PriceLevelDollarsCountFp'
+
+    MarginOrderbookResponse:
+      type: object
+      required:
+        - orderbook
+      properties:
+        orderbook:
+          $ref: '#/components/schemas/MarginOrderbookCount'
+
+    MarginMarket:
+      type: object
+      required:
+        - ticker
+        - status
+        - title
+        - contract_size
+        - underlying_multiplier
+        - tick_size
+        - fractional_trading_enabled
+        - schedule
+        - exchange_index
+      properties:
+        ticker:
+          type: string
+        title:
+          type: string
+        exchange_index:
+          type: integer
+          description: The group of markets this market belongs to for order groups. Order groups may only reference markets whose exchange_index matches theirs.
+        contract_size:
+          type: string
+          description: Fixed-point number with 6 decimal places
+        underlying_multiplier:
+          type: string
+          description: Underlying units per contract-size unit.
+        tick_size:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Minimum price increment in dollars.
+        status:
+          $ref: '#/components/schemas/MarginMarketStatus'
+        fractional_trading_enabled:
+          type: boolean
+        leverage_estimate:
+          type: number
+          format: double
+          description: >
+            Leverage estimate (1 / margin_rate) evaluated at a small retail-sized notional position.
+            Actual leverage may be lower for larger positions as the liquidation margin rate grows with size.
+            Null when margin config or price data is unavailable.
+        leverage_estimates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: >
+            Leverage estimates (1 / margin_rate) keyed by notional position size in dollars
+            ("1000", "10000", "100000", "1000000"). Leverage decreases at larger notionals as
+            the liquidation margin rate grows with size.
+            Null when margin config or price data is unavailable.
+        long_leverage_estimates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: >
+            Leverage estimates for a long position, keyed by the same notional position sizes
+            as leverage_estimates. 
+        short_leverage_estimates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: >
+            Leverage estimates for a short position, keyed by the same notional position sizes
+            as long_leverage_estimates.
+        price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Last trade price in dollars.
+        volume:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: One sided total trade volume.
+        volume_notional_value_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Total notional value of one sided trade volume in dollars.
+        open_interest:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: One sided open interest.
+        open_interest_notional_value_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Total notional value of one sided open interest in dollars.
+        volume_24h:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: One sided trade volume in the last 24 hours.
+        volume_24h_notional_value_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Total notional value of one sided trade volume in the last 24 hours in dollars.
+        bid:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Best bid price in dollars.
+        ask:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Best ask price in dollars.
+        settlement_mark_price:
+          $ref: '#/components/schemas/TickerPrice'
+          description: Mark price used for settlement and funding.
+        liquidation_mark_price:
+          $ref: '#/components/schemas/TickerPrice'
+          description: Mark price used for liquidation.
+        reference_price:
+          $ref: '#/components/schemas/TickerPrice'
+          description: Underlying reference price, scaled per contract.
+        asset_class:
+          type: string
+          description: >
+            Asset class grouping for this market. New asset classes may be added
+            over time. Omitted when the market has no assigned class.
+        product_metadata:
+          type: object
+          additionalProperties: true
+          x-omitempty: true
+          x-go-type-skip-optional-pointer: true
+          description: Public metadata for this market.
+          example:
+            important_info:
+              markdown: "**Important information:** Review this market's trading schedule."
+        schedule:
+          $ref: '#/components/schemas/MarginMarketSchedule'
+
+    MarginMarketSchedule:
+      type: object
+      nullable: true
+      description: Current market trading schedule. Null for markets that trade 24/7.
+      required:
+        - is_open
+        - next_close_ts
+        - next_open_ts
+      properties:
+        is_open:
+          type: boolean
+          description: Whether the market is currently open for trading.
+        next_close_ts:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix timestamp in seconds for the next scheduled close. Null while closed.
+        next_open_ts:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix timestamp in seconds for the next scheduled open. Null while open.
+
+    TickerPrice:
+      type: object
+      required:
+        - price
+        - ts_ms
+      properties:
+        price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Price in dollars.
+        ts_ms:
+          type: integer
+          format: int64
+          description: Source timestamp in epoch milliseconds.
+
+    MarginMarketStatus:
+      type: string
+      enum: [inactive, active, closed]
+      description: The status of a margin market
+
+    OrderSource:
+      type: string
+      enum: ['user', 'system']
+      description: The source of the order. 'user' indicates a user-placed order, 'system' indicates a system-generated order.
+
+    OrderReason:
+      type: string
+      enum: ['liquidation', 'take_profit_stop_loss']
+      description: The reason for a system-generated order. Present for liquidation and TP/SL orders.
+
+    LastUpdateReason:
+      type: string
+      enum: ['', 'Decrease', 'Amend', 'MarginCancel', 'SelfTradeCancel', 'ExpiryCancel', 'Trade', 'PostOnlyCrossCancel']
+
+    MarginMarketResponse:
+      type: object
+      required:
+        - market
+      properties:
+        market:
+          $ref: '#/components/schemas/MarginMarket'
+
+    GetMarginMarketsResponse:
+      type: object
+      required:
+        - markets
+      properties:
+        markets:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginMarket'
+
+    GetMarginFillsResponse:
+      type: object
+      required:
+        - fills
+        - cursor
+      properties:
+        fills:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginFill'
+        cursor:
+          type: string
+
+    MarginFill:
+      type: object
+      required:
+        - fill_id
+        - order_id
+        - is_taker
+        - side
+        - count
+        - created_time
+        - ticker
+        - price
+        - entry_price
+        - fees
+        - realized_pnl
+      properties:
+        fill_id:
+          type: string
+          description: Unique identifier for the fill
+        order_id:
+          type: string
+          description: The order ID that generated this fill
+        is_taker:
+          type: boolean
+          description: Whether the user was the taker in this fill
+        side:
+          $ref: '#/components/schemas/BookSide'
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+        created_time:
+          type: string
+          format: date-time
+          description: When the fill was executed
+        ticker:
+          type: string
+          description: Market ticker symbol
+        price:
+          type: string
+          description: Fill price in fixed-point dollars
+        entry_price:
+          type: string
+          description: Position entry price used to compute incremental realized PnL for this fill
+        fees:
+          type: string
+          description: Fees paid on filled contracts, in dollars
+        realized_pnl:
+          type: string
+          description: Incremental realized PnL contributed by this fill, in fixed-point dollars
+        order_source:
+          $ref: '#/components/schemas/OrderSource'
+
+    GetMarginPositionsResponse:
+      type: object
+      required:
+        - positions
+      properties:
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginPosition'
+
+    MarginPosition:
+      type: object
+      required:
+        - subaccount
+        - market_ticker
+        - position
+        - entry_price
+        - unrealized_pnl
+        - fees
+        - is_portfolio
+      properties:
+        subaccount:
+          type: integer
+          description: The subaccount number that holds this position (0 for primary, 1-63 for subaccounts)
+        market_ticker:
+          type: string
+          description: Market ticker symbol
+        position:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Position size as a fixed-point count string (positive = long, negative = short)
+        entry_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Weighted average entry price of the open position
+        unrealized_pnl:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark-to-market unrealized PnL for the open position
+        margin_used:
+          $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Maintenance-margin-based capital usage for the open position. Null when the position shares its asset class with other portfolio-margin positions in the subaccount, since margin is then computed jointly for the group and cannot be attributed to a single market.
+        fees:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Total fees accumulated over the lifetime of the current open position, resets when position is fully closed
+        roe:
+          type: number
+          format: double
+          nullable: true
+          description: Return on equity as a percentage (unrealized_pnl / margin_used * 100). Null when margin_used is zero or not attributable to this market.
+        is_portfolio:
+          type: boolean
+          description: 'True when this position is hedged within a portfolio, so margin_used and roe cannot be attributed to it individually and are not reported.'
+
+    GetMarginTradesResponse:
+      type: object
+      required:
+        - trades
+        - cursor
+      properties:
+        trades:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginTrade'
+        cursor:
+          type: string
+
+    MarginTrade:
+      type: object
+      required:
+        - trade_id
+        - ticker
+        - count
+        - price
+        - created_time
+        - taker_side
+      properties:
+        trade_id:
+          type: string
+          description: Unique identifier for the trade
+        ticker:
+          type: string
+          description: Market ticker symbol
+        count:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts traded
+        price:
+          type: string
+          description: Trade price in dollars
+        created_time:
+          type: string
+          format: date-time
+          description: When the trade was executed
+        taker_side:
+          $ref: '#/components/schemas/BookSide'
+          description: Side of the taker in this trade
+    BookSide:
+      type: string
+      enum: ['bid', 'ask']
+      description: The side of an order or trade (bid or ask)
+
+    MarginEnabledResponse:
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: Indicates whether margin trading is enabled for the user
+
+    NotionalRiskLimitResponse:
+      type: object
+      required:
+        - default_notional_value_risk_limit
+        - notional_value_risk_limits_by_market_ticker
+        - total_current_usage
+        - current_usage_by_market_ticker
+      properties:
+        default_notional_value_risk_limit:
+          type: string
+          description: The notional value risk limit for the user as a fixed-point dollar string with 4 decimal places (e.g., "5000.0000")
+          example: "5000.0000"
+        notional_value_risk_limits_by_market_ticker:
+          type: object
+          additionalProperties:
+            type: string
+          description: Map of market_ticker to notional value risk limit as a fixed-point dollar string with 4 decimal places (e.g., "5000.0000"). If present, the market-level risk limit overrides the default notional value risk limit.
+          example:
+            "market-abc-123": "5000.0000"
+        total_current_usage:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            The account's current notional usage in fixed-point US dollars, aggregated the way the exchange checks the
+            account-level limit: per market, the larger of the long side (long positions plus resting bids) and the
+            short side (short positions plus resting asks), summed across every market the account holds positions or
+            resting orders in — for an FCM, across the whole omnibus account. Every term is priced through the
+            market's risk-notional model, the same pricing the exchange's limit check uses: the cached mark for
+            positions and the limit price for resting orders. Computed from the exchange's read model, so it excludes
+            orders still in flight and may slightly trail the engine.
+          example: "1250.0000"
+        current_usage_by_market_ticker:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            Per-market components of total_current_usage, as fixed-point US dollar strings. Entries exist only for
+            markets where the account holds positions or resting orders; like the total, values come from the
+            exchange's read model and may slightly trail the engine.
+          example:
+            "market-abc-123": "1250.0000"
+        member_notional_value_risk_limit:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            The account-level notional value risk limit the member set on its own account (FCM members only), as a
+            fixed-point dollar string. Stored separately from the Kalshi-set limit; the exchange enforces the smaller
+            of the two. Absent when the member has not set one.
+          example: "5000.0000"
+        effective_account_notional_value_risk_limit:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          description: >-
+            The account-level notional value risk limit the exchange enforces, as a fixed-point dollar string - the
+            smaller of the Kalshi-set limit and the member-set limit, or whichever one is set. Absent when neither is
+            set.
+          example: "5000.0000"
+
+    MarginSubaccountBalance:
+      type: object
+      required:
+        - subaccount
+        - position_value
+        - account_equity
+        - maintenance_margin
+        - initial_margin
+        - resting_orders_margin
+        - available_balance
+      properties:
+        subaccount:
+          type: integer
+          description: The subaccount number (0 for primary, 1-63 for subaccounts)
+        position_value:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark-to-market value of open positions for this subaccount in fixed-point dollars
+        account_equity:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Account equity for this subaccount in fixed-point dollars. 0 for self clearing members.
+        maintenance_margin:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Maintenance margin requirement for this subaccount in fixed-point dollars
+        initial_margin:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Initial margin requirement for this subaccount in fixed-point dollars. 0 for self clearing members.
+        resting_orders_margin:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Margin locked by resting orders for this subaccount in fixed-point dollars. 0 unless compute_available_balance is passed.
+        available_balance:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Available balance for this subaccount in fixed-point dollars. 0 for institutional users or if compute_available_balance was not passed.
+
+    GetMarginBalanceResponse:
+      type: object
+      required:
+        - subaccount_balances
+        - settled_funds
+      properties:
+        subaccount_balances:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginSubaccountBalance'
+          description: Per-subaccount balance breakdown
+        settled_funds:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Total settled funds across all subaccounts in fixed-point dollars
+
+    MarginRiskPosition:
+      type: object
+      required:
+        - subaccount
+        - market_ticker
+        - position
+        - mark_price
+        - position_notional
+        - is_portfolio
+      properties:
+        subaccount:
+          type: integer
+          description: The subaccount number (0 for primary, 1-63 for subaccounts)
+        market_ticker:
+          type: string
+          description: Market ticker symbol
+        position:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Signed position quantity as a fixed-point count string
+        mark_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Current mark price for the market in fixed-point dollars
+        position_notional:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Absolute notional value of the position (|qty| * mark_price) in fixed-point dollars
+        maintenance_margin_required:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Maintenance margin requirement for this position in fixed-point dollars. Null if margin config is missing.
+          nullable: true
+        position_leverage:
+          type: number
+          format: double
+          description: 'Position leverage ratio (position_notional / maintenance_margin_required). Null when maintenance margin is zero or config is missing.'
+          nullable: true
+        estimated_liquidation_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: 'Estimated portfolio-aware liquidation price for this position within the subaccount. Null when no valid liquidation price exists.'
+          nullable: true
+        is_portfolio:
+          type: boolean
+          description: 'True when this position is hedged within a portfolio, so maintenance_margin_required, position_leverage, and estimated_liquidation_price cannot be attributed to it individually and are not reported.'
+
+    GetMarginRiskResponse:
+      type: object
+      required:
+        - total_position_notional
+        - total_maintenance_margin
+        - positions
+      properties:
+        account_leverage:
+          type: number
+          format: double
+          description: 'Account-level leverage (total_position_notional / total_maintenance_margin). Null when total maintenance margin is zero.'
+          nullable: true
+        total_position_notional:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Sum of absolute position notional values across all positions in fixed-point dollars
+        total_maintenance_margin:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Sum of maintenance margin requirements across all positions in fixed-point dollars
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginRiskPosition'
+          description: Per-position risk breakdown grouped by subaccount and market
+
+    GetMarginFeeTiersResponse:
+      type: object
+      required:
+        - maker_fee_rates
+        - taker_fee_rates
+      properties:
+        maker_fee_rates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: A map of margin market ticker to the maker-side fee rate as a decimal fraction of notional (e.g. 0.0005 = 0.05% = 5 bps). Multiply notional by this value to compute the fee.
+        taker_fee_rates:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: A map of margin market ticker to the taker-side fee rate as a decimal fraction of notional (e.g. 0.0012 = 0.12% = 12 bps). Multiply notional by this value to compute the fee.
+
+    GetMarginFeeTierRatesResponse:
+      type: object
+      required:
+        - fee_tier_rates
+      properties:
+        fee_tier_rates:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginFeeTierRate'
+
+    MarginFeeTierRate:
+      type: object
+      required:
+        - fee_schedule
+        - tier
+        - maker_fee_rate
+        - taker_fee_rate
+      properties:
+        fee_schedule:
+          type: string
+          enum:
+            - self_clearing_members
+            - kalshi_prime
+            - fcm
+          description: Fee schedule containing this tier.
+        tier:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Stable fee tier number within the indicated fee schedule. Existing numbers never change when the schedule is reshaped.
+        maker_fee_rate:
+          type: number
+          format: double
+          description: Maker fee rate as a decimal fraction of notional (e.g. 0.0005 = 0.05% = 5 bps).
+        taker_fee_rate:
+          type: number
+          format: double
+          description: Taker fee rate as a decimal fraction of notional (e.g. 0.0012 = 0.12% = 12 bps).
+
+    MarginFundingHistoryEntry:
+      type: object
+      required:
+        - market_ticker
+        - funding_time
+        - funding_rate
+        - mark_price
+        - funding_amount
+        - quantity
+        - subaccount_number
+      properties:
+        market_ticker:
+          type: string
+          description: Ticker of the margin market
+        funding_time:
+          type: string
+          format: date-time
+          description: Timestamp when the funding payment was applied
+        funding_rate:
+          type: number
+          format: double
+          description: Funding rate for this period
+        mark_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at the time of funding
+        funding_amount:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Dollar amount of the funding payment (positive = received, negative = paid)
+        quantity:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Position size at time of funding as a fixed-point count string
+        subaccount_number:
+          type: integer
+          nullable: true
+          description: Subaccount number (0 for primary)
+
+    GetMarginFundingHistoryResponse:
+      type: object
+      required:
+        - funding_history
+      properties:
+        funding_history:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginFundingHistoryEntry'
+          description: Array of historical funding payment entries
+
+    MarginFundingRate:
+      type: object
+      required:
+        - market_ticker
+        - funding_time
+        - funding_rate
+        - mark_price
+      properties:
+        market_ticker:
+          type: string
+          description: Ticker of the margin market
+        funding_time:
+          type: string
+          format: date-time
+          description: Timestamp when the funding rate was applied
+        funding_rate:
+          type: number
+          format: double
+          description: Funding rate for this period
+        mark_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at the time of funding
+
+    GetMarginHistoricalFundingRatesResponse:
+      type: object
+      required:
+        - funding_rates
+      properties:
+        funding_rates:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarginFundingRate'
+          description: Array of historical funding rate entries
+
+    GetMarginFundingRateEstimateResponse:
+      type: object
+      required:
+        - next_funding_time
+      properties:
+        market_ticker:
+          type: string
+          description: Ticker of the margin market
+        computed_time:
+          type: string
+          format: date-time
+          description: Timestamp when this estimate was computed
+        funding_rate:
+          type: number
+          format: double
+          description: Estimated funding rate for the in-progress period
+        mark_price:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Mark price at the time the estimate was computed
+        next_funding_time:
+          type: string
+          format: date-time
+          description: Timestamp of the next scheduled funding event
+
+    GetMarginMarketCandlesticksResponse:
+      type: object
+      required:
+        - ticker
+        - candlesticks
+      properties:
+        ticker:
+          type: string
+          description: Unique identifier for the margin market.
+        candlesticks:
+          type: array
+          description: Array of candlestick data points for the specified time range.
+          items:
+            $ref: '#/components/schemas/MarginMarketCandlestick'
+
+    MarginMarketCandlestick:
+      type: object
+      required:
+        - end_period_ts
+        - bid
+        - ask
+        - price
+        - volume
+        - volume_notional_value_dollars
+        - open_interest
+        - open_interest_notional_value_dollars
+      properties:
+        end_period_ts:
+          type: integer
+          format: int64
+          description: Unix timestamp for the inclusive end of the candlestick period.
+        bid:
+          $ref: '#/components/schemas/BidAskDistributionHistorical'
+          description: Open, high, low, close (OHLC) data for buy offers on the market during the candlestick period.
+        ask:
+          $ref: '#/components/schemas/BidAskDistributionHistorical'
+          description: Open, high, low, close (OHLC) data for sell offers on the market during the candlestick period.
+        price:
+          $ref: '#/components/schemas/PriceDistributionHistorical'
+          description: Open, high, low, close (OHLC) and more data for trade prices on the market during the candlestick period.
+        volume:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts traded on the market during the candlestick period.
+        volume_notional_value_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Notional value of contracts traded on the market during the candlestick period.
+        open_interest:
+          $ref: '#/components/schemas/FixedPointCount'
+          description: Number of contracts held on the market by end of the candlestick period (end_period_ts).
+        open_interest_notional_value_dollars:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Notional value of contracts held on the market by end of the candlestick period (end_period_ts).
+
+    BidAskDistributionHistorical:
+      type: object
+      required:
+        - open
+        - low
+        - high
+        - close
+      description: OHLC data for quoted prices on one side of the orderbook during the candlestick period. These values reflect bid or ask quotes, not executed trade prices.
+      properties:
+        open:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Quoted price at the start of the candlestick period (in dollars).
+        low:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Lowest quoted price during the candlestick period (in dollars).
+        high:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Highest quoted price during the candlestick period (in dollars).
+        close:
+          $ref: '#/components/schemas/FixedPointDollars'
+          description: Quoted price at the end of the candlestick period (in dollars).
+
+    PriceDistributionHistorical:
+      type: object
+      required:
+        - open
+        - low
+        - high
+        - close
+        - mean
+        - previous
+      properties:
+        open:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Price of the first trade during the candlestick period (in dollars). Null if no trades occurred.
+        low:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Lowest trade price during the candlestick period (in dollars). Null if no trades occurred.
+        high:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Highest trade price during the candlestick period (in dollars). Null if no trades occurred.
+        close:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Price of the last trade during the candlestick period (in dollars). Null if no trades occurred.
+        mean:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Volume-weighted average price during the candlestick period (in dollars). Null if no trades occurred.
+        previous:
+          allOf:
+            - $ref: '#/components/schemas/FixedPointDollars'
+          nullable: true
+          description: Close price from the previous candlestick period (in dollars). Null if this is the first candlestick or no prior trade exists.
+
+  parameters:
+    CursorQuery:
+      name: cursor
+      in: query
+      description: Pagination cursor. Use the cursor value returned from the previous response to get the next page of results. Leave empty for the first page.
+      schema:
+        type: string
+        x-go-type-skip-optional-pointer: true
+    LimitQuery:
+      name: limit
+      in: query
+      description: Number of results per page. Defaults to 100.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 1000
+        default: 100
+        x-oapi-codegen-extra-tags:
+          validate: "omitempty,min=1,max=1000"
+    MarginOrdersLimitQuery:
+      name: limit
+      in: query
+      description: Number of margin orders per page. Defaults to 10000.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 10000
+        default: 10000
+        x-oapi-codegen-extra-tags:
+          validate: "omitempty,min=1,max=10000"
+    MaxTsQuery:
+      name: max_ts
+      in: query
+      description: Filter items before this Unix timestamp
+      schema:
+        type: integer
+        format: int64
+    MinTsQuery:
+      name: min_ts
+      in: query
+      description: Filter items after this Unix timestamp
+      schema:
+        type: integer
+        format: int64
+    OrderGroupIdPath:
+      name: order_group_id
+      in: path
+      required: true
+      description: Order group ID
+      schema:
+        type: string
+    OrderIdPath:
+      name: order_id
+      in: path
+      required: true
+      description: Order ID
+      schema:
+        type: string
+    StatusQuery:
+      name: status
+      in: query
+      description: Filter by status. Possible values depend on the endpoint.
+      schema:
+        type: string
+    TickerQuery:
+      name: ticker
+      in: query
+      description: Filter by market ticker
+      schema:
+        type: string
+        x-go-type-skip-optional-pointer: true
+    SubaccountQuery:
+      name: subaccount
+      in: query
+      required: false
+      description: Subaccount number (0 for primary, 1-63 for subaccounts). If omitted, defaults to all subaccounts.
+      schema:
+        type: integer
+        minimum: 0
+    SubaccountQueryDefaultPrimary:
+      name: subaccount
+      in: query
+      required: false
+      description: Subaccount number (0 for primary, 1-63 for subaccounts). Defaults to 0.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    ExitTriggerTickerPath:
+      name: ticker
+      in: path
+      required: true
+      description: Ticker of the market whose position the trigger protects.
+      schema:
+        type: string
+    ExitTriggerIdPath:
+      name: trigger_id
+      in: path
+      required: true
+      description: Identifier of a specific exit trigger, as returned by the list endpoint.
+      schema:
+        type: string
+    ExitTriggerKindQuery:
+      name: kind
+      in: query
+      required: false
+      description: Restricts the request to one trigger family. Omitted covers every kind.
+      schema:
+        $ref: '#/components/schemas/ExitTriggerKind'
+tags:
+  - name: account
+    description: Account information endpoints
+  - name: fcm
+    description: FCM member specific endpoints
+  - name: exchange
+    description: Exchange status and information endpoints
+  - name: market
+    description: Market data endpoints
+  - name: orders
+    description: Order management endpoints
+  - name: order-groups
+    description: Order group management endpoints
+  - name: portfolio
+    description: Portfolio and balance information endpoints
+  - name: risk
+    description: Margin risk metrics, parameters, and limits
+  - name: funding
+    description: Funding rates and payment history
+  - name: fees
+    description: Margin fee schedule
+  - name: exit-triggers
+    description: Stop-loss, take-profit, and trailing-stop triggers on margin positions

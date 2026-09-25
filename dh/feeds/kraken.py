@@ -3,6 +3,9 @@
 ASSUMED WIRE FORMAT (docs.kraken.com "Spot WebSocket v2": book, trade, "Book checksum" guide;
 verify live with ``python scripts/smoke_feeds.py --venues kraken``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, 60 s, no credentials): book depth 100 + CRC32 checksum
+(2467/2467 ok), trades side = taker (1.00 consistent), 0 gaps. Format below confirmed.
+
   endpoint  wss://ws.kraken.com/v2
   subscribe {"method":"subscribe","params":{"channel":"book","symbol":["BTC/USD"],"depth":100,
              "snapshot":true},"req_id":1}

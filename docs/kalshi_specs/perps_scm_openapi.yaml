@@ -1,0 +1,1338 @@
+openapi: 3.0.0
+info:
+  title: Kalshi Clearing Member API
+  version: 0.0.1
+  description: |
+    Klear API endpoints available to clearing members —
+    institutional users who clear margin activity directly with
+    Kalshi.
+
+    ## Authentication
+
+    All endpoints require an admin access token passed in the `Authorization` header:
+
+    `Authorization: Bearer <admin_user_id>:<access_token>`
+
+    To generate an access token and obtain your admin user id, sign in at
+    https://klearing.kalshi.com, and navigate to the "Security" page.
+
+    If you are in the process of onboarding to be a clearing member,
+    please contact your contact at Kalshi for credentials. Otherwise,
+    please contact institutional@kalshi.com.
+
+servers:
+  - url: https://api.klear.kalshi.com/klear-api/v1
+    description: Production
+  - url: https://demo-api.kalshi.co/klear-api/v1
+    description: Demo
+
+security:
+  - kalshiBearer: []
+
+paths:
+  /margin/reports:
+    get:
+      operationId: GetMarginReports
+      summary: Get Margin Reports
+      description: Margin reports for the authenticated clearing member, filterable by date range.
+
+      parameters:
+        - { name: start_date, in: query, required: true, schema: { type: string, format: date } }
+        - { name: end_date,   in: query, required: true, schema: { type: string, format: date }, description: "Must be within 90 days of start_date." }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetMarginReportsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/active_obligations:
+    get:
+      operationId: GetActiveMarginObligations
+      summary: Get Active Margin Obligations
+      description: |
+        Returns the clearing member's outstanding settlement obligations for
+        the current cycle across all asset classes, ordered by asset class
+        then obligation ID. A negative amount indicates a net payable to
+        Kalshi Klear; a positive amount indicates a net receivable. Empty
+        when no obligation is pending.
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetActiveMarginObligationsResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/obligation_history:
+    get:
+      operationId: GetObligationHistory
+      summary: Get Obligation History
+      description: Completed obligations from previous settlements, ordered by most recent first.
+
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 }, description: Number of results per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetObligationHistoryResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/obligations/{obligation_id}/settlement_details:
+    get:
+      operationId: GetObligationSettlementDetails
+      summary: Get Obligation Settlement Details
+      description: >-
+        Pages the full per-market, per-subtrader settlement breakdown of one
+        obligation. The inline settlement_details array on obligation
+        responses is capped at 1000 rows (settlement_details_truncated is set
+        when the cap applied); this endpoint serves the complete set.
+      parameters:
+        - { name: obligation_id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 1000, maximum: 1000 }, description: Number of rows per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetObligationSettlementDetailsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/obligations/{obligation_id}/funding_payments:
+    get:
+      operationId: GetObligationFundingPayments
+      summary: Get Obligation Funding Payments
+      description: >-
+        Pages the full per-market, per-subtrader, per-funding-period funding
+        breakdown of one obligation. The inline funding_payments array on
+        obligation responses is capped at 1000 rows (funding_payments_truncated
+        is set when the cap applied); this endpoint serves the complete set.
+      parameters:
+        - { name: obligation_id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 1000, maximum: 1000 }, description: Number of rows per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetObligationFundingPaymentsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/obligations/{obligation_id}/maintenance_margin_details:
+    get:
+      operationId: GetObligationMaintenanceMarginDetails
+      summary: Get Obligation Maintenance Margin Details
+      description: >-
+        Pages the full per-subtrader maintenance margin breakdown of one
+        obligation. The inline maintenance_margin_details array on obligation
+        responses is capped at 1000 rows (maintenance_margin_details_truncated
+        is set when the cap applied); this endpoint serves the complete set.
+      parameters:
+        - { name: obligation_id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 1000, maximum: 1000 }, description: Number of rows per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetObligationMaintenanceMarginDetailsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/funding_payments:
+    get:
+      operationId: GetMemberFundingPayments
+      summary: Get Member Funding Payments
+      description: >-
+        Returns the member's funding payments for a given funding time, if
+        available. Payments are written shortly after each funding execution,
+        before the settlement that carries them.
+      parameters:
+        - { name: funding_time, in: query, required: true, schema: { type: string, format: date-time }, description: "The funding execution to read, as an RFC3339 timestamp. Funding is scheduled in ET." }
+        - { name: market_ticker, in: query, required: false, schema: { type: string }, description: Restrict rows to one market. }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 1000, maximum: 10000 }, description: Number of rows per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetMemberFundingPaymentsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/large_trader_positions:
+    get:
+      operationId: GetLargeTraderPositions
+      summary: Get Large Trader Positions
+      description: >-
+        Positions of the authenticated clearing member that meet the CFTC
+        large-trader reporting levels for a settlement day (17 CFR 15.03(b);
+        currently 25 contracts for crypto), plus exit-day positions that were
+        reportable on the prior settlement day and are now below the threshold.
+        Members with reportable positions are subject to their own CFTC Part 17
+        large-trader reporting obligations; this endpoint provides the position
+        data needed to meet them. Empty when no positions meet the reporting
+        levels and no prior-day reportable positions need exit reporting. See the
+        CFTC's Large Trader Reporting Program
+        (https://www.cftc.gov/IndustryOversight/MarketSurveillance/LargeTraderReportingProgram/index.htm)
+        and reporting levels at 17 CFR 15.03
+        (https://www.ecfr.gov/current/title-17/chapter-I/part-15).
+
+      parameters:
+        - { name: report_date, in: query, required: false, schema: { type: string, format: date }, description: ET settlement day to report, YYYY-MM-DD. Defaults to the most recent ET settlement day whose settlement window has closed. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetLargeTraderPositionsResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/estimate_maintenance_margin:
+    post:
+      operationId: EstimatePortfolioMaintenanceMargin
+      summary: Estimate Portfolio Maintenance Margin
+      description: >-
+        Maintenance margin requirement in dollars for a hypothetical portfolio,
+        margined under the rules that apply to the authenticated clearing
+        member. Positions and prices are supplied by the caller and need not
+        reflect positions held. Every market in `positions` must belong to
+        `asset_class`. The response includes the component breakdown of the
+        estimate; see the response schema for the semantics of each component.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EstimatePortfolioMaintenanceMarginRequest' }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EstimatePortfolioMaintenanceMarginResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/estimate_maintenance_margin/metadata:
+    get:
+      operationId: GetMaintenanceMarginMetadata
+      summary: Get Maintenance Margin Metadata
+      description: Inputs to the maintenance margin calculation for an asset class.
+
+      parameters:
+        - { name: asset_class, in: query, required: true, schema: { $ref: '#/components/schemas/AssetClass' } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date }, description: 'Return the matrices calibrated on this Eastern-time day (YYYY-MM-DD), the liquidation parameters in effect at the end of that day, and the current subgroups of the markets they cover for the caller. Returns 404 if no matrices were calibrated that day.' }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetMaintenanceMarginMetadataResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/settlement_estimate_by_asset_class:
+    get:
+      operationId: GetSettlementEstimateByAssetClass
+      summary: Get Settlement Estimate By Asset Class
+      description: >-
+        Estimated next settlement amounts for the authenticated clearing
+        member, keyed by asset class, including per-subtrader and per-group
+        breakdowns. Asset classes where the member has no margin activity are
+        omitted.
+        `subtrader_breakdowns` and `group_breakdowns` together contain at most
+        the 1,000 entries with the largest maintenance margin requirement;
+        `omitted_subtrader_count` and `omitted_group_count` report how many
+        entries of each type were left out. `user_breakdown` always aggregates
+        across all subtraders.
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetSettlementEstimateByAssetClassResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/funding_estimate_by_asset_class:
+    get:
+      operationId: GetFundingEstimateByAssetClass
+      summary: Get Funding Estimate By Asset Class
+      description: >-
+        Estimated funding at the next scheduled funding time for the
+        authenticated clearing member, keyed by asset class.
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetFundingEstimateByAssetClassResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/funding_schedule:
+    get:
+      operationId: GetMarginFundingSchedule
+      summary: Get Funding Schedule
+      description: >-
+        Returns an asset class's funding schedule as a cron expression
+        evaluated in US Eastern Time. Funding executes at each scheduled
+        tick; schedules differ by asset class.
+      parameters:
+        - { name: asset_class, in: query, required: true, schema: { $ref: '#/components/schemas/AssetClass' } }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetMarginFundingScheduleResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/settlement_prices:
+    get:
+      operationId: GetSettlementPrices
+      summary: Get Settlement Prices
+      description: >-
+        Settlement (mark) prices for the markets in an asset class at a given
+        settlement time. Empty when no settlement has run for that asset
+        class and settlement time.
+
+      parameters:
+        - { name: asset_class, in: query, required: true, schema: { $ref: '#/components/schemas/AssetClass' } }
+        - { name: settlement_time, in: query, required: true, schema: { type: string, format: date-time }, description: Settlement cycle time, RFC3339. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetSettlementPricesResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/settlement_balance:
+    get:
+      operationId: GetSettlementBalance
+      summary: Get Settlement Balance
+      description: Settlement buffer balance for the authenticated clearing member.
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetSettlementBalanceResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/guaranty_fund_balance:
+    get:
+      operationId: GetGuarantyFundBalance
+      summary: Get Guaranty Fund Balance
+      description: Guaranty fund contribution balance for the authenticated clearing member.
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetGuarantyFundBalanceResponse' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/settlement_balance_history:
+    get:
+      operationId: GetSettlementBalanceHistory
+      summary: Get Settlement Balance History
+      description: Settlement balance changes for the authenticated clearing member, ordered by most recent first.
+
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 500 }, description: Number of results per page. }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: Cursor from a previous response to fetch the next page. }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetSettlementBalanceHistoryResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/withdraw_settlement_balance:
+    post:
+      operationId: WithdrawSettlementBalance
+      summary: Withdraw Settlement Balance
+      description: Initiate a wire withdrawal from the clearing member's settlement buffer. The withdrawal is processed asynchronously.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WithdrawSettlementBalanceRequest' }
+      responses:
+        '200':
+          description: Withdrawal initiated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WithdrawSettlementBalanceResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /margin/settlement_balance_withdrawal:
+    get:
+      operationId: GetSettlementBalanceWithdrawal
+      summary: Get Settlement Balance Withdrawal
+      description: Get the status of a settlement balance withdrawal by ID.
+
+      parameters:
+        - { name: id, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetSettlementBalanceWithdrawalResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /fcm/margin/subtrader_groups:
+    get:
+      operationId: GetMarginSubtraderGroups
+      summary: Get Subtrader Groups
+      description: List the clearing member's margin subtrader groups and their members.
+
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GetMarginSubtraderGroupsResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    post:
+      operationId: CreateMarginSubtraderGroup
+      summary: Create Subtrader Group
+      description: Create a margin subtrader group. Grouped subtraders are margined as one netted portfolio at each settlement.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMarginSubtraderGroupRequest' }
+      responses:
+        '200':
+          description: Group created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateMarginSubtraderGroupResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '409': { $ref: '#/components/responses/ConflictError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /fcm/margin/subtrader_groups/{group_id}:
+    parameters:
+      - name: group_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      operationId: UpdateMarginSubtraderGroup
+      summary: Update Subtrader Group
+      description: Replace a margin subtrader group's membership.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMarginSubtraderGroupRequest' }
+      responses:
+        '200': { description: Group updated }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '409': { $ref: '#/components/responses/ConflictError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    delete:
+      operationId: DeleteMarginSubtraderGroup
+      summary: Delete Subtrader Group
+      description: Delete a margin subtrader group if it exists.
+
+      responses:
+        '200': { description: Group deleted or already absent }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /fcm/margin/api_keys:
+    post:
+      operationId: CreateMarginFcmApiKey
+      summary: Create Subtrader-Bound API Key
+      description: >-
+        FCM clearing members only. Mint an API key bound to one of your margin
+        subtraders using an RSA or Ed25519 public key you supply. The binding is set at
+        mint and immutable; the resulting key is the institution's trading
+        credential for that subtrader and cannot reach any REST endpoint,
+        including key management.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMarginFcmApiKeyRequest' }
+      responses:
+        '201':
+          description: API key created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateMarginFcmApiKeyResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '409':
+          description: >-
+            The bound subtrader is not yet visible in the credential registry,
+            which updates asynchronously. Retry shortly after creating the
+            subtrader.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+    get:
+      operationId: ListMarginFcmApiKeys
+      summary: List Subtrader-Bound API Keys
+      description: >-
+        FCM clearing members only. List your API keys that carry a subtrader
+        binding, optionally filtered to one subtrader.
+
+      parameters:
+        - name: fcm_subtrader_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Return only keys bound to this subtrader.
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListMarginFcmApiKeysResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /fcm/margin/api_keys/generate:
+    post:
+      operationId: GenerateMarginFcmApiKey
+      summary: Generate Subtrader-Bound API Key
+      description: >-
+        FCM clearing members only. Mint a subtrader-bound API key with a
+        platform-generated RSA key pair. The private key appears exactly once
+        in this response and cannot be retrieved again; store it securely
+        before leaving the page or discarding the response.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenerateMarginFcmApiKeyRequest' }
+      responses:
+        '201':
+          description: API key generated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerateMarginFcmApiKeyResponse' }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '409':
+          description: >-
+            The bound subtrader is not yet visible in the credential registry,
+            which updates asynchronously. Retry shortly after creating the
+            subtrader.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+  /fcm/margin/api_keys/{api_key_id}:
+    delete:
+      operationId: DeleteMarginFcmApiKey
+      summary: Delete Subtrader-Bound API Key
+      description: >-
+        FCM clearing members only. Permanently revoke a subtrader-bound API
+        key. Revocation cannot be undone; the institution's live sessions on
+        this key are terminated.
+
+      parameters:
+        - name: api_key_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: API key revoked }
+        '400': { $ref: '#/components/responses/BadRequestError' }
+        '401': { $ref: '#/components/responses/UnauthorizedError' }
+        '403': { $ref: '#/components/responses/ForbiddenError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalServerError' }
+
+components:
+  securitySchemes:
+    kalshiBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: admin_user_id:access_token
+      description: |
+        Pass `Authorization: Bearer <admin_user_id>:<access_token>` on each request.
+
+  responses:
+    BadRequestError:
+      description: Bad request - invalid input
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnauthorizedError:
+      description: Missing or invalid authentication
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ForbiddenError:
+      description: Caller is not permitted to access this resource
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ConflictError:
+      description: Request conflicts with existing state
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error message.
+        details:
+          type: string
+        service:
+          type: string
+
+    MarginReport:
+      type: object
+      required: [report_type, url, date, created_ts, is_end_of_day]
+      properties:
+        report_type:
+          type: string
+          enum:
+            - trade_audit
+            - position_snapshot
+            - market_price_snapshot
+            - funding_periods
+            - settlement_periods
+            - maintenance_margin
+            - maintenance_margin_aggregate
+            - cash_balance_daily
+            - cash_activity_daily
+            - daily_financial_summary
+            - interest_on_collateral_monthly
+            - daily_statement
+          description: >-
+            Report file type. Every type is a CSV except `daily_statement`,
+            the end-of-day PDF statement that lays out the same date's
+            position, trade, settlement, funding, and cash files with an
+            account summary.
+        url: { type: string, description: Presigned download URL (omitted from logs). }
+        date:
+          type: string
+          format: date
+          description: >-
+            The ET report date the file belongs to. Intraday snapshots after
+            4pm ET belong to the next report date.
+        created_ts: { type: string, format: date-time }
+        is_end_of_day: { type: boolean }
+        snapshot_ts:
+          type: string
+          format: date-time
+          description: >-
+            Snapshot instant for intraday files (noon and hourly cycles);
+            omitted for end-of-day files.
+
+    GetMarginReportsResponse:
+      type: object
+      required: [reports]
+      properties:
+        reports:
+          type: array
+          items: { $ref: '#/components/schemas/MarginReport' }
+
+    AssetClass:
+      type: string
+      # TODO(randy): add other enums once SCMs should be aware of other asset classes
+      enum: [Crypto]
+      description: Asset class of the margin markets covered by this entry.
+
+    ObligationInfo:
+      type: object
+      required:
+        - id
+        - user_id
+        - amount_centicents
+        - fees_centicents
+        - maintenance_margin_centicents
+        - pnl_centicents
+        - execution_time
+        - last_updated_ts
+        - asset_class
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        amount_centicents:
+          type: integer
+          format: int64
+          description: |
+            Net settlement amount in USD as centicents (1 USD = 10,000
+            centicents). All monetary fields on this API are returned in
+            centicents. Total the clearing member owes or is owed, inclusive
+            of PnL, fees, and maintenance margin changes. Negative means the
+            clearing member pays Kalshi Klear; positive means Kalshi Klear
+            pays the clearing member.
+        fees_centicents: { type: integer, format: int64, description: Trading fees incurred during the settlement period. }
+        maintenance_margin_centicents: { type: integer, format: int64, description: Current maintenance margin requirement for this obligation. }
+        pnl_centicents: { type: integer, format: int64, description: "Total PnL for this settlement period; the sum of the settlement details for this settlement cycle." }
+        execution_time: { type: string, format: date-time, description: Settlement cycle time this obligation belongs to. }
+        last_updated_ts: { type: string, format: date-time, description: Timestamp of the last status change on this obligation. }
+        asset_class: { $ref: '#/components/schemas/AssetClass' }
+
+    ObligationReceiveInfo:
+      type: object
+      required: [id, type, amount_centicents, external_reference, created_ts]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        amount_centicents: { type: integer, format: int64 }
+        external_reference: { type: string }
+        created_ts: { type: string, format: date-time }
+
+    SettlementDetail:
+      type: object
+      required:
+        - id
+        - market_ticker
+        - subtrader_id
+        - position_quantity_fp
+        - pnl_centicents
+        - total_fees_centicents
+        - total_amount_centicents
+      properties:
+        id: { type: string }
+        market_ticker: { type: string }
+        subtrader_id: { type: string }
+        position_quantity_fp: { type: string, description: "Signed position at settlement as a fixed-point contract count (e.g. \"1.25\")." }
+        pnl_centicents: { type: integer, format: int64, description: Total PnL for this market and subtrader over the settlement period, including the market's net funding (itemized per funding period in the entry's funding_payments). }
+        total_fees_centicents: { type: integer, format: int64, description: Total fees. }
+        total_amount_centicents: { type: integer, format: int64, description: Total amount. }
+
+    FundingPaymentDetail:
+      type: object
+      required:
+        - id
+        - market_ticker
+        - subtrader_id
+        - funding_time
+        - position_quantity_fp
+        - notional_value_centicents
+        - funding_amount_centicents
+      properties:
+        id: { type: string }
+        market_ticker: { type: string }
+        subtrader_id: { type: string }
+        funding_time: { type: string, format: date-time, description: The funding period this payment applies to. }
+        position_quantity_fp: { type: string, description: "Signed position at funding time as a fixed-point contract count (e.g. \"1.25\")." }
+        notional_value_centicents: { type: integer, format: int64, description: Signed notional value (position times mark price) the funding payment was computed from. }
+        funding_amount_centicents: { type: integer, format: int64, description: Signed funding amount; positive when received, negative when paid. }
+
+    MaintenanceMarginDetail:
+      type: object
+      required:
+        - id
+        - subtrader_id
+        - maintenance_margin_centicents
+        - maintenance_margin_delta_centicents
+      properties:
+        id: { type: string }
+        subtrader_id: { type: string, description: Empty when not populated or when the subtrader is part of a subtrader group. }
+        margin_group_id: { type: string, description: Set when the subtrader is part of a subtrader group. }
+        maintenance_margin_centicents: { type: integer, format: int64, description: Maintenance margin requirement after this settlement. }
+        maintenance_margin_delta_centicents: { type: integer, format: int64, description: Change in maintenance margin between the previous settlement and this one. }
+
+    ObligationEntry:
+      allOf:
+        - $ref: '#/components/schemas/ObligationInfo'
+        - type: object
+          required: [receives, settlement_details, maintenance_margin_details, funding_payments]
+          properties:
+            receives:
+              type: array
+              items: { $ref: '#/components/schemas/ObligationReceiveInfo' }
+            settlement_details:
+              type: array
+              items: { $ref: '#/components/schemas/SettlementDetail' }
+              description: |
+                Per-market, per-subtrader breakdown of the settlement amount.
+                This structure may change in future versions as margin
+                methodology evolves (e.g. portfolio margin).
+            maintenance_margin_details:
+              type: array
+              items: { $ref: '#/components/schemas/MaintenanceMarginDetail' }
+              description: |
+                Breakdown of the maintenance margin requirement and the delta
+                from the prior settlement.
+            funding_payments:
+              type: array
+              items: { $ref: '#/components/schemas/FundingPaymentDetail' }
+              description: |
+                Per-market, per-subtrader, per-funding-period breakdown of the
+                funding payments settled by this obligation.
+            settlement_details_truncated:
+              type: boolean
+              description: Set when settlement_details was capped at the 1000-row inline limit; page the full set via /margin/obligations/{obligation_id}/settlement_details.
+            maintenance_margin_details_truncated:
+              type: boolean
+              description: Set when maintenance_margin_details was capped at the 1000-row inline limit; page the full set via /margin/obligations/{obligation_id}/maintenance_margin_details.
+            funding_payments_truncated:
+              type: boolean
+              description: Set when funding_payments was capped at the 1000-row inline limit; page the full set via /margin/obligations/{obligation_id}/funding_payments.
+
+    GetActiveMarginObligationsResponse:
+      type: object
+      required: [obligations]
+      properties:
+        obligations:
+          type: array
+          description: Outstanding settlement obligations for the current cycle across all asset classes, ordered by asset class then obligation ID. Empty when no obligation is pending.
+          items: { $ref: '#/components/schemas/ObligationEntry' }
+
+    GetLargeTraderPositionsResponse:
+      type: object
+      properties:
+        user_id: { type: string }
+        report_date: { type: string, format: date, description: ET settlement day the positions are reported for. }
+        positions:
+          type: array
+          items:
+            type: object
+            properties:
+              market_ticker: { type: string }
+              position: { type: integer, description: Signed contract count; positive long, negative short. Can be below the reportable threshold when exit_day is true. }
+              exit_day: { type: boolean, description: True when this row is included because the same market was reportable on the prior settlement day but is now below the reportable threshold. }
+    EstimatePortfolioMaintenanceMarginPosition:
+      type: object
+      required: [market_ticker, quantity, price]
+      properties:
+        market_ticker: { type: string, description: Market to include in the hypothetical portfolio. Must belong to the request's asset class. }
+        quantity: { type: integer, format: int64, description: Signed whole contract count; positive long, negative short. Must be non-zero. }
+        price: { type: string, description: 'Price of one contract in USD, to at most four decimal places (e.g. "6.8000"). Must be positive.' }
+
+    EstimatePortfolioMaintenanceMarginRequest:
+      type: object
+      required: [asset_class, positions]
+      properties:
+        asset_class: { $ref: '#/components/schemas/AssetClass' }
+        date:
+          type: string
+          format: date
+          description: Margin the portfolio against the matrices calibrated on this Eastern-time day (YYYY-MM-DD). Omit to use the current matrices. Returns 404 if no matrices were calibrated that day, or 400 if a requested market is absent from them.
+        clearing_type:
+          type: string
+          enum: [FCM, SelfClearing]
+          description: Clearing arrangement whose margin rules to apply. Omit to use the arrangement on record for the authenticated clearing member.
+        positions:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: Hypothetical portfolio to margin. Market tickers must be unique and must name markets that exist in the requested asset class.
+          items: { $ref: '#/components/schemas/EstimatePortfolioMaintenanceMarginPosition' }
+
+    EstimatePortfolioMaintenanceMarginResponse:
+      type: object
+      properties:
+        maintenance_margin_fp: { type: string, description: 'Maintenance margin requirement for the submitted portfolio, in USD (e.g. "1234.5600"). Equals base_margin_fp + funding_addon_fp + liquidation_addon_fp, subject to per-market minimums on gross-margined markets and to each component being rounded individually, so the components need not sum exactly to this total.' }
+        base_margin_fp: { type: string, description: 'Base scenario margin charged, in USD: the larger of the historical-VaR and APC candidates, taken per market for gross-margined markets and across the whole portfolio for portfolio-margined ones, then summed. Equals max(hvar_fp, apc_fp) only when the entire portfolio is portfolio-margined; with gross-margined markets it can exceed both.' }
+        hvar_fp: { type: string, description: 'Portfolio total of the historical-VaR candidate for the base scenario margin, in USD.' }
+        apc_fp: { type: string, description: 'Portfolio total of the APC candidate for the base scenario margin, in USD, computed over the pooled APC and augmented stress scenario set.' }
+        funding_addon_fp: { type: string, description: 'Funding margin add-on, in USD.' }
+        liquidation_addon_fp: { type: string, description: 'Liquidation margin add-on, in USD.' }
+
+    MaintenanceMarginMatrix:
+      type: object
+      required: [market_tickers, returns]
+      properties:
+        market_tickers: { type: array, items: { type: string }, description: Markets covered by the matrix, in column order. }
+        returns:
+          type: array
+          items: { type: array, items: { type: number, format: double } }
+          description: One row per scenario; each row holds one return per entry in market_tickers.
+
+    MaintenanceMarginMatrices:
+      type: object
+      properties:
+        hvar: { $ref: '#/components/schemas/MaintenanceMarginMatrix' }
+        apc: { $ref: '#/components/schemas/MaintenanceMarginMatrix' }
+        aug: { $ref: '#/components/schemas/MaintenanceMarginMatrix' }
+        funding: { $ref: '#/components/schemas/MaintenanceMarginMatrix' }
+
+    MaintenanceMarginLiquidationConfig:
+      type: object
+      required: [market_ticker, market_impact_volatility, market_impact_coefficient, market_impact_exponent, market_impact_forecasted_volume, spread_rate]
+      properties:
+        market_ticker: { type: string }
+        market_impact_volatility: { type: number, format: double }
+        market_impact_coefficient: { type: number, format: double }
+        market_impact_exponent: { type: number, format: double }
+        market_impact_forecasted_volume: { type: number, format: double }
+        spread_rate: { type: number, format: double }
+
+    GetMaintenanceMarginMetadataResponse:
+      type: object
+      required: [asset_class, base_tail_percentile, funding_tail_percentile, matrices, liquidation_configs, subgroups]
+      properties:
+        asset_class: { $ref: '#/components/schemas/AssetClass' }
+        base_tail_percentile: { type: number, format: double, description: Lower-tail percentile of the scenario P&L distribution used for the base margin. }
+        funding_tail_percentile: { type: number, format: double, description: Lower-tail percentile of the scenario P&L distribution used for the funding margin. }
+        matrices: { $ref: '#/components/schemas/MaintenanceMarginMatrices' }
+        liquidation_configs:
+          type: array
+          description: Liquidation margin parameters for each active market with a calibrated margin config.
+          items: { $ref: '#/components/schemas/MaintenanceMarginLiquidationConfig' }
+        subgroups:
+          type: array
+          description: Partition of the asset class's active markets; positions within a subgroup are margined together.
+          items: { type: array, items: { type: string } }
+
+    GetObligationHistoryResponse:
+      type: object
+      required: [obligations]
+      properties:
+        obligations:
+          type: array
+          items: { $ref: '#/components/schemas/ObligationEntry' }
+        cursor:
+          type: string
+          description: Opaque cursor; pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    GetObligationSettlementDetailsResponse:
+      type: object
+      required: [settlement_details]
+      properties:
+        settlement_details:
+          type: array
+          items: { $ref: '#/components/schemas/SettlementDetail' }
+        cursor:
+          type: string
+          description: Opaque cursor; pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    GetObligationFundingPaymentsResponse:
+      type: object
+      required: [funding_payments]
+      properties:
+        funding_payments:
+          type: array
+          items: { $ref: '#/components/schemas/FundingPaymentDetail' }
+        cursor:
+          type: string
+          description: Opaque cursor; pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    MemberFundingPayment:
+      allOf:
+        - $ref: '#/components/schemas/FundingPaymentDetail'
+        - type: object
+          required: [settlement_execution_time]
+          properties:
+            settlement_execution_time: { type: string, format: date-time, description: Execution time of the FCM-to-clearinghouse omnibus settlement that will carry (or carried) this payment. }
+
+    GetMemberFundingPaymentsResponse:
+      type: object
+      required: [payments]
+      properties:
+        payments:
+          type: array
+          items: { $ref: '#/components/schemas/MemberFundingPayment' }
+        cursor:
+          type: string
+          description: Opaque cursor; pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    GetObligationMaintenanceMarginDetailsResponse:
+      type: object
+      required: [maintenance_margin_details]
+      properties:
+        maintenance_margin_details:
+          type: array
+          items: { $ref: '#/components/schemas/MaintenanceMarginDetail' }
+        cursor:
+          type: string
+          description: Opaque cursor; pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    MarketSettlementEstimate:
+      type: object
+      required:
+        - quantity_centicount
+        - variation_margin_centicents
+        - notional_value_centicents
+      properties:
+        quantity_centicount: { type: integer, format: int64, description: Position quantity in centicounts. }
+        variation_margin_centicents: { type: integer, format: int64, description: Variation margin for this market. }
+        notional_value_centicents: { type: integer, format: int64, description: Notional value for this market. }
+        session_avg_price_fp: { type: string, description: Average entry price for the current settlement session, as a fixed-point dollar string. Omitted when the position quantity is zero. }
+
+    SettlementEstimate:
+      type: object
+      required:
+        - variation_margin_centicents
+        - total_fees_centicents
+        - maintenance_margin_delta_centicents
+        - maintenance_margin_required_centicents
+        - total_amount_centicents
+      properties:
+        variation_margin_centicents: { type: integer, format: int64, description: Variation margin. }
+        total_fees_centicents: { type: integer, format: int64, description: Total fees. }
+        maintenance_margin_delta_centicents: { type: integer, format: int64, description: Change in maintenance margin requirement. }
+        maintenance_margin_required_centicents: { type: integer, format: int64, description: Maintenance margin requirement. }
+        total_amount_centicents: { type: integer, format: int64, description: Estimated total settlement amount. }
+        positions:
+          type: object
+          description: Map of market ticker to that market's settlement estimate.
+          additionalProperties: { $ref: '#/components/schemas/MarketSettlementEstimate' }
+
+    AssetClassSettlementEstimate:
+      type: object
+      required: [next_runtime]
+      properties:
+        user_breakdown:
+          $ref: '#/components/schemas/SettlementEstimate'
+          description: Estimated next settlement for this asset class. Null when the member has no activity in this asset class.
+        subtrader_breakdowns:
+          type: object
+          description: Map of subtrader ID to that portfolio's settlement estimate.
+          additionalProperties: { $ref: '#/components/schemas/SettlementEstimate' }
+        group_breakdowns:
+          type: object
+          description: Map of margin group ID to that portfolio's netted settlement estimate.
+          additionalProperties: { $ref: '#/components/schemas/SettlementEstimate' }
+        omitted_subtrader_count: { type: integer, format: int64, description: Number of subtraders omitted from subtrader_breakdowns. Their amounts are still included in user_breakdown. }
+        omitted_group_count: { type: integer, format: int64, description: Number of groups omitted from group_breakdowns. Their amounts are still included in user_breakdown. }
+        next_runtime: { type: string, format: date-time, description: Next settlement time for this asset class. }
+
+    GetSettlementEstimateByAssetClassResponse:
+      type: object
+      required: [estimates, settlement_balance_centicents]
+      properties:
+        estimates:
+          type: object
+          description: Map of asset class to the estimated next settlement for that asset class.
+          additionalProperties: { $ref: '#/components/schemas/AssetClassSettlementEstimate' }
+        settlement_balance_centicents: { type: integer, format: int64, description: Current settlement buffer balance. }
+
+    MarketFundingEstimate:
+      type: object
+      required: [quantity_centicount, funding_amount_centicents]
+      properties:
+        quantity_centicount: { type: integer, format: int64 }
+        funding_amount_centicents: { type: integer, format: int64 }
+
+    FundingEstimate:
+      type: object
+      required: [funding_amount_centicents]
+      properties:
+        funding_amount_centicents: { type: integer, format: int64 }
+        positions:
+          type: object
+          description: Keyed by market ticker; only present on subtrader and group breakdowns.
+          additionalProperties: { $ref: '#/components/schemas/MarketFundingEstimate' }
+
+    AssetClassFundingEstimate:
+      type: object
+      required: [user_breakdown, omitted_subtrader_count, omitted_group_count, next_funding_time]
+      properties:
+        user_breakdown: { $ref: '#/components/schemas/FundingEstimate' }
+        subtrader_breakdowns:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/FundingEstimate' }
+        group_breakdowns:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/FundingEstimate' }
+        omitted_subtrader_count: { type: integer, format: int64 }
+        omitted_group_count: { type: integer, format: int64 }
+        next_funding_time: { type: string, format: date-time, description: Next scheduled funding time for this asset class. }
+
+    GetFundingEstimateByAssetClassResponse:
+      type: object
+      required: [estimates]
+      properties:
+        estimates:
+          type: object
+          description: Keyed by asset class.
+          additionalProperties: { $ref: '#/components/schemas/AssetClassFundingEstimate' }
+
+    GetMarginFundingScheduleResponse:
+      type: object
+      required: [schedule]
+      properties:
+        schedule:
+          type: string
+          description: Cron expression evaluated in US Eastern Time (e.g. "0 */8 * * *" = midnight, 8AM and 4PM ET).
+
+    GetSettlementPricesResponse:
+      type: object
+      required: [settlement_prices]
+      properties:
+        settlement_prices:
+          type: object
+          description: Map of market ticker to that market's settlement (mark) price at the requested settlement time, in centicents. Empty when no settlement ran for that asset class and settlement time.
+          additionalProperties: { type: integer, format: int64 }
+
+    GetSettlementBalanceResponse:
+      type: object
+      required: [user_id, balance_available_centicents]
+      properties:
+        user_id: { type: string }
+        balance_available_centicents: { type: integer, format: int64, description: Settlement buffer balance. }
+        locked_balance_centicents: { type: integer, format: int64, description: Locked settlement balance (e.g. pending withdrawals). }
+
+    GetGuarantyFundBalanceResponse:
+      type: object
+      required: [user_id, amount_centicents, updated_ts]
+      properties:
+        user_id: { type: string }
+        amount_centicents: { type: integer, format: int64, description: Guaranty fund contribution balance. Zero when no contribution has been made yet. }
+        updated_ts: { type: string, format: date-time, description: Timestamp of the most recent contribution entry. }
+
+    GetSettlementBalanceWithdrawalResponse:
+      type: object
+      required: [id, amount, status, created_ts]
+      properties:
+        id: { type: string }
+        amount: { type: string, description: "Withdrawal amount in USD as a fixed-point string (e.g. \"500.00\")." }
+        status: { type: string, enum: [pending, processing, processed, failed] }
+        created_ts: { type: string, format: date-time }
+
+    WithdrawSettlementBalanceRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          type: string
+          description: Amount to withdraw in USD as a fixed-point string (e.g. "500.00"). Must be positive.
+
+    WithdrawSettlementBalanceResponse:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: ID of the withdrawal. The withdrawal is processed asynchronously.
+
+    SettlementBalanceHistoryEntry:
+      type: object
+      required: [balance_delta_centicents, locked_balance_delta_centicents, reason, business_transaction_id, created_ts]
+      properties:
+        balance_delta_centicents: { type: integer, format: int64, description: Change to the settlement buffer balance. }
+        locked_balance_delta_centicents: { type: integer, format: int64, description: Change to the locked settlement balance. Funds are locked during pending withdrawals. }
+        reason: { type: string, description: Reason for the balance change. }
+        business_transaction_id: { type: string, description: Identifier of the business transaction that caused this entry. }
+        created_ts: { type: string, format: date-time, description: Timestamp when the entry was created. }
+
+    GetSettlementBalanceHistoryResponse:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/SettlementBalanceHistoryEntry' }
+        cursor:
+          type: string
+          description: Pass as the `cursor` query param to fetch the next page. Absent when there are no more results.
+
+    CreateMarginSubtraderGroupRequest:
+      type: object
+      required: [subtrader_ids]
+      properties:
+        subtrader_ids:
+          type: array
+          minItems: 1
+          items: { type: string, minLength: 1 }
+          description: List of subtrader IDs belonging to the clearing member that will comprise the group. Subtraders must not belong to another group.
+
+    CreateMarginSubtraderGroupResponse:
+      type: object
+      required: [group_id]
+      properties:
+        group_id: { type: string, format: uuid }
+
+    UpdateMarginSubtraderGroupRequest:
+      type: object
+      required: [subtrader_ids]
+      properties:
+        subtrader_ids:
+          type: array
+          minItems: 1
+          items: { type: string, minLength: 1 }
+          description: Full desired list of subtrader IDs belonging to the clearing member. Subtraders must not belong to another group.
+
+    MarginSubtraderGroup:
+      type: object
+      required: [group_id, member_subtrader_ids]
+      properties:
+        group_id: { type: string, format: uuid }
+        member_subtrader_ids:
+          type: array
+          items: { type: string }
+
+    GetMarginSubtraderGroupsResponse:
+      type: object
+      required: [groups]
+      properties:
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/MarginSubtraderGroup' }
+
+    CreateMarginFcmApiKeyRequest:
+      type: object
+      required: [name, public_key, fcm_subtrader_id]
+      properties:
+        name:
+          type: string
+          description: Name identifying the key's purpose, e.g. the institution it is issued to.
+        public_key:
+          type: string
+          description: RSA or Ed25519 public key in PEM format. Signatures on the institution's requests verify against it with the key's algorithm.
+        fcm_subtrader_id:
+          type: string
+          description: The subtrader to bind, spelled {your_account_id}_{suffix} with a suffix of 1-16 characters of [a-z0-9]. Must already exist and belong to you.
+
+    CreateMarginFcmApiKeyResponse:
+      type: object
+      required: [api_key_id]
+      properties:
+        api_key_id: { type: string }
+        warning:
+          type: string
+          nullable: true
+          description: Present only when the bound subtrader is missing a per-subtrader risk control - the initial-margin cap (margin lane) or the event-contract daily cap. The mint still succeeds; the warning names each missing control - an event-contract subtrader without a daily cap has its event-contract orders rejected until one is set, while a margin subtrader without an initial-margin cap is bounded only by firm-level risk limits.
+
+    GenerateMarginFcmApiKeyRequest:
+      type: object
+      required: [name, fcm_subtrader_id]
+      properties:
+        name:
+          type: string
+          description: Name identifying the key's purpose, e.g. the institution it is issued to.
+        fcm_subtrader_id:
+          type: string
+          description: The subtrader to bind, spelled {your_account_id}_{suffix} with a suffix of 1-16 characters of [a-z0-9]. Must already exist and belong to you.
+
+    GenerateMarginFcmApiKeyResponse:
+      type: object
+      required: [api_key_id, private_key]
+      properties:
+        api_key_id: { type: string }
+        private_key:
+          type: string
+          description: RSA private key in PEM format. Returned exactly once and never stored; it cannot be retrieved again.
+        warning:
+          type: string
+          nullable: true
+          description: Present only when the bound subtrader is missing a per-subtrader risk control - the initial-margin cap (margin lane) or the event-contract daily cap. The mint still succeeds; the warning names each missing control - an event-contract subtrader without a daily cap has its event-contract orders rejected until one is set, while a margin subtrader without an initial-margin cap is bounded only by firm-level risk limits.
+
+    MarginFcmApiKey:
+      type: object
+      required: [api_key_id, name, fcm_subtrader_id]
+      properties:
+        api_key_id: { type: string }
+        name: { type: string }
+        fcm_subtrader_id: { type: string }
+
+    ListMarginFcmApiKeysResponse:
+      type: object
+      required: [api_keys]
+      properties:
+        api_keys:
+          type: array
+          items: { $ref: '#/components/schemas/MarginFcmApiKey' }

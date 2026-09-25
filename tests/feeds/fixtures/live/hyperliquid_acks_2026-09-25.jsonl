@@ -1,0 +1,3 @@
+{"t":1790364945390991000,"s":"hyperliquid.ws","q":0,"d":"{\"channel\":\"subscriptionResponse\",\"data\":{\"method\":\"subscribe\",\"subscription\":{\"type\":\"l2Book\",\"coin\":\"BTC\",\"nSigFigs\":null,\"mantissa\":null,\"fast\":false}}}"}
+{"t":1790364945391136000,"s":"hyperliquid.ws","q":0,"d":"{\"channel\":\"subscriptionResponse\",\"data\":{\"method\":\"subscribe\",\"subscription\":{\"type\":\"trades\",\"coin\":\"BTC\"}}}"}
+{"t":1790364945395612000,"s":"hyperliquid.ws","q":0,"d":"{\"channel\":\"subscriptionResponse\",\"data\":{\"method\":\"subscribe\",\"subscription\":{\"type\":\"activeAssetCtx\",\"coin\":\"BTC\"}}}"}

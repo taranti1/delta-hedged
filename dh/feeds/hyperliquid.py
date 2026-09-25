@@ -8,6 +8,9 @@ ASSUMED WIRE FORMAT (hyperliquid.gitbook.io "WebSocket / Subscriptions"; verify 
              {"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}
              {"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}
              ack {"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{...}}}
+             VERIFIED LIVE 2026-09-25: the ack echoes l2Book options {"nSigFigs":null,"mantissa":null,
+             "fast":false}. Without "fast": true the l2Book snapshot is pushed only every ~3-5 s;
+             with it every ~0.5 s. Option ``fast`` (default true) adds "fast": true to l2Book.
   keepalive  {"method":"ping"} -> {"channel":"pong"}; the server drops connections that sent
              nothing for 60 s.
   l2Book     {"channel":"l2Book","data":{"coin":"BTC","time":<ms>,"levels":[[{"px":"...","sz":"...",
@@ -47,11 +50,15 @@ class HyperliquidFeed(FeedClient):
     resnapshot_interval_s: ClassVar[float] = 0.0  # l2Book messages are full snapshots
 
     def subscribe_messages(self) -> list[str]:
-        return [
-            dumps({"method": "subscribe", "subscription": {"type": ch, "coin": coin}})
-            for ch in self.channels
-            for coin in self.symbols
-        ]
+        fast = bool(self.options.get("fast", True))
+        out = []
+        for ch in self.channels:
+            for coin in self.symbols:
+                sub: dict = {"type": ch, "coin": coin}
+                if ch == "l2Book" and fast:
+                    sub["fast"] = True  # ~0.5 s snapshots instead of ~3-5 s (verified live)
+                out.append(dumps({"method": "subscribe", "subscription": sub}))
+        return out
 
     def keepalive_message(self) -> str | None:
         return dumps({"method": "ping"})

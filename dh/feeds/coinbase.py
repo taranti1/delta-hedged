@@ -21,14 +21,20 @@ ASSUMED WIRE FORMAT (Advanced Trade WS docs, "WebSocket Channels"; verify live w
   heartbeats channel "heartbeats" once per second (keeps idle subscriptions open).
   errors     {"type": "error", "message": "..."}
 
-  SEQUENCE_SCOPE   sequence_num is assumed to be ONE counter per connection, incremented by
-                   exactly 1 for every message on that connection across all channels. A jump
-                   is a gap -> the book is invalidated and level2 is resubscribed (fresh
-                   snapshot). If live data shows per-channel counters, set SEQUENCE_SCOPE to
-                   "channel".
-  TRADE_SIDE       market_trades ``side`` is assumed to be the TAKER (aggressor) side. The
-                   smoke test measures this (buy-aggressor trades should print at/above mid);
-                   flip TRADE_SIDE_IS_TAKER if it reports the inverse.
+  SEQUENCE_SCOPE   sequence_num is ONE counter per connection, incremented by exactly 1 for
+                   every message on that connection across all channels (VERIFIED LIVE
+                   2026-09-25: 0 gaps over ~1,200 frames of level2 + market_trades +
+                   heartbeats). A jump is a gap -> the book is invalidated and level2 is
+                   resubscribed (fresh snapshot).
+  TRADE_SIDE       market_trades ``side`` is the MAKER order's side, NOT the taker's
+                   (VERIFIED LIVE 2026-09-25, smoke_feeds aggressor check: with side read as
+                   taker only 0.04 of 264 trades were consistent with the book; e.g. "BUY"
+                   prints at the best BID = a seller hit a resting buy). The aggressor is the
+                   opposite of ``side`` (TRADE_SIDE_IS_TAKER = False), as on the legacy
+                   Coinbase Exchange feed.
+  AUTH             level2 / market_trades / heartbeats work WITHOUT credentials on
+                   advanced-trade-ws.coinbase.com (verified live 2026-09-25).
+  VOLUME           level2 is the FULL book (~20k levels per side; ~90 kB/s of raw frames).
 """
 
 from __future__ import annotations
@@ -55,8 +61,8 @@ from dh.feeds.base import (
 
 VENUE = "coinbase"
 URL = "wss://advanced-trade-ws.coinbase.com"
-SEQUENCE_SCOPE = "connection"  # "connection" | "channel"   (MUST VERIFY LIVE)
-TRADE_SIDE_IS_TAKER = True  # (MUST VERIFY LIVE: smoke test aggressor check)
+SEQUENCE_SCOPE = "connection"  # "connection" | "channel"   (verified live 2026-09-25)
+TRADE_SIDE_IS_TAKER = False  # market_trades 'side' = MAKER side (verified live 2026-09-25)
 
 
 def _aggressor(side: str) -> str:

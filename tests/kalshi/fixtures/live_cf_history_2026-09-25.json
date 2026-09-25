@@ -1,0 +1,55 @@
+{
+  "_note": "real response 2026-09-25 (GET /cfbenchmarks/history/values?id=BRTI&timespan=HOUR&timestamp=2026-09-25T17:00:00.000Z); payload trimmed to the first 5 and last 5 of 18000 rows",
+  "request_params": {
+    "id": "BRTI",
+    "timespan": "HOUR",
+    "timestamp": "2026-09-25T17:00:00.000Z"
+  },
+  "body": {
+    "data": {
+      "serverTime": "2026-09-25T19:44:54.863Z",
+      "payload": [
+        {
+          "time": 1790355600000,
+          "value": "83737.50"
+        },
+        {
+          "time": 1790355600200,
+          "value": "83737.37"
+        },
+        {
+          "time": 1790355600400,
+          "value": "83739.06"
+        },
+        {
+          "time": 1790355600600,
+          "value": "83740.38"
+        },
+        {
+          "time": 1790355600800,
+          "value": "83738.10"
+        },
+        {
+          "time": 1790359199000,
+          "value": "83772.07"
+        },
+        {
+          "time": 1790359199200,
+          "value": "83772.05"
+        },
+        {
+          "time": 1790359199400,
+          "value": "83771.96"
+        },
+        {
+          "time": 1790359199600,
+          "value": "83772.03"
+        },
+        {
+          "time": 1790359199800,
+          "value": "83772.30"
+        }
+      ]
+    }
+  }
+}

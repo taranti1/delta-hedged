@@ -4,6 +4,11 @@ BRTI constituent.
 ASSUMED WIRE FORMAT (bitstamp.net/websocket/v2 and /api "Order book" docs; verify live with
 ``python scripts/smoke_feeds.py --venues bitstamp``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, 90 s): diffs + REST snapshot alignment, trades "type"
+0/1 = buy/sell taker (1.00 consistent). The first live run found a bug outside the format:
+recording the REST snapshot raised TypeError (dh.feeds.base.make_marker parameter named
+``kind``), so the book never became valid; fixed (positional-only parameters).
+
   endpoint   wss://ws.bitstamp.net
   subscribe  {"event":"bts:subscribe","data":{"channel":"diff_order_book_btcusd"}}
              {"event":"bts:subscribe","data":{"channel":"live_trades_btcusd"}}

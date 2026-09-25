@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Market-data recorder (scripts/record.py) as a per-user launchd agent on this Mac.
+  NOT installed by default: see deploy/launchd/README.md (launchctl bootstrap gui/$(id -u) ...).
+  caffeinate -i keeps the Mac from idle-sleeping while the recorder runs (it does not stop
+  sleep on lid close). Paths are absolute for this host (/Users/thomast/Desktop/delta-hedged).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dh.recorder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>/Users/thomast/Desktop/delta-hedged/.venv/bin/python</string>
+    <string>/Users/thomast/Desktop/delta-hedged/scripts/record.py</string>
+    <string>--config</string>
+    <string>/Users/thomast/Desktop/delta-hedged/config/feeds.yaml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/thomast/Desktop/delta-hedged</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- sntp (clock samples) and git (session metadata) live in /usr/bin -->
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- always restart (crash, network loss at start-up, exit 2 while another recorder holds
+       data/recorder.lock); ThrottleInterval spaces restarts -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!-- SIGTERM -> the recorder flushes, fsyncs and writes segment indexes -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <!-- Standard, not Background: Background agents get throttled CPU/IO -->
+  <key>ProcessType</key>
+  <string>Standard</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/thomast/Desktop/delta-hedged/data/logs/record.launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/thomast/Desktop/delta-hedged/data/logs/record.launchd.out</string>
+</dict>
+</plist>

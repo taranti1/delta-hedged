@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Compare our fee model with the account's real fills and with the series fee settings.
 
-    export KALSHI_KEY_ID=...  KALSHI_PRIVATE_KEY_PATH=...
+    export KALSHI_KEY_ID=...  KALSHI_PRIVATE_KEY_PATH=...   # or auth.env_file in config/kalshi.yaml
     python scripts/verify_fee_schedule.py --days 14
     python scripts/verify_fee_schedule.py --series KXBTCD KXBTC --ticker-prefix KXBTC --show 50
 
@@ -150,13 +150,14 @@ async def amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.config, env="demo" if args.demo else None)
     signer = cfg.signer()
     if signer is None:
-        print("credentials required: set KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH", file=sys.stderr)
+        print(f"credentials required: {cfg.credentials_hint()}", file=sys.stderr)
         return 2
     engine = cfg.fee_engine()
     print(f"fee config: {engine.rates.source} (effective_from={engine.rates.effective_from}, "
           f"verified_against_live_fills={engine.rates.verified_against_live_fills})")
-    async with KalshiRest(cfg.rest_url, signer, cfg.limiter(), **cfg.rest_kwargs()) as rest:
+    async with KalshiRest(cfg.rest_url, signer, cfg.limiter(), read_only=True, **cfg.rest_kwargs()) as rest:
         await rest.configure_rate_limits()
+        print(f"rate limiter: {rest.limiter.describe()}")
         bad = await check_series(rest, engine, list(args.series))
         bad += await check_fills(rest, engine, args.days, args.ticker_prefix, args.show)
     print("\nRESULT:", "OK" if not bad else f"{bad} problem(s)")

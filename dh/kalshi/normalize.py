@@ -691,6 +691,10 @@ def rest_fill_to_event(row: dict, recv_ns: int) -> KalshiFill:
 def cf_history_to_ticks(body: Any, recv_ns: int, index_id: str = "BRTI") -> list[IndexTick]:
     """CF Benchmarks REST passthrough body -> IndexTick(feed='rest'), ascending by source time.
 
+    VERIFIED LIVE 2026-09-25: /cfbenchmarks/history/values returns
+    {"data": {"serverTime": "...", "payload": [{"time": <epoch ms>, "value": "83737.50"}, ...]}}
+    (the upstream CF body wrapped in Kalshi's "data" envelope).
+
     The passthrough is not in the openapi spec, so the shape is parsed defensively: rows are
     looked up under 'payload' | 'values' | 'data' | 'history' | 'results' (or the body is a
     list); a row is {value|v|price, time|t|timestamp|ts|source_ts_ms} or [time, value]; times
@@ -701,8 +705,8 @@ def cf_history_to_ticks(body: Any, recv_ns: int, index_id: str = "BRTI") -> list
         rows = None
         for key in ("payload", "values", "data", "history", "results"):
             v = body.get(key)
-            if isinstance(v, dict):
-                v = next((v[k] for k in ("values", "data", "history") if isinstance(v.get(k), list)), None)
+            if isinstance(v, dict):  # e.g. the passthrough's {"data": {"serverTime", "payload": [...]}}
+                v = next((v[k] for k in ("payload", "values", "data", "history") if isinstance(v.get(k), list)), None)
             if isinstance(v, list):
                 rows = v
                 break

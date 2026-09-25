@@ -384,9 +384,11 @@ def snapshot_event(
 
 
 # ============================================================================ markers
-def make_marker(kind: str, conn: int, **fields: Any) -> bytes:
-    """Serialize a control record. ``_dh`` is always the first key (fast prefix test)."""
-    d: dict[str, Any] = {"_dh": kind, "conn": conn}
+def make_marker(marker: str, conn: int, /, **fields: Any) -> bytes:
+    """Serialize a control record. ``_dh`` is always the first key (fast prefix test).
+    Positional-only parameters: REST markers carry a field named ``kind`` (found live
+    2026-09-25: a ``kind`` parameter name made every REST snapshot marker raise TypeError)."""
+    d: dict[str, Any] = {"_dh": marker, "conn": conn}
     d.update(fields)
     return orjson.dumps(d)
 

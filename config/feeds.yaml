@@ -97,20 +97,24 @@ feeds:
     channels: [options]
     currency: BTC
     option_expiries: 2            # nearest N expiries
-    option_moneyness: 0.10        # |K/S - 1| <= 10%
+    # Measured 2026-09-25: +/-10% = ~104 instruments, ~100 msg/s, 34 MB/h on disk (the largest
+    # external stream). M1 only needs near-ATM implied vol (KXBTCD strikes sit within a few % of
+    # spot), and "agg2" is not sparser than "100ms" (~1 update/s per instrument either way), so
+    # the instrument set is narrowed instead: +/-5%.
+    option_moneyness: 0.05        # |K/S - 1| <= 5%
     option_max: 300
     option_interval: 100ms        # ticker.<instrument>.<interval>; "agg2" for fewer messages
     rediscover_s: 900
     resnapshot_interval_s: 0
     stale_after_s: 30
-  binance_futures:                # GEO-RESTRICTED (HTTP 451 from the US): enable only where allowed
+  binance_futures:                # GEO-RESTRICTED: HTTP 451 from this US host (verified 2026-09-25); enable only where allowed
     enabled: false
     stream: binance_futures.ws
     symbols: [BTCUSDT]
     channels: [bookTicker, aggTrade, markPrice, forceOrder]
     # url: wss://fstream.binance.com/stream?streams=...   (built from symbols/channels if unset)
-  bybit:
-    enabled: true
+  bybit:                          # GEO-RESTRICTED: HTTP 403 from this US host (verified 2026-09-25); enable only where allowed
+    enabled: false
     stream: bybit.ws
     url: wss://stream.bybit.com/v5/public/linear
     symbols: [BTCUSDT]
@@ -143,8 +147,17 @@ kalshi:
   lifecycle_channels: [market_lifecycle_v2]   # all markets (new-market discovery + settlements)
   index_channels: [cfbenchmarks_value, cfbenchmarks_value_5hz]
   index_ids: [BRTI]
-  market_horizon_h: 30            # subscribe to open markets closing within this many hours (0 = all)
+  # 0 = ALL open markets of the series. Seen 2026-09-25: besides the current/next hours and the
+  # next day's 17:00 event there is a weekly event (~7 days out, 50 markets per series) that a
+  # 30 h horizon excluded; ~360 markets in total, the far-dated ones are quiet.
+  market_horizon_h: 0             # subscribe to open markets closing within this many hours (0 = all)
   market_refresh_s: 300           # REST re-discovery of open markets (plus lifecycle-triggered refresh)
+  pending_lookahead_h: 3          # markets closing within this window that are not open yet are
+                                  # re-discovered ~2 s after their open_time (next KXBTC15M, next hour)
+  min_refresh_gap_s: 15           # lifecycle-triggered re-discoveries at most this often
   rest_orderbook_interval_s: 60   # periodic REST order-book snapshots of subscribed markets (0 = off)
-  cf_history_interval_s: 0        # >0: poll the CF Benchmarks REST passthrough (BRTI history)
+  # >0: poll the CF Benchmarks REST passthrough (BRTI history). Off: the WS records BRTI at 1 and
+  # 5 Hz. NOTE the passthrough needs timespan=HOUR AND an hour-aligned ISO timestamp (verified
+  # 2026-09-25, see dh.live.config.BackfillCfg); this poll only sends the timespan.
+  cf_history_interval_s: 0
   cf_history_timespan: null

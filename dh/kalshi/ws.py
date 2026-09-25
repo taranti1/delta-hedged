@@ -10,6 +10,15 @@ Behaviour
   * Subscribe: one ``subscribe`` command per Subscription with an incrementing ``id``
     (unique for the client's lifetime); orderbook subscriptions send ``use_yes_price``
     explicitly (default false: NO bids on the NO price scale, the normalizer's convention).
+    VERIFIED LIVE (prod, 2026-09-25): the server keeps ONE subscription (sid) per channel
+    per connection. The first subscribe for a channel is answered with
+    ``{"type":"subscribed","id":N,"msg":{"channel":C,"sid":S}}`` per channel; a later
+    subscribe for a channel that already has a sid on this connection (our market shards)
+    is MERGED into it and answered with ``{"type":"ok","id":N,"sid":S,"seq":K,
+    "msg":{"market_tickers":[<the full merged list>]}}`` (``seq`` present on sequenced
+    channels: the ok consumes a number of the sid's sequence; the ticker channel has no seq).
+    Each shard is therefore mapped to the existing sid from those ``ok`` replies, so
+    add/delete_markets on any shard reach the server immediately.
   * Raw capture: ``on_raw('kalshi.ws', recv_ns, raw_bytes)`` for EVERY inbound frame, before
     parsing, plus synthetic ``dh.feed_status`` records for connected / disconnected / stale /
     error (see dh.kalshi.sequencer) so replay reproduces outages.
@@ -205,6 +214,7 @@ class KalshiWS:
         self._pending: dict[int, tuple[str, int | None]] = {}  # cmd id -> (cmd, sub index)
         self._sub_sids: dict[int, dict[str, int]] = {}  # sub index -> channel -> sid
         self._sub_sent: dict[int, tuple[list[str], list[str]]] = {}  # sub index -> (tickers, index_ids) in subscribe
+        self._unmapped_ok: list[tuple[int, int]] = []  # (sub index, sid) from 'ok' before the sid's 'subscribed'
         self._resync_since: dict[tuple[int, str], float] = {}
         self.connects = 0
         self.stats: dict[str, int] = {"frames": 0, "events": 0, "commands": 0}
@@ -240,6 +250,7 @@ class KalshiWS:
             self._pending.clear()
             self._sub_sids.clear()
             self._sub_sent.clear()
+            self._unmapped_ok.clear()
             self._resync_since.clear()
             self._synthetic("connected", self.url)
             reason = "closed"
@@ -375,6 +386,14 @@ class KalshiWS:
                 return i
         raise KeyError(f"no subscription carries channel {channel!r}")
 
+    def _channel_of_sid(self, sid: int) -> str | None:
+        """Channel of a sid on this connection (from 'subscribed' replies), None if unknown."""
+        for chans in self._sub_sids.values():
+            for ch, s in chans.items():
+                if s == sid:
+                    return ch
+        return None
+
     def _channel_sid(self, channel: str) -> int | None:
         for chans in self._sub_sids.values():
             if channel in chans:
@@ -482,6 +501,25 @@ class KalshiWS:
                 channel, sid = str(body.get("channel")), int(body["sid"])
                 self._sub_sids.setdefault(pend[1], {})[channel] = sid
                 await self._sync_new_sid(pend[1], channel, sid)
+                waiting = [(i, s) for i, s in self._unmapped_ok if s == sid]
+                if waiting:
+                    self._unmapped_ok = [(i, s) for i, s in self._unmapped_ok if s != sid]
+                    for i, s in waiting:
+                        self._sub_sids.setdefault(i, {})[channel] = s
+                        await self._sync_new_sid(i, channel, s)
+        elif typ == "ok":
+            # A subscribe merged into an existing per-channel sid (see module docstring):
+            # map this shard to that sid (channel known from its 'subscribed' reply).
+            cid, sid_raw = msg.get("id"), msg.get("sid")
+            pend = self._pending.get(int(cid)) if cid is not None else None
+            if pend is not None and pend[0] == "subscribe" and pend[1] is not None and sid_raw is not None:
+                sid = int(sid_raw)
+                channel = self._channel_of_sid(sid)
+                if channel is None:
+                    self._unmapped_ok.append((pend[1], sid))
+                elif self._sub_sids.setdefault(pend[1], {}).get(channel) != sid:
+                    self._sub_sids[pend[1]][channel] = sid
+                    await self._sync_new_sid(pend[1], channel, sid)
         elif typ == "error":
             body = as_dict(msg.get("msg"))
             raw_code = body.get("code")

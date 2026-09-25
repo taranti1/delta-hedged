@@ -4,6 +4,9 @@ mark-price, open-interest, index-tickers, liquidation-orders.
 ASSUMED WIRE FORMAT (okx.com/docs-v5 "WebSocket Public Channel"; verify live with
 ``python scripts/smoke_feeds.py --venues okx``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, 60 s, no credentials): books5, trades (side = taker,
+1.00 consistent), funding, mark, OI, index, liquidations; 0 gaps. Format below confirmed.
+
   endpoint   wss://ws.okx.com:8443/ws/v5/public
   subscribe  {"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT-SWAP"},
               {"channel":"trades","instId":...},{"channel":"funding-rate","instId":...},

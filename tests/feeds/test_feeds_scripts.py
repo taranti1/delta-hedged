@@ -162,3 +162,47 @@ async def test_collector_end_to_end_against_loopback_venue(tmp_path):
     from dh.store.replay import read_index, segment_files
 
     assert all(read_index(p) is not None for _h, _p, p in segment_files(tmp_path, "coinbase.ws"))
+
+
+def test_record_single_instance_lock(tmp_path):
+    """Two recorders on one store would interleave segment files: the second refuses."""
+    first = record.acquire_single_instance_lock(tmp_path)
+    assert first is not None and (tmp_path / "recorder.lock").read_text().strip().isdigit()
+    assert record.acquire_single_instance_lock(tmp_path) is None
+    first.close()  # released (process exit releases it too)
+    again = record.acquire_single_instance_lock(tmp_path)
+    assert again is not None
+    again.close()
+
+
+def test_record_kalshi_lifecycle_refresh_triggers(tmp_path):
+    """Found live 2026-09-25: Kalshi 'created' a day of KXBTC15M markets at once (open_ts hours
+    ahead) and each event re-ran discovery (~1 REST call/s). Future markets are now parked in
+    pending_open and refreshed once they open; open/activated markets refresh immediately."""
+    import time as _time
+
+    from dh.core.events import KalshiMarketLifecycle
+
+    class _Mon:
+        def on_kalshi_event(self, ev):
+            pass
+
+    async def go():
+        ks = record.KalshiSource({"series": ["KXBTC15M"]}, Recorder(tmp_path, start=False), _Mon(), asyncio.Event())
+        now = _time.time_ns()
+        future = KalshiMarketLifecycle(ts=now, ts_exch=0, ticker="KXBTC15M-X-15", event_type="created", open_ts=now + 3600 * 10**9)
+        ks.on_event(future)
+        assert not ks._refresh_now.is_set() and ks.pending_open == {"KXBTC15M-X-15": future.open_ts}
+        assert not ks.pending_due()
+        ks.pending_open["KXBTC15M-X-15"] = now - 5 * 10**9  # it opened 5 s ago
+        ks._last_refresh_mono = _time.monotonic() - 60
+        assert ks.pending_due()
+        ks.tickers = ["KXBTC15M-X-15"]  # discovery found it: no longer pending
+        assert not ks.pending_due() and ks.pending_open == {}
+        ks.on_event(KalshiMarketLifecycle(ts=now, ts_exch=0, ticker="KXBTC15M-Y-30", event_type="activated"))
+        assert ks._refresh_now.is_set()
+        ks._refresh_now.clear()
+        ks.on_event(KalshiMarketLifecycle(ts=now, ts_exch=0, ticker="KXOTHER-Z", event_type="created"))
+        assert not ks._refresh_now.is_set()
+
+    asyncio.run(go())

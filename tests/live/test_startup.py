@@ -133,14 +133,24 @@ def test_spec_roundtrip():
 
 
 def _cf_history(end_ns: int, days: float, rng_seed: int = 0, step_ms: int = 1000):
-    """Fake passthrough: 1 Hz BRTI for the requested window (timespan '<s>s', timestamp end ms)."""
+    """Fake passthrough for the requested window: the verified live format (timespan 'HOUR',
+    timestamp = hour START as ISO ms, rows in [start, start + 1 h)) or the legacy test templates
+    (timespan '<s>s', timestamp end ms)."""
+    import datetime as _dt
+
     rng = np.random.default_rng(rng_seed)
 
     def body(timespan, timestamp):
-        span = int(str(timespan).rstrip("s"))
-        end_ms = int(timestamp)
-        start_ms = end_ms - span * 1000
-        ts = np.arange(start_ms, end_ms + 1, step_ms)
+        if str(timespan) == "HOUR":
+            start = _dt.datetime.strptime(str(timestamp), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=_dt.timezone.utc)
+            start_ms = int(start.timestamp()) * 1000
+            ts = np.arange(start_ms, start_ms + 3_600_000, step_ms)
+            ts = ts[ts <= end_ns // 1_000_000]  # nothing after "now"
+        else:
+            span = int(str(timespan).rstrip("s"))
+            end_ms = int(timestamp)
+            start_ms = end_ms - span * 1000
+            ts = np.arange(start_ms, end_ms + 1, step_ms)
         base = 84_000.0 * np.exp(np.cumsum(rng.standard_normal(len(ts)) * 0.35 / math.sqrt(365 * 86400)))
         return {"payload": [{"time": int(t), "value": f"{v:.2f}"} for t, v in zip(ts, base)]}
 
@@ -152,7 +162,7 @@ async def test_backfill_chunks_resamples_and_warms_model():
     rest.cf_history = _cf_history(T0, 2.0, step_ms=10_000)
     fv = FairValueModel.from_config(load_recommended_config())
     assert not fv.ready
-    cfg = BackfillCfg(days=2.0, chunk_s=6 * 3600, step_s=60)
+    cfg = BackfillCfg(days=2.0, chunk_s=6 * 3600, step_s=60, timespan="{span_s}s", timestamp="{end_ms}", align=False)
     res = await backfill_fair_value(rest, fv, T0, cfg)
     assert res.ready and fv.ready and res.source == "cfbenchmarks_rest"
     assert res.requests == 8 and res.coverage > 0.99
@@ -183,7 +193,7 @@ async def test_backfill_too_sparse_is_not_used():
 
     rest.cf_history = body
     fv = FairValueModel.from_config(load_recommended_config())
-    res = await backfill_fair_value(rest, fv, T0, BackfillCfg())
+    res = await backfill_fair_value(rest, fv, T0, BackfillCfg(timespan="{span_s}s", timestamp="{end_ms}", align=False))
     assert res.source == "none" and not fv.ready and res.coverage < 0.9
 
 

@@ -3,6 +3,9 @@
 ASSUMED WIRE FORMAT (docs.gemini.com "Market Data Version 2"; verify live with
 ``python scripts/smoke_feeds.py --venues gemini``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, 60 s, no credentials): l2 snapshot + updates + trades,
+trade side consistent with the book, 0 gaps. Format below confirmed.
+
   endpoint   wss://api.gemini.com/v2/marketdata
   subscribe  {"type":"subscribe","subscriptions":[{"name":"l2","symbols":["BTCUSD"]}]}
   l2         {"type":"l2_updates","symbol":"BTCUSD","changes":[["buy","9122.04","0.00121425"],

@@ -521,13 +521,54 @@ def _timedatectl() -> dict[str, Any] | None:
     return d or None
 
 
+_SNTP_RE = re.compile(r"^\s*([+-][0-9.]+)\s+\+/-\s+([0-9.]+)\s+(\S+)")
+SNTP_DEFAULT_SERVER = "time.apple.com"
+SNTP_ENABLED = True  # the test suite turns this off (a network round trip per sample)
+
+
+def _ntp_server() -> str:
+    """First 'server' of /etc/ntp.conf (macOS writes the System Settings time server there)."""
+    try:
+        for line in Path("/etc/ntp.conf").read_text().splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[0] == "server":
+                return f[1]
+    except OSError:
+        pass
+    return SNTP_DEFAULT_SERVER
+
+
+def _sntp(server: str | None = None, timeout_s: int = 2) -> dict[str, Any] | None:
+    """macOS fallback (no chronyc / timedatectl / adjtimex): one query-only SNTP exchange
+    (``sntp -t <timeout> <server>``; without -s/-S sntp never sets the clock, no root needed).
+    Output's last line '+0.034883 +/- 0.021637 time.apple.com <addr>': offset = server - local
+    (positive = local clock BEHIND true time, the same sign as chronyc's 'slow' offset), and
+    the +/- error bound. One network round trip (~50 ms, up to a few s on a timeout)."""
+    if not SNTP_ENABLED:
+        return None
+    srv = server or _ntp_server()
+    out = _run_cmd(["sntp", "-t", str(int(timeout_s)), srv], timeout=3.0 * timeout_s + 2)
+    if not out:
+        return None
+    for line in reversed(out.strip().splitlines()):
+        m = _SNTP_RE.match(line)
+        if m:
+            return {"offset_s": float(m.group(1)), "est_error_s": float(m.group(2)), "server": m.group(3),
+                    "raw": line.strip()[:200]}
+    return None
+
+
 def sample_clock() -> dict[str, Any]:
     """Best-effort clock-health sample. ``src`` is the most informative source found:
-    'chronyc' > 'timedatectl' > 'adjtimex' > 'unknown'. Offsets in seconds."""
+    'chronyc' > 'timedatectl' > 'adjtimex' > 'sntp' (macOS: query-only SNTP offset against
+    the configured time server; ``synced`` stays None: it measures, it does not tell whether
+    the OS disciplines the clock) > 'unknown'. Offsets in seconds, positive = local clock
+    behind. The live runner only trusts 'chronyc'/'timedatectl' (dh.live.runner.CLOCK_SOURCES)."""
     rec: dict[str, Any] = {"wall_ns": time.time_ns(), "mono_ns": time.monotonic_ns()}
     chrony = _chronyc()
     tdc = None if chrony else _timedatectl()
     adj = _adjtimex()
+    sn = _sntp() if not (chrony or tdc or adj) else None
     if chrony:
         rec.update(src="chronyc", offset_s=chrony.get("offset_s"), est_error_s=chrony.get("est_error_s"), synced=chrony.get("synced"))
         rec["chronyc"] = chrony
@@ -536,6 +577,9 @@ def sample_clock() -> dict[str, Any]:
         rec["timedatectl"] = tdc
     elif adj:
         rec.update(src="adjtimex", offset_s=adj.get("offset_s"), est_error_s=adj.get("esterror_s"), synced=adj.get("synced"))
+    elif sn:
+        rec.update(src="sntp", offset_s=sn["offset_s"], est_error_s=sn["est_error_s"], synced=None)
+        rec["sntp"] = sn
     else:
         rec.update(src="unknown", offset_s=None, est_error_s=None, synced=None)
     if adj:

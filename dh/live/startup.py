@@ -172,10 +172,18 @@ class BackfillResult:
                 "last_ns": self.points[-1][0] if self.points else 0, "errors": self.errors[:5]}
 
 
+def _iso_ms(t_ns: int) -> str:
+    """UTC ISO-8601 with milliseconds and 'Z' (CF Benchmarks timestamp format)."""
+    import datetime as _dt
+
+    d = _dt.datetime.fromtimestamp(t_ns // NS_PER_MS / 1000, tz=_dt.timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{(t_ns // NS_PER_MS) % 1000:03d}Z"
+
+
 def _fill_template(tpl: str, start_ns: int, end_ns: int) -> str:
     return tpl.format(start_ms=start_ns // NS_PER_MS, end_ms=end_ns // NS_PER_MS, start_s=start_ns // NS_PER_S,
                       end_s=end_ns // NS_PER_S, span_s=(end_ns - start_ns) // NS_PER_S,
-                      span_ms=(end_ns - start_ns) // NS_PER_MS)
+                      span_ms=(end_ns - start_ns) // NS_PER_MS, start_iso=_iso_ms(start_ns), end_iso=_iso_ms(end_ns))
 
 
 async def fetch_benchmark_history(
@@ -193,9 +201,12 @@ async def fetch_benchmark_history(
     ticks: dict[int, IndexTick] = {}
     errors: list[str] = []
     n = 0
-    c_end = end_ns
+    align = bool(getattr(cfg, "align", False))
+    recent_ns = int(float(getattr(cfg, "recent_delay_s", 0.0)) * NS_PER_S)
+    # aligned: the newest chunk is the (partial) one containing end_ns, e.g. [18:00, 19:00)
+    c_end = -(-end_ns // chunk_ns) * chunk_ns if align else end_ns
     while c_end > start_all:
-        c_start = max(start_all, c_end - chunk_ns)
+        c_start = c_end - chunk_ns if align else max(start_all, c_end - chunk_ns)
         n += 1
         try:
             body = await rest.get_cfbenchmarks_history(
@@ -214,6 +225,10 @@ async def fetch_benchmark_history(
                 ticks[t.ts_exch] = t
                 got += 1
         if got == 0:
+            if recent_ns and c_end > end_ns - recent_ns:  # publication delay (CF: up to 15 min)
+                errors.append(f"chunk ending {c_end // NS_PER_S}: no ticks yet (recent; skipped)")
+                c_end = c_start
+                continue
             errors.append(f"chunk ending {c_end // NS_PER_S}: no ticks")
             break
         c_end = c_start

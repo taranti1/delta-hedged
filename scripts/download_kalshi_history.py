@@ -623,9 +623,9 @@ async def amain(args: argparse.Namespace) -> int:
     signer = cfg.signer()
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
     if "brti" in datasets and signer is None:
-        print("brti requested but no credentials (KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH): skipping BRTI", file=sys.stderr)
+        print(f"brti requested but no credentials ({cfg.credentials_hint()}): skipping BRTI", file=sys.stderr)
     out = args.out or Path(cfg.history.get("out_dir", "data/external/kalshi"))
-    async with KalshiRest(args.base_url or cfg.rest_url, signer, cfg.limiter(), **cfg.rest_kwargs()) as rest:
+    async with KalshiRest(args.base_url or cfg.rest_url, signer, cfg.limiter(), read_only=True, **cfg.rest_kwargs()) as rest:
         if signer is not None:
             await rest.configure_rate_limits()
         stats = await download(

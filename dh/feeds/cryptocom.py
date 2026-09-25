@@ -4,6 +4,9 @@ BRTI constituent.
 ASSUMED WIRE FORMAT (exchange-docs.crypto.com "Exchange API v1", book.{instrument}.{depth},
 trade.{instrument}; verify live with ``python scripts/smoke_feeds.py --venues cryptocom``):
 
+VERIFIED LIVE 2026-09-25 (smoke_feeds, 60 s, no credentials): book depth 50 + trades, 0 gaps,
+trade side consistent. Format below confirmed.
+
   endpoint   wss://stream.crypto.com/exchange/v1/market  (wait ~1 s after connecting before
              sending requests: rate limits are pro-rated from connection time)
   subscribe  {"id":1,"method":"subscribe","params":{"channels":["book.BTC_USD.50"],

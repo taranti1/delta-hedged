@@ -28,7 +28,9 @@ def dumps(obj: Any) -> str:
 
 
 class FakeConn:
-    def __init__(self, script: list[Any], *, hold_replies: bool = False, drop_snapshots: bool = False) -> None:
+    def __init__(self, script: list[Any], *, hold_replies: bool = False, drop_snapshots: bool = False,
+                 merge_subscriptions: bool = True) -> None:
+        self.merge_subscriptions = merge_subscriptions
         self.script: deque[Any] = deque(script)
         self.replies: deque[Any] = deque()  # str frames or thunks built at delivery time
         self.held: deque[Any] = deque()
@@ -92,12 +94,33 @@ class FakeConn:
         p = cmd.get("params") or {}
         if cmd["cmd"] == "subscribe":
             for ch in p["channels"]:
+                existing = [s for s, c in self.sid_channel.items() if c == ch]
+                if existing and self.merge_subscriptions:
+                    # Real server (verified live 2026-09-25): one sid per channel per connection;
+                    # a second subscribe merges its markets and is answered with 'ok' carrying
+                    # sid, a seq (sequenced channels; not 'ticker') and the full market list.
+                    sid = existing[0]
+                    new = [t for t in (p.get("market_tickers") or []) if t not in self.sid_tickers.setdefault(sid, [])]
+                    self.sid_tickers[sid] += new
+                    tickers = list(self.sid_tickers[sid])
+
+                    def ok(sid=sid, cid=cmd["id"], tickers=tickers, ch=ch) -> str:
+                        m: dict[str, Any] = {"type": "ok", "id": cid, "sid": sid, "msg": {"market_tickers": tickers}}
+                        if ch != "ticker":
+                            m["seq"] = self.next_seq(sid)
+                        return dumps(m)
+
+                    self.replies.append(ok)
+                    if ch == "orderbook_delta":
+                        for t in new:
+                            self.replies.append(lambda sid=sid, t=t: self.snapshot(sid, t))
+                    continue
                 sid = self.next_sid
                 self.next_sid += 1
                 self.sid_channel[sid] = ch
+                self.sid_tickers[sid] = list(p.get("market_tickers") or [])
                 self.replies.append(dumps({"id": cmd["id"], "type": "subscribed", "msg": {"channel": ch, "sid": sid}}))
                 if ch == "orderbook_delta":
-                    self.sid_tickers[sid] = list(p.get("market_tickers") or [])
                     for t in self.sid_tickers[sid]:
                         self.replies.append(lambda sid=sid, t=t: self.snapshot(sid, t))
         elif cmd["cmd"] == "update_subscription":
@@ -107,6 +130,7 @@ class FakeConn:
                     for t in p["market_tickers"]:
                         self._reply(lambda sid=sid, t=t, cid=cmd["id"]: self.snapshot(sid, t, cid=cid))
             elif p["action"] == "add_markets" and self.sid_channel.get(sid) == "orderbook_delta":
+                self.sid_tickers.setdefault(sid, [])
                 self.sid_tickers[sid] += p["market_tickers"]
                 tickers = list(self.sid_tickers[sid])
                 self.replies.append(lambda sid=sid, cid=cmd["id"], tickers=tickers: dumps(

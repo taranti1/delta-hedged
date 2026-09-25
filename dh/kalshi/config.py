@@ -1,7 +1,14 @@
 """Kalshi adapter configuration (config/kalshi.yaml, falling back to config/kalshi.example.yaml).
 
 Secrets are never stored in the config: the key id / private-key PATH come from the
-environment (KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH) or from placeholder fields.
+environment (``auth.key_id_env`` / ``auth.private_key_path_env``, default KALSHI_KEY_ID /
+KALSHI_PRIVATE_KEY_PATH) or from placeholder fields. ``auth.env_file`` (optional) names a
+host-local KEY=VALUE file that is loaded into the environment first (dh.kalshi.envfile:
+already-set variables win, ``ALLOW_*`` names are never loaded, values are never logged).
+
+``rate_limits.account_share`` (default 1.0) limits this process to that fraction of the
+account's REST budget (the budget is per account and shared with every other process using
+the account; see dh.kalshi.rate_limit).
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from typing import Any
 import yaml
 
 from dh.kalshi.auth import KalshiSigner
+from dh.kalshi.envfile import EnvFileReport, load_env_file
 from dh.kalshi.fees import FeeEngine, FeeRates
 from dh.kalshi.rate_limit import BucketLimit, KalshiRateLimiter
 
@@ -37,6 +45,21 @@ class KalshiConfig:
     fees: dict[str, Any] = field(default_factory=dict)
     history: dict[str, Any] = field(default_factory=dict)
     source: str = ""
+    key_id_env: str = "KALSHI_KEY_ID"
+    private_key_path_env: str = "KALSHI_PRIVATE_KEY_PATH"
+    env_file: str = ""  # resolved path of auth.env_file ('' = none)
+    env_file_report: EnvFileReport | None = None  # names only, safe to log
+
+    def credentials_hint(self) -> str:
+        """Where credentials are expected (names and paths only, never values)."""
+        where = f"{self.key_id_env} / {self.private_key_path_env}"
+        if self.env_file:
+            where += f" (environment or auth.env_file {self.env_file})"
+        return where
+
+    @property
+    def account_share(self) -> float:
+        return float((self.rate_limits or {}).get("account_share", 1.0) or 1.0)
 
     @property
     def has_credentials(self) -> bool:
@@ -55,7 +78,7 @@ class KalshiConfig:
             kw["read"] = BucketLimit.from_json(rl["read"])
         if "write" in rl:
             kw["write"] = BucketLimit.from_json(rl["write"])
-        return KalshiRateLimiter(**kw)
+        return KalshiRateLimiter(account_share=self.account_share, **kw)
 
     def fee_engine(self) -> FeeEngine:
         path = self.fees.get("config") or "config/fees.yaml"
@@ -94,10 +117,18 @@ def load_config(path: str | Path | None = None, env: str | None = None) -> Kalsh
     if not ep:
         raise ValueError(f"no endpoints for env {env!r} in {p}")
     auth = raw.get("auth") or {}
-    key_id = os.environ.get(str(auth.get("key_id_env", "KALSHI_KEY_ID")), "") or str(auth.get("key_id") or "")
-    key_path = os.environ.get(str(auth.get("private_key_path_env", "KALSHI_PRIVATE_KEY_PATH")), "") or str(
-        auth.get("private_key_path") or ""
-    )
+    env_file = ""
+    report: EnvFileReport | None = None
+    if auth.get("env_file"):
+        report = load_env_file(str(auth["env_file"]), base=REPO_ROOT)
+        env_file = report.path
+    key_id_env = str(auth.get("key_id_env", "KALSHI_KEY_ID"))
+    key_path_env = str(auth.get("private_key_path_env", "KALSHI_PRIVATE_KEY_PATH"))
+    key_id = os.environ.get(key_id_env, "") or str(auth.get("key_id") or "")
+    key_path = os.environ.get(key_path_env, "") or str(auth.get("private_key_path") or "")
+    share = float((raw.get("rate_limits") or {}).get("account_share", 1.0) or 1.0)
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"rate_limits.account_share must be in (0, 1], got {share} in {p}")
     return KalshiConfig(
         env=env,
         rest_url=str(ep["rest"]),
@@ -112,4 +143,8 @@ def load_config(path: str | Path | None = None, env: str | None = None) -> Kalsh
         fees=dict(raw.get("fees") or {}),
         history=dict(raw.get("history") or {}),
         source=str(p),
+        key_id_env=key_id_env,
+        private_key_path_env=key_path_env,
+        env_file=env_file,
+        env_file_report=report,
     )

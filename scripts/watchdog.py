@@ -58,6 +58,8 @@ def build_rest(lcfg: LiveConfig) -> Any:
     from dh.kalshi.config import load_config
     from dh.kalshi.rest import KalshiRest
 
+    # load_config also loads the kalshi config's auth.env_file (if any) into the environment
+    # (never overriding set variables, never ALLOW_*), so the watchdog key lookup below sees it
     kc = load_config(_resolve(lcfg.kalshi_config) if lcfg.kalshi_config else None, env=lcfg.kalshi_env or None)
     wd = lcfg.watchdog
     key_id = os.environ.get(wd.key_id_env, "")
@@ -68,8 +70,8 @@ def build_rest(lcfg: LiveConfig) -> Any:
     else:
         signer = kc.signer()
     if signer is None:
-        raise SystemExit("watchdog: no Kalshi credentials (set KALSHI_WATCHDOG_KEY_ID/_PRIVATE_KEY_PATH or KALSHI_KEY_ID/"
-                         "KALSHI_PRIVATE_KEY_PATH)")
+        raise SystemExit(f"watchdog: no Kalshi credentials (set {wd.key_id_env}/{wd.private_key_path_env} or "
+                         f"{kc.credentials_hint()})")
     kw = kc.rest_kwargs()
     kw.pop("cf_history_path", None)
     return KalshiRest(kc.rest_url, signer, kc.limiter(), **kw)
