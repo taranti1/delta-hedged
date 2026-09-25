@@ -209,7 +209,7 @@ Per-experiment method notes:
 ## 5. Synthetic demo (pipeline proof, not evidence)
 
 ```
-python scripts/run_experiment.py demo --jobs 4              # ~35 min on 4 cores -> docs/research/synthetic_demo/
+python scripts/run_experiment.py demo --jobs 4              # ~39 min on 4 cores -> docs/research/synthetic_demo/
 python scripts/run_experiment.py synth --root /tmp/synth --events 2 --spacing 300 --strike-delay 20
 python scripts/run_experiment.py all --root /tmp/synth --config synthetic --jobs 4
 ```
@@ -225,7 +225,12 @@ banner and every CSV a leading `synthetic` column. Known-answer tests
 publication delay (gain shrinks when the delay is removed); E8 finds many more +EV takes with a 3 s
 than a 0.2 s maker lag, with positive 1 s markouts after fees; E3 shadow fills mark out worse
 with informed flow on the same price path. E1 on the recording path recovers the injected maker lag
-(gap-closure half-life ~0.16 s for a 0.2 s lag vs ~1.5 s for a 3 s lag).
+(gap-closure half-life ~0.16 s for a 0.2 s lag vs ~1.5 s for a 3 s lag). The demo window has 4
+settlement events, so every event-based verdict in it is INCONCLUSIVE by the 20-event guard (the
+rule's outcome on the sample is kept in each report); the flow stage shows the in-sample /
+out-of-sample table (`flow/`). Leakage guards are tested in `tests/research/test_leakage_guards.py`
+(causal BTC bar join, time-split flow calibration recovering a regime change out of sample,
+in-sample FV / flow labels, replay wiring of fitted flow segments).
 
 ## 6. Limitations (read before trusting a number)
 

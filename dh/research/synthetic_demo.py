@@ -156,6 +156,9 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         "* **E3** informed takers pick off stale quotes -> maker fills are adversely selected; the test compares "
         "shadow-fill markouts with and without informed flow (`e3/`).", "",
         "## Results index (synthetic; policies B and C unless noted)", "",
+        f"Every event-based verdict below is reported INCONCLUSIVE: the window has {len(info.expirations)} settlement "
+        "events (< 20, `exp_common.MIN_DECISION_EVENTS`); each report keeps the decision rule's outcome on this "
+        "sample, which is what the pipeline check exercises.", "",
         "| experiment | output | headline (SYNTHETIC) | runtime |", "|---|---|---|---|",
         f"| replay | `replay_summary.csv` | fills A/B/C = {', '.join(str(x) for x in rep['fills'])}; net c/ct B "
         f"{_fmt(rep.loc[rep.policy == 'B', 'net_c_per_contract'].iloc[0])} | {timings['replay']:.0f} s |",

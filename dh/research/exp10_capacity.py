@@ -75,6 +75,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                                       "base_clip_contracts": cfg.quoting.clip_contracts,
                                       "limits_scaled_with_size": scale_limits})
     bk = cap[(cap.level_c == 0.0) & (cap.basis == "point")]
+    rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
     rep.verdict = "MEASUREMENT — breakeven clip multiple: " + ", ".join(
         f"{r.policy}: {r.max_clip_multiple:.3g}" for r in bk.itertuples()) if len(bk) else "MEASUREMENT"
     for w in run_warnings(runs):
