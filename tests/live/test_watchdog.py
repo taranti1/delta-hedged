@@ -137,3 +137,73 @@ async def test_watchdog_script_with_injected_rest(tmp_path, flag):
                               once=flag == "once", cancel_now=flag == "cancel_now", arm_on_start=True, max_age_s=0.0)
     assert await mod.amain(args, rest=rest) == 0
     assert rest.names() == ["cancel_all_orders"]
+
+
+# ============================================================================ live review fixes (M7, m12)
+def hb(tmp_path, clock, pid, mode="live", state="running", session="s", **extra):
+    write_heartbeat(tmp_path / "hb.json", {"mode": mode, "state": state, "pid": pid, "session": session, **extra},
+                    now_ns=clock())
+
+
+async def test_locks_onto_the_live_runner_and_ignores_other_writers(tmp_path):
+    """A paper runner (or any other process) writing the same heartbeat file can neither
+    disarm the watchdog nor keep it quiet after the live runner died."""
+    w, rest, clock = wd(tmp_path)
+    hb(tmp_path, clock, 100, session="live-a")
+    assert await w.step() == "ARMED" and w.st.armed == (100, "live-a")
+    hb(tmp_path, clock, 200, mode="paper", session="paper-b")
+    assert await w.step() == "ARMED"
+    for _ in range(12):  # the live runner is dead; the paper runner keeps beating
+        clock.advance(NS_PER_S // 4)
+        hb(tmp_path, clock, 200, mode="paper", session="paper-b")
+        await w.step()
+    assert w.st.state == "TRIGGERED" and rest.names() == ["cancel_all_orders"] and w.st.foreign > 0
+    # a second LIVE writer is ignored while armed, too
+    w2, rest2, clock2 = wd(tmp_path / "x")
+    (tmp_path / "x").mkdir()
+    hb(tmp_path / "x", clock2, 100, session="live-a")
+    await w2.step()
+    clock2.advance(NS_PER_S)
+    hb(tmp_path / "x", clock2, 300, session="live-c", state="stopped")  # someone else's clean stop
+    assert await w2.step() == "ARMED"  # not disarmed by another process
+
+
+async def test_trigger_rearms_on_a_new_live_runner(tmp_path):
+    w, rest, clock = wd(tmp_path)
+    hb(tmp_path, clock, 100, session="live-a")
+    await w.step()
+    clock.advance(3 * NS_PER_S)
+    assert await w.step() == "TRIGGERED"
+    hb(tmp_path, clock, 101, session="live-b")  # restarted runner
+    assert await w.step() == "ARMED" and w.st.armed == (101, "live-b")
+    hb(tmp_path, clock, 101, session="live-b", state="stopped")
+    assert await w.step() == "DISARMED"
+
+
+async def test_hung_shutdown_triggers(tmp_path):
+    w, rest, clock = wd(tmp_path, stopping_grace_s=1.0)
+    hb(tmp_path, clock, 100, shutdown_timeout_s=3.0)
+    await w.step()
+    for _ in range(3):  # 'stopping' heartbeats keep coming, but for longer than 3 s + 1 s
+        clock.advance(2 * NS_PER_S)
+        hb(tmp_path, clock, 100, state="stopping", shutdown_timeout_s=3.0)
+        await w.step()
+    assert w.st.state == "ARMED"
+    clock.advance(NS_PER_S)
+    hb(tmp_path, clock, 100, state="stopping", shutdown_timeout_s=3.0)
+    assert await w.step() == "TRIGGERED" and rest.names() == ["cancel_all_orders"]
+
+
+async def test_cancel_all_marker_and_explicit_primary_subaccount(tmp_path):
+    import json
+
+    clock = FakeClock()
+    rest = FakeRest()
+    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, None), WatchdogCfg(), clock_ns=clock)
+    hb(tmp_path, clock, 100)
+    await w.step()
+    clock.advance(3 * NS_PER_S)
+    assert await w.step() == "TRIGGERED"
+    assert rest.of("cancel_all_orders")[0][1] == {"subaccount": 0}  # never omitted (= all subaccounts)
+    m = json.loads((tmp_path / "hb.json.cancel_all").read_text())
+    assert m["t"] == clock() and m["ok"] is True and m["by"] == "watchdog"

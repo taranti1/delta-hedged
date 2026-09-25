@@ -69,8 +69,7 @@ async def cmd_backfill(lcfg: Any, rest: Any, out: Any = print) -> int:
 
 async def cmd_orders(lcfg: Any, rest: Any, out: Any = print) -> int:
     kw: dict[str, Any] = {"status": "resting"}
-    if lcfg.venue.subaccount is not None:
-        kw["subaccount"] = lcfg.venue.subaccount
+    kw["subaccount"] = lcfg.venue.sub  # explicit: omitted means ALL subaccounts
     rows = [o async for o in rest.iter_orders(**kw)]
     for o in rows:
         out(f"{o.get('ticker')} {o.get('book_side')} {o.get('yes_price_dollars')} rem={o.get('remaining_count_fp')} "
@@ -128,8 +127,7 @@ async def cmd_reconcile(log: str, lcfg: Any, rest: Any, out: Any = print) -> int
     from dh.core.units import micros_from_dollars, qty_from_fp
 
     kw: dict[str, Any] = {"min_ts": t0 // NS_PER_S - 60}
-    if lcfg.venue.subaccount is not None:
-        kw["subaccount"] = lcfg.venue.subaccount
+    kw["subaccount"] = lcfg.venue.sub  # explicit: omitted means ALL subaccounts
     theirs: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     async for f in rest.iter_fills(**kw):
         t = str(f.get("ticker") or f.get("market_ticker"))

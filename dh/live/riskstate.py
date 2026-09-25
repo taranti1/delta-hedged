@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dh.core.units import NS_PER_S, PX_SCALE, QTY_SCALE, qty_from_fp
+from dh.core.units import NS_PER_S, PX_SCALE, qty_from_fp
 from dh.kalshi.wire import opt_iso_to_ns
 
 DAY_NS = 86_400 * NS_PER_S
@@ -111,6 +111,19 @@ class RiskStateError(RuntimeError):
 
 
 # ============================================================================ REST re-derivation
+def row_in_subaccount(row: dict[str, Any], sub: int) -> bool:
+    """A REST row (Fill / Order / Settlement) fetched with ``subaccount=<sub>`` belongs to
+    ``sub``: its subaccount field matches, or it is absent (omitted for the primary account;
+    the explicit query parameter scoped the request). An explicit other value is dropped."""
+    from dh.kalshi.normalize import subaccount_of
+
+    sa = subaccount_of(row)
+    if sa == sub:
+        return True
+    explicit = row.get("subaccount") is not None or row.get("subaccount_number") is not None
+    return not explicit and sa == 0 and sub != 0
+
+
 @dataclass
 class DayPnl:
     day_start_ns: int
@@ -149,14 +162,14 @@ def day_pnl_from_rows(day_start_ns: int, fills: Iterable[dict[str, Any]], settle
                       positions: dict[str, int], *, subaccount: int = 0) -> DayPnl:
     """The lower bound described in the module docstring (pure; tests feed rows directly).
     ``positions`` is {ticker: signed YES qty (0.01 contracts)}."""
-    from dh.kalshi.normalize import rest_fill_to_event, subaccount_of
+    from dh.kalshi.normalize import rest_fill_to_event
 
     out = DayPnl(day_start_ns)
     flow: dict[str, int] = {}
     settled: dict[str, int] = {}
     cash_micros = fee_micros = 0
     for row in fills:
-        if subaccount_of(row) != subaccount:
+        if not row_in_subaccount(row, subaccount):
             continue
         try:
             f = rest_fill_to_event(row, 0)
@@ -171,7 +184,7 @@ def day_pnl_from_rows(day_start_ns: int, fills: Iterable[dict[str, Any]], settle
         out.fills += 1
     settle_micros = 0
     for row in settlements:
-        if subaccount_of(row) != subaccount:
+        if not row_in_subaccount(row, subaccount):
             continue
         t = opt_iso_to_ns(row.get("settled_time"))
         if t and t < day_start_ns:
@@ -260,4 +273,4 @@ def decide_seed(now_ns: int, prev: RiskState | None, rest_pnl: DayPnl | None, *,
 
 
 __all__ = ["DAY_NS", "DayPnl", "RiskState", "RiskStateError", "RiskStateStore", "SeedDecision", "base_reason",
-           "day_pnl_from_rows", "day_start", "decide_seed", "derive_day_pnl", "sticky"]
+           "day_pnl_from_rows", "day_start", "decide_seed", "derive_day_pnl", "row_in_subaccount", "sticky"]

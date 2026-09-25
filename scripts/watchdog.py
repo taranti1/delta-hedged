@@ -5,13 +5,19 @@ Run it as its own process/service next to scripts/run_live.py (never inside it):
 
     python scripts/watchdog.py --live-config config/live.yaml
 
-It reads the heartbeat file (live config paths.heartbeat_file). Once it has seen a fresh
-heartbeat of a LIVE runner, a heartbeat older than watchdog.stale_s (default 2 s) triggers
-``DELETE /portfolio/events/orders`` with the watchdog's own signed session, retried until it
-succeeds and repeated every watchdog.repeat_s while the heartbeat stays stale. A clean runner
-shutdown (heartbeat state 'stopped', written only after a confirmed cancel-all) disarms it.
-It never places orders. Credentials: KALSHI_WATCHDOG_KEY_ID / KALSHI_WATCHDOG_PRIVATE_KEY_PATH
-(a separate key is recommended), else the runner's KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH.
+It reads the heartbeat file (live config paths.heartbeat_file; paper runners write their own
+file). Once it has seen a fresh heartbeat of a LIVE runner it locks onto that runner (pid +
+session): heartbeats written by any other process are ignored. The watched runner's heartbeat
+older than watchdog.stale_s (default 2 s), a vanished file, or a shutdown hung longer than the
+runner's shutdown_timeout_s + watchdog.stopping_grace_s triggers
+``DELETE /portfolio/events/orders?subaccount=<n>`` (explicit: omitted = ALL subaccounts) with
+the watchdog's own signed session, retried until it succeeds and repeated every
+watchdog.repeat_s while it stays stale; each attempt is announced in <heartbeat>.cancel_all
+(a runner still alive then holds new orders for a minute). A clean runner shutdown (state
+'stopped', written only after a confirmed cancel-all) disarms it; a new live runner re-arms
+it. It never places orders. Credentials: KALSHI_WATCHDOG_KEY_ID /
+KALSHI_WATCHDOG_PRIVATE_KEY_PATH (a separate key is recommended), else the runner's
+KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH.
 
     --once              one check (+ cancel if stale) and exit (cron / manual use)
     --cancel-now        cancel all immediately and exit (manual kill procedure)
@@ -71,7 +77,7 @@ async def amain(args: argparse.Namespace, rest: Any = None) -> int:
     hb = _resolve(args.heartbeat or lcfg.paths.heartbeat_file)
     own = rest is None
     rest = rest or build_rest(lcfg)
-    cancel = rest_cancel_all(rest, lcfg.venue.subaccount)
+    cancel = rest_cancel_all(rest, lcfg.venue.sub)  # explicit subaccount (0 = primary)
     try:
         if args.cancel_now:
             ok = await cancel()

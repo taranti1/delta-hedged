@@ -148,6 +148,21 @@ def write_heartbeat(path: str | Path, payload: dict[str, Any], now_ns: int | Non
     os.replace(tmp, p)
 
 
+def cancel_all_marker_path(heartbeat: str | Path) -> Path:
+    """File the watchdog writes after every cancel-all it sends (the live runner reads it: new
+    orders are held for the cancel-all tail and its order view is reconciled)."""
+    p = Path(heartbeat)
+    return p.with_name(p.name + ".cancel_all")
+
+
+def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, p)
+
+
 def read_heartbeat(path: str | Path) -> dict[str, Any] | None:
     """Parsed heartbeat ({"t": ns, ...}); falls back to the file mtime when the content is
     unreadable; None when the file does not exist."""

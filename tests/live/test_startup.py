@@ -86,10 +86,16 @@ def test_select_specs_horizon_rules_status_exclusions():
     import dataclasses
 
     t = "KXBTCD-26SEP2514-T84000.00"
-    known[t] = dataclasses.replace(known[t], fee_type="quadratic")
+    # an EVENT fee override (effective fee differs, base fee the same) is not a spec change: the
+    # KalshiFeeUpdate event carries it (blocking the market for the session would be wrong)
+    base = known[t].base_fee
+    known[t] = dataclasses.replace(known[t], fee_type="quadratic", base_fee_type=base[0], base_fee_multiplier=base[1])
     again = select_specs(reg, T0, 6 * 3600, series=("KXBTCD",), known=known)
     assert [s.event_ticker for s in again.specs] == ["KXBTCD-26SEP2518", "KXBTCD-26SEP2518"]
-    assert again.changed == {t: "spec changed"}
+    assert again.changed == {}
+    # a change of the series/market (base) fee is
+    known[t] = dataclasses.replace(known[t], base_fee_type="quadratic")
+    assert select_specs(reg, T0, 6 * 3600, series=("KXBTCD",), known=known).changed == {t: "spec changed"}
 
 
 def test_unresolved_fee_is_kept_but_flagged():

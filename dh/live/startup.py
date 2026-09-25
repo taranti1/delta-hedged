@@ -60,9 +60,12 @@ def spec_from_dict(d: dict[str, Any]) -> MarketSpec:
 
 
 def spec_signature(spec: MarketSpec) -> tuple:
-    """Everything that changes what a quote is worth or whether it is valid."""
+    """Everything that changes what a quote is worth or whether it is valid. The fee enters as
+    the BASE fee (series / market, without event overrides): an event override is applied by
+    the KalshiFeeUpdate event (strategy and runner follow it), so it must not make a re-discovered
+    market look changed (which would block it for the session)."""
     return (spec.strike_type, spec.floor_strike, spec.cap_strike, spec.close_ts, spec.expiration_ts,
-            spec.price_ranges, spec.fee_type, spec.fee_multiplier, spec.settlement)
+            spec.price_ranges, spec.base_fee, spec.settlement)
 
 
 # ============================================================================ universe

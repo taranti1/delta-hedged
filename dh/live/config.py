@@ -35,7 +35,7 @@ class PathsCfg:
     log_dir: str = "data/live_logs"  # JSON-lines decision/action logs
     kill_file: str = "/run/dh/KILL"  # touch it to cancel everything and stop (live AND paper)
     heartbeat_file: str = "/run/dh/heartbeat.json"  # LIVE runner; read by scripts/watchdog.py
-    paper_heartbeat_file: str = "/run/dh/heartbeat.paper.json"  # paper runner (never the watchdog's file)
+    paper_heartbeat_file: str = ""  # paper runner; '' = <heartbeat_file stem>.paper.json (never the watchdog's file)
     # per-UTC-day risk state (day P&L, carried halt, pause); '' = <data_root>/state/risk_state.<mode>.json
     risk_state_file: str = ""
 

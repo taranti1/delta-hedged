@@ -6,17 +6,22 @@
 
 What a session leaves on disk (dh.live.runner / dh.live.app):
   kalshi.ws, <venue>.ws     raw frames (normalized again by dh.store.replay.iter_events)
-  events.live               adapter results fed to the strategy (acks, rejects, reconciliation
-                            updates, position snapshots, order-group updates, gate rejects)
+  events.live               events the runner fed that are not raw frames, in processing
+                            order: the start-up RiskStateSeed, adapter results (acks, rejects,
+                            reconciliation updates, gate rejects), runner-derived events (lag /
+                            reconciliation FeedStatus, checked position snapshots, back-filled
+                            fills, order-group updates)
   events.paper              simulator messages (audit only: the replay regenerates them)
-  meta                      session_start (configs, universe, paper simulator config),
-                            fv_warmup (the exact benchmark points fed to the model),
-                            universe_add / universe_prune / queue_resync at their times,
-                            session_end (last delivered ts)
-The replay rebuilds the same MarketMaker (same specs, same warm-up), applies the recorded
-universe changes at their recorded times, and runs dh.backtest.runner.run over the recorded
-events (paper: with a simulator built from the recorded config, which regenerates the fills).
-Any difference in actions or Log records up to the last delivered ts is a bug.
+  meta                      session_start (configs, universe, paper simulator config, id
+                            prefix, subaccount), fv_warmup (the exact benchmark points fed to
+                            the model), universe_add / universe_prune / queue_resync at their
+                            times, session_end (last delivered ts)
+The replay rebuilds the same MarketMaker (same specs, same warm-up, same client_order_id
+prefix), applies the recorded universe changes at their recorded times and the runner's
+inbound rules, and runs dh.backtest.runner.run over the recorded events (paper: with a
+simulator built from the recorded config, which regenerates the fills). events.live is merged
+LAST: a runner-derived event shares the timestamp of the item that caused it and was fed
+after it. Any difference in actions or Log records up to the last delivered ts is a bug.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from dh.live.config import PaperCfg
 from dh.live.startup import build_paper_sim, spec_from_dict, warm_fv
 from dh.store.replay import iter_events, iter_raw
 
-REPLAY_STREAMS = ("kalshi.ws", "events.live")
+REPLAY_STREAMS = ("kalshi.ws", "events.live")  # events.live is always merged last (see module docstring)
 
 
 @dataclass
@@ -51,6 +56,8 @@ class SessionInfo:
     strategy_digest: str = ""
     start: dict[str, Any] = field(default_factory=dict)
     group_map: dict[str, str] = field(default_factory=dict)  # exchange order-group id -> logical id
+    id_prefix: str | None = None  # the session's client_order_id prefix (None: config run_prefix)
+    subaccount: int = 0
 
 
 def load_session(root: str | Path, session: str | None = None) -> SessionInfo:
@@ -80,19 +87,24 @@ def load_session(root: str | Path, session: str | None = None) -> SessionInfo:
         specs=[spec_from_dict(d) for d in st.get("specs", [])],
         fv_points=[(int(t), float(v)) for t, v in warm.get("points", [])],
         changes=sorted(changes, key=lambda c: c[0]), paper=st.get("paper"),
-        strategy_digest=str(st.get("strategy_digest", "")), start=st, group_map=group_map)
+        strategy_digest=str(st.get("strategy_digest", "")), start=st, group_map=group_map,
+        id_prefix=st.get("id_prefix") or None, subaccount=int(st.get("subaccount") or 0))
 
 
 class UniverseReplay:
     """Strategy wrapper reproducing what the live runner did around the strategy:
       * recorded universe changes applied at their recorded times (before the first
         merged-stream item at or after the change, as the live consumer did);
-      * live inbound rules (LiveRunner.push): order-group ids translated to the logical id
-        (other groups dropped); WS market_position snapshots dropped (the runner fed only
-        checked ones, recorded on events.live with source 'ws_checked' / 'rest')."""
+      * live inbound rules (LiveRunner.push / _on_event): events of another subaccount
+        dropped; order-group ids translated to the logical id (other groups dropped); WS
+        market_position snapshots dropped (the runner fed only checked ones, recorded on
+        events.live with source 'ws_checked' / 'rest'); a fill whose trade/fill id was already
+        delivered dropped (a REST back-fill that beat the WS message)."""
 
     def __init__(self, strategy: Any, changes: list[tuple[int, str, Any]], sim: Any = None, paper_fees: Any = None,
-                 *, live: bool = False, group_map: dict[str, str] | None = None) -> None:
+                 *, live: bool = False, group_map: dict[str, str] | None = None, subaccount: int = 0) -> None:
+        from dh.live.runner import SeenIds
+
         self.strategy = strategy
         self.changes = list(changes)
         self.sim = sim
@@ -100,6 +112,8 @@ class UniverseReplay:
         self.live = live
         self.group_map = dict(group_map or {})
         self.logical = set(self.group_map.values())
+        self.subaccount = int(subaccount)
+        self.fills_seen = SeenIds()
 
     def _apply(self, kind: str, payload: Any, t: int) -> None:
         s = self.strategy
@@ -123,23 +137,23 @@ class UniverseReplay:
             self._apply(kind, payload, t)
         if self.paper_fees is not None:
             from dh.core.events import KalshiFeeUpdate
+            from dh.live.runner import effective_fee
 
             if isinstance(ev, KalshiFeeUpdate):  # as LiveRunner._on_fee_update does in paper mode
                 for t, spec in list(getattr(self.strategy, "specs", {}).items()):
                     if spec.event_ticker != ev.event_ticker:
                         continue
-                    ftype = ev.fee_type_override if ev.fee_type_override is not None else spec.fee_type
-                    try:
-                        mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else spec.fee_multiplier
-                    except ValueError:
-                        continue
-                    if ftype:
-                        self.paper_fees.set_fee(t, ftype, mult)
+                    eff = effective_fee(spec, ev)
+                    if eff is not None and eff[0]:
+                        self.paper_fees.set_fee(t, eff[0], eff[1])
         if self.live:
             from dataclasses import replace
 
-            from dh.core.events import KalshiOrderGroupUpdate, KalshiPositionSnapshot
+            from dh.core.events import KalshiFill, KalshiOrderGroupUpdate, KalshiPositionSnapshot
+            from dh.live.runner import OWN_TYPES
 
+            if isinstance(ev, OWN_TYPES) and getattr(ev, "subaccount", 0) != self.subaccount:
+                return []
             if isinstance(ev, KalshiPositionSnapshot) and ev.source == "ws":
                 return []
             if isinstance(ev, KalshiOrderGroupUpdate) and ev.order_group_id not in self.logical:
@@ -147,6 +161,10 @@ class UniverseReplay:
                 if not logical:
                     return []
                 ev = replace(ev, order_group_id=logical)
+            if isinstance(ev, KalshiFill):
+                if self.fills_seen.seen(ev):
+                    return []
+                self.fills_seen.add(ev.trade_id, ev.fill_id)
         return self.strategy.on_event(ev)
 
 
@@ -177,16 +195,19 @@ def replay_session(root: str | Path, scfg: Any, *, session: str | None = None, e
     fee_engine = fee_engine or FeeEngine.from_config()
     fv = FairValueModel.from_config(load_recommended_config())
     warm_fv(fv, info.fv_points)
-    mm = MarketMaker(scfg, info.specs, fv_model=fv, fee_engine=fee_engine, book_includes_own=(info.mode == "live"))
+    mm = MarketMaker(scfg, info.specs, fv_model=fv, fee_engine=fee_engine, book_includes_own=(info.mode == "live"),
+                     id_prefix=info.id_prefix)
     sim = fees = None
     if info.mode == "paper":
         sim, fees = build_paper_sim(PaperCfg(**(info.paper or {})), info.specs, fee_engine)
-    wrapper = UniverseReplay(mm, info.changes, sim, fees, live=(info.mode == "live"), group_map=info.group_map)
+    wrapper = UniverseReplay(mm, info.changes, sim, fees, live=(info.mode == "live"), group_map=info.group_map,
+                             subaccount=info.subaccount)
     from dh.feeds.registry import has_normalizer
     from dh.store.replay import list_streams
 
     feeds = [x for x in list_streams(root) if has_normalizer(x)]  # external venues this session recorded
-    streams = list(dict.fromkeys(list(REPLAY_STREAMS) + feeds + list(extra_streams)))
+    raw = [x for x in REPLAY_STREAMS if x != "events.live"]
+    streams = list(dict.fromkeys(raw + feeds + [x for x in extra_streams if x != "events.live"] + ["events.live"]))
     events = iter_events(root, streams, info.t0, info.t1)
     res = run(events, wrapper, sim, timer_period_ns=int(scfg.timers.quote_period_ms) * NS_PER_MS,
               end_ns=None if info.last_ts >= 2**62 else info.last_ts)

@@ -72,7 +72,8 @@ def _setup(tmp_path, mode: str, *, forbid_writes: bool):
                        heartbeat_file=str(tmp_path / "run" / "hb.json")),
         metrics=MetricsCfg(enabled=False),
         loop=LoopCfg(heartbeat_interval_s=0.05, clock_sample_s=0.0, shutdown_timeout_s=2.0, max_lag_s=5.0),
-        venue=VenueCfg(positions_interval_s=0.0, queue_positions_interval_s=0.0),
+        venue=VenueCfg(positions_interval_s=0.0, queue_positions_interval_s=0.0, fills_backfill_interval_s=0.0,
+                       cancel_all_hold_s=0.3),
         universe=UniverseCfg(horizon_s=7200.0, discovery_interval_s=3600.0),
         backfill=BackfillCfg(days=2.0, chunk_s=12 * 3600),
     )
@@ -87,7 +88,7 @@ def _setup(tmp_path, mode: str, *, forbid_writes: bool):
 async def _brti(runner, seconds: float):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        t = time.time_ns()
+        t = runner.clock_ns()
         runner.push(IndexTick(ts=t, ts_exch=t, index_id="BRTI", value=84000.0, feed="5hz"))
         await asyncio.sleep(0.05)
 
@@ -126,7 +127,8 @@ async def test_paper_session_end_to_end(tmp_path):
     assert len(meta[1]["points"]) >= 2 * 1440 - 2
     assert sum(1 for _ in iter_raw(data, ["kalshi.ws"], 0, 2**62)) > 5
     assert sum(1 for _ in iter_raw(data, ["events.paper"], 0, 2**62)) > 0
-    assert read_heartbeat(tmp_path / "run" / "hb.json")["state"] == "stopped"
+    assert read_heartbeat(tmp_path / "run" / "hb.paper.json")["state"] == "stopped"  # paper: its own heartbeat file
+    assert not (tmp_path / "run" / "hb.json").exists(), "a paper runner must never write the live (watchdog's) heartbeat"
     logs = [json.loads(x) for f in (tmp_path / "logs").iterdir() for x in f.read_text().splitlines()]
     assert any(x["k"] == "action" and x["type"] == "PlaceOrder" for x in logs)
     assert any(x["k"] == "log.fv" for x in logs)
@@ -141,8 +143,12 @@ async def test_live_session_end_to_end(tmp_path):
     await app.close()
     assert code == 0 and runner.shutdown_ok
     names = rest.names()
-    # start-up: positions, clean-slate cancel-all, order group before any order
-    assert names.index("get_all_positions") < names.index("cancel_all_orders") < names.index("create_order_group")
+    # start-up: clean-slate cancel-all VERIFIED (resting list), THEN positions, today's fills and
+    # settlements (risk seed), order group before any order
+    assert (names.index("cancel_all_orders") < names.index("iter_orders") < names.index("get_all_positions")
+            < names.index("iter_fills") < names.index("iter_settlements") < names.index("create_order_group"))
+    assert all(k.get("subaccount") == 0 for n, _, k in rest.calls if n in ("cancel_all_orders", "iter_orders", "iter_fills",
+                                                                         "get_all_positions", "iter_settlements"))
     first_order = min(names.index(n) for n in ("create_order", "batch_create_orders") if n in names)
     assert names.index("create_order_group") < first_order
     bodies = [a[0] for a, _ in rest.of("create_order")] + [b for a, _ in rest.of("batch_create_orders") for b in a[0]]
@@ -204,7 +210,7 @@ async def test_session_replays_bit_for_bit(tmp_path, mode):
         end = time.monotonic() + 5
         v = 84_000.0
         while time.monotonic() < end:
-            t = time.time_ns()
+            t = runner.clock_ns()
             v = 84_000.0 + (0.5 if (t // 10**8) % 2 else -0.5)  # calm: no abnormal-move trips
             ev = IndexTick(ts=t, ts_exch=t, index_id="BRTI", value=v, feed="5hz")
             rec.write_event("events.test", ev)

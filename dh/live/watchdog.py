@@ -2,22 +2,32 @@
 
 Runs as a SEPARATE process (scripts/watchdog.py) with its own Kalshi API session (optionally
 its own API key), so it keeps working when the runner crashes, hangs or loses its event loop.
-It only ever calls ``DELETE /portfolio/events/orders`` (cancel all): it never places orders.
+It only ever calls ``DELETE /portfolio/events/orders?subaccount=<n>`` (cancel all, with the
+subaccount explicit: omitted means ALL subaccounts): it never places orders.
 
 State machine (poll every ``poll_s``):
-  DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping)
-  ARMED      heartbeat fresh; a heartbeat with state 'stopped' (clean shutdown after a
-             confirmed cancel-all) disarms
-  TRIGGERED  heartbeat older than ``stale_s`` (or the file vanished): cancel all now, retry
-             every ``retry_s`` until one succeeds, then repeat every ``repeat_s`` (orders in
-             flight when the runner died can still land) up to ``max_repeats`` while stale;
-             a fresh heartbeat re-arms (runner recovered / restarted)
+  DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping); it then
+             LOCKS ONTO that runner (pid + session)
+  ARMED      only the locked runner's heartbeats count: a heartbeat written by any other
+             process (a paper runner sharing the file, a second instance) is ignored, so it
+             can neither disarm the watchdog nor keep it quiet. The locked runner's 'stopped'
+             (clean shutdown after a confirmed cancel-all) disarms
+  TRIGGERED  the locked runner's last heartbeat is older than ``stale_s``, the file vanished,
+             or the runner has been 'stopping' for longer than its own shutdown_timeout_s +
+             ``stopping_grace_s`` (a hung shutdown): cancel all now, retry every ``retry_s``
+             until one succeeds, then repeat every ``repeat_s`` (orders in flight when the
+             runner died can still land) up to ``max_repeats`` while stale; a fresh heartbeat
+             of the locked runner, or of a NEW live runner (a restart), re-arms on it
+After every cancel-all attempt the watchdog writes ``<heartbeat>.cancel_all`` (time, result):
+a runner that is still alive holds new orders for the cancel-all tail (Kalshi may cancel
+orders placed during the minute after a cancel-all) and reconciles its view of the orders.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -26,7 +36,7 @@ from typing import Any
 
 from dh.core.units import NS_PER_S
 from dh.live.config import WatchdogCfg
-from dh.live.monitor import read_heartbeat
+from dh.live.monitor import cancel_all_marker_path, read_heartbeat, write_json_atomic
 
 log = logging.getLogger("dh.live.watchdog")
 
@@ -36,15 +46,19 @@ CancelAllFn = Callable[[], Awaitable[bool]]
 @dataclass
 class WatchdogState:
     state: str = "DISARMED"
-    last_hb_ns: int = 0
+    armed: tuple[Any, Any] | None = None  # (pid, session) of the runner we watch
+    last_hb_ns: int = 0  # the watched runner's last heartbeat time
     last_mode: str = ""
     last_state: str = ""
+    stopping_seen_ns: int = 0  # when the watched runner was first seen 'stopping'
+    shutdown_timeout_s: float = 10.0  # the watched runner's own (from its heartbeat)
     triggered_at_ns: int = 0
     last_attempt_ns: int = 0
     last_success_ns: int = 0
     successes: int = 0
     attempts: int = 0
     failures: int = 0
+    foreign: int = 0  # heartbeats from other writers ignored
     events: list[tuple[int, str]] = field(default_factory=list)  # (ns, message), bounded
 
 
@@ -61,6 +75,7 @@ class Watchdog:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         arm_on_start: bool = False,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        marker_path: str | Path | None = None,
     ) -> None:
         self.path = Path(heartbeat_path)
         self.cancel_all = cancel_all
@@ -68,7 +83,9 @@ class Watchdog:
         self._clock = clock_ns
         self._sleep = sleep
         self.st = WatchdogState(state="ARMED" if arm_on_start else "DISARMED")
+        self._arm_on_start = arm_on_start
         self._on_event = on_event
+        self.marker = Path(marker_path) if marker_path else cancel_all_marker_path(self.path)
 
     def _note(self, msg: str, **kw: Any) -> None:
         now = self._clock()
@@ -78,54 +95,77 @@ class Watchdog:
         if self._on_event is not None:
             self._on_event(msg, kw)
 
-    def _read(self) -> tuple[int | None, str, str]:
-        """(heartbeat ns or None if missing, mode, state). A missing file keeps the last
-        known mode/state: a runner that vanished is exactly what the watchdog is for."""
-        hb = read_heartbeat(self.path)
-        if hb is None:
-            return None, self.st.last_mode, self.st.last_state
-        mode, state = str(hb.get("mode", "live")), str(hb.get("state", "running"))
-        self.st.last_mode, self.st.last_state = mode, state
-        return int(hb.get("t", 0)), mode, state
+    def _relevant(self, mode: str) -> bool:
+        return mode == "live" or not self.cfg.only_live
+
+    def _arm(self, hb: dict[str, Any], note: str) -> None:
+        st = self.st
+        st.state = "ARMED"
+        st.armed = (hb.get("pid"), hb.get("session"))
+        st.last_hb_ns = int(hb.get("t", 0))
+        st.last_state = str(hb.get("state", "running"))
+        st.stopping_seen_ns = 0
+        st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or 10.0)
+        self._note(note, pid=hb.get("pid"), session=hb.get("session"))
 
     async def step(self) -> str:
         """One poll; returns the resulting state."""
         now = self._clock()
-        t, mode, hstate = self._read()
         c = self.cfg
-        stale_ns = int(c.stale_s * NS_PER_S)
         st = self.st
-        relevant = (mode == "live") or not c.only_live
+        stale_ns = int(c.stale_s * NS_PER_S)
+        hb = read_heartbeat(self.path)
+        t = int(hb.get("t", 0)) if hb is not None else None
+        mode = str(hb.get("mode", "live")) if hb is not None else st.last_mode
+        hstate = str(hb.get("state", "running")) if hb is not None else st.last_state
         fresh = t is not None and now - t <= stale_ns
-        if t is not None:
-            st.last_hb_ns = t
+        ident = (hb.get("pid"), hb.get("session")) if hb is not None else None
+        if hb is not None:
+            st.last_mode = mode
+        if st.state == "ARMED" and st.armed is None and self._arm_on_start and hb is not None and self._relevant(mode):
+            st.armed = ident  # --arm-on-start: lock onto whatever live runner the file names
+            st.last_hb_ns = t or 0
+            st.last_state = hstate
+        ours = hb is not None and st.armed is not None and ident == st.armed
+        if ours:
+            st.last_hb_ns = max(st.last_hb_ns, t or 0)
+            st.last_state = hstate
+            st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or st.shutdown_timeout_s)
+            if hstate == "stopping":
+                st.stopping_seen_ns = st.stopping_seen_ns or now
+            else:
+                st.stopping_seen_ns = 0
+        elif hb is not None and st.armed is not None and st.state != "DISARMED":
+            st.foreign += 1
+            if st.foreign == 1 or st.foreign % 1000 == 0:
+                self._note("ignoring a heartbeat from another writer", pid=hb.get("pid"), session=hb.get("session"),
+                           mode=mode, state=hstate)
         if st.state == "DISARMED":
-            if fresh and relevant and hstate in ("running", "stopping"):
-                st.state = "ARMED"
-                self._note("armed", mode=mode)
+            if fresh and self._relevant(mode) and hstate in ("running", "stopping"):
+                self._arm(hb, "armed")  # type: ignore[arg-type]
             return st.state
         if st.state == "ARMED":
-            if not relevant:
-                st.state = "DISARMED"
-                self._note("disarmed: heartbeat is not from a live runner", mode=mode)
-            elif hstate == "stopped" and fresh:
-                st.state = "DISARMED"
+            if ours and hstate == "stopped" and fresh:
+                st.state, st.armed = "DISARMED", None
                 self._note("disarmed: runner stopped cleanly")
-            elif not fresh:
+                return st.state
+            stuck = bool(st.stopping_seen_ns) and now - st.stopping_seen_ns > int(
+                (st.shutdown_timeout_s + c.stopping_grace_s) * NS_PER_S)
+            if hb is None or now - st.last_hb_ns > stale_ns or stuck:
                 st.state = "TRIGGERED"
                 st.triggered_at_ns = now
                 st.successes = 0
-                age = (now - t) / NS_PER_S if t is not None else None
-                self._note("TRIGGERED: heartbeat stale", age_s=age, missing=t is None)
+                why = "heartbeat file missing" if hb is None else ("shutdown hung" if stuck else "heartbeat stale")
+                self._note(f"TRIGGERED: {why}", age_s=(now - st.last_hb_ns) / NS_PER_S if st.last_hb_ns else None)
                 await self._attempt(now)
             return st.state
         # TRIGGERED
-        if fresh and relevant and hstate in ("running", "stopping"):
-            st.state = "ARMED"
-            self._note("re-armed: heartbeat fresh again")
+        if hb is not None and fresh and self._relevant(mode) and hstate == "running":
+            # the watched runner recovered, or a new live runner started (a restart)
+            self._arm(hb, "re-armed: runner alive again" if ours else "re-armed on a new live runner")
             return st.state
-        if fresh and hstate == "stopped":
-            st.state = "DISARMED"
+        if ours and fresh and hstate == "stopped":
+            st.state, st.armed = "DISARMED", None
             self._note("disarmed: runner stopped cleanly (cancel confirmed) after trigger")
             return st.state
         if st.successes == 0:
@@ -151,6 +191,11 @@ class Watchdog:
         else:
             st.failures += 1
             self._note("cancel-all FAILED (will retry)", failures=st.failures)
+        try:
+            write_json_atomic(self.marker, {"t": now, "ok": ok, "by": "watchdog", "pid": os.getpid(),
+                                            "watched": list(st.armed) if st.armed else None})
+        except OSError as exc:
+            self._note("cancel-all marker write failed", error=str(exc)[:200])
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         while stop is None or not stop.is_set():
@@ -162,11 +207,15 @@ class Watchdog:
 
 
 def rest_cancel_all(rest: Any, subaccount: int | None = None) -> CancelAllFn:
-    """cancel_all for Watchdog on top of KalshiRest: True only on a definite 2xx."""
+    """cancel_all for Watchdog on top of KalshiRest: True only on a definite 2xx. The
+    subaccount is always explicit (None -> 0, the primary): Kalshi reads an omitted
+    subaccount as ALL subaccounts."""
     from dh.kalshi.rest import UnknownOutcome
 
+    sub = int(subaccount) if subaccount is not None else 0
+
     async def _cancel() -> bool:
-        res = await rest.cancel_all_orders(subaccount=subaccount)
+        res = await rest.cancel_all_orders(subaccount=sub)
         return not isinstance(res, UnknownOutcome)
 
     return _cancel

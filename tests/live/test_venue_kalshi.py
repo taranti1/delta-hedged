@@ -151,8 +151,8 @@ async def test_unknown_create_reconciled_found_never_resubmitted():
     clock.advance(1 * NS_PER_S)
     await v.reconcile_due()
     assert len(rest.of("create_order")) == 1, "a create with unknown outcome is never resubmitted"
-    (args, kw), = rest.of("find_order_by_client_id")
-    assert args == ("c-1",) and kw["ticker"] == TK and kw["min_ts"] == clock.t // NS_PER_S - 1 - 60
+    (_, kw), = rest.of("iter_orders")  # lookup by client id: explicit subaccount, ticker, min_ts
+    assert kw == {"ticker": TK, "min_ts": clock.t // NS_PER_S - 1 - 60, "subaccount": 0}
     (ev,) = out
     assert isinstance(ev, KalshiOrderUpdate) and (ev.client_order_id, ev.order_id, ev.status) == ("c-1", "oid-9", "resting")
     om = OrderManager()
@@ -172,7 +172,7 @@ async def test_unknown_create_missing_becomes_reject_after_grace():
         await v.reconcile_due()
         if out:
             break
-    assert len(rest.of("find_order_by_client_id")) >= 3
+    assert len(rest.of("iter_orders")) >= 3
     (ev,) = out
     assert isinstance(ev, OrderReject) and ev.reason == "reconciled_missing" and ev.request == "create"
     om = OrderManager()
@@ -202,12 +202,13 @@ async def test_cancel_single_and_batch():
     v, _, out, clock = make(rest)
     v.submit([CancelOrder("c-1", TK, "o-1")], clock())
     await v.wait_idle(1.0)
-    assert rest.of("cancel_order")[0] == (("o-1",), {"market_ticker": TK, "subaccount": None})
+    assert rest.of("cancel_order")[0] == (("o-1",), {"market_ticker": TK, "subaccount": 0})  # explicit primary
     assert isinstance(out[0], CancelAck) and out[0].canceled_qty == 200
     v.submit([CancelOrder("c-2", TK2, "o-2"), CancelOrder("c-3", TK2, "o-3")], clock())
     await v.wait_idle(1.0)
     (args, _), = rest.of("batch_cancel_orders")
-    assert args[0] == [{"order_id": "o-2", "market_ticker": TK2}, {"order_id": "o-3", "market_ticker": TK2}]
+    assert args[0] == [{"order_id": "o-2", "market_ticker": TK2, "subaccount": 0},
+                       {"order_id": "o-3", "market_ticker": TK2, "subaccount": 0}]
     assert sorted(e.client_order_id for e in out[1:] if isinstance(e, CancelAck)) == ["c-2", "c-3"]
 
 
@@ -342,3 +343,193 @@ async def test_rate_budget_counts_chunks_of_the_same_dispatch():
     rej = [e.client_order_id for e in out if isinstance(e, OrderReject)]
     assert rej == ["c-3"] and len(rest.of("create_order")) == 3
     assert v._reserved_write == 0.0  # noqa: SLF001 - every reservation released
+
+
+# ============================================================================ live review fixes
+async def test_recancel_never_gives_up_while_resting_and_raises_the_stuck_alarm():
+    """C2: cancels time out while reads work (partial outage). The venue keeps re-cancelling
+    with a capped backoff for as long as GET says resting; after max_cancel_retries the order
+    is flagged STUCK (never dropped)."""
+    rest = FakeRest()
+    rest.orders["o-1"] = order_row("c-1", "o-1", TK)
+    rest.on("cancel_order", *[unknown("DELETE")] * 12)
+    logs: list = []
+    v, _, out, clock = make(rest, max_cancel_retries=3, recancel_backoff_max_s=2.0)
+    v.log_fn = lambda k, p: logs.append(k)
+    v.submit([CancelOrder("c-1", TK, "o-1")], clock())
+    await v.wait_idle(1.0)
+    gaps = []
+    for _ in range(10):
+        q = v._orders["o-1"]  # noqa: SLF001
+        gaps.append(q.next_ns - clock())
+        clock.t = q.next_ns
+        await v.reconcile_due()
+        await v.wait_idle(1.0)
+    assert len(rest.of("cancel_order")) == 11 and "o-1" in v._orders  # noqa: SLF001 - still being worked
+    assert max(gaps) <= 2 * NS_PER_S, "re-cancel backoff is capped"
+    assert v.stuck_orders == ["o-1"] and "cancel_stuck" in logs and v.stats.stuck_cancels == 1
+    rest.script.pop("cancel_order", None)  # the outage ends: the next re-cancel works
+    clock.t = v._orders["o-1"].next_ns  # noqa: SLF001
+    await v.reconcile_due()
+    await v.wait_idle(1.0)
+    clock.t = v._orders["o-1"].next_ns  # noqa: SLF001
+    await v.reconcile_due()
+    assert rest.orders["o-1"]["status"] == "canceled" and "o-1" not in v._orders  # noqa: SLF001
+    assert any(isinstance(e, CancelAck) for e in out)
+
+
+async def test_get_404_is_final_only_when_the_resting_list_confirms():
+    rest = FakeRest()
+    rest.orders["o-1"] = order_row("c-1", "o-1", TK)
+    rest.on("get_order", http_error(404, "not_found", "not found", "GET"), http_error(404, "not_found", "not found", "GET"))
+    rest.on("cancel_order", unknown("DELETE"))
+    v, _, out, clock = make(rest)
+    v.submit([CancelOrder("c-1", TK, "o-1")], clock())
+    await v.wait_idle(1.0)
+    clock.advance(NS_PER_S)
+    await v.reconcile_due()  # GET 404 but the resting list still shows it: keep it, re-cancel
+    await v.wait_idle(1.0)
+    assert "o-1" in v._orders and len(rest.of("cancel_order")) == 2  # noqa: SLF001
+    assert rest.of("iter_orders")[0][1] == {"status": "resting", "ticker": TK, "subaccount": 0}
+    rest.orders["o-1"]["status"] = "canceled"
+    clock.t = v._orders["o-1"].next_ns  # noqa: SLF001
+    await v.reconcile_due()  # 404 again and the resting list agrees: gone
+    assert "o-1" not in v._orders  # noqa: SLF001
+
+
+async def test_lookup_by_client_id_never_adopts_an_older_order():
+    """M6: a create with unknown outcome is matched only to an order created at or after the
+    request (minus skew): an earlier order with the same client_order_id is not ours."""
+    rest = FakeRest().on("create_order", unknown())
+    v, _, out, clock = make(rest, reconcile_missing_after_s=30.0)
+    rest.orders["old"] = order_row("dhm1-x-1", "old", TK, status="executed", filled="5.00", remaining="0.00",
+                                   initial="5.00", created_ns=clock() - 3600 * NS_PER_S)
+    v.submit([po("dhm1-x-1")], clock())
+    await v.wait_idle(1.0)
+    for _ in range(10):
+        clock.advance(5 * NS_PER_S)
+        await v.reconcile_due()
+    (ev,) = out
+    assert isinstance(ev, OrderReject) and ev.reason == "reconciled_missing"
+    assert v.stats.lookup_rejected_matches >= 3
+    # created after the request (minus skew): adopted
+    rest2 = FakeRest()
+
+    def lost(args, kwargs):
+        rest2.orders["new"] = order_row(args[0]["client_order_id"], "new", TK, created_ns=clock2() + NS_PER_S)
+        return unknown()
+
+    rest2.on("create_order", lost)
+    v2, _, out2, clock2 = make(rest2)
+    v2.submit([po("dhm1-y-1")], clock2())
+    await v2.wait_idle(1.0)
+    clock2.advance(NS_PER_S)
+    await v2.reconcile_due()
+    assert isinstance(out2[0], KalshiOrderUpdate) and out2[0].order_id == "new"
+
+
+async def test_create_409_is_a_definite_reject():
+    from dh.kalshi.rest import UnknownOutcome
+
+    rest = FakeRest().on("create_order", UnknownOutcome("POST", "/portfolio/events/orders", None, "HTTP 409", 409,
+                                                        {"error": {"code": "conflict", "message": "exists"}}))
+    v, _, out, clock = make(rest)
+    v.submit([po("c-1")], clock())
+    await v.wait_idle(1.0)
+    (ev,) = out
+    assert isinstance(ev, OrderReject) and ev.reason == "duplicate_client_order_id" and ev.http_status == 409
+    assert v.pending_reconciliations == 0
+    om = OrderManager()
+    om.request_place(po("c-1"), 0)
+    om.on_event(ev)
+    assert om.order("c-1").state is OrderState.REJECTED
+
+
+async def test_missing_create_that_turns_up_resting_is_fed_back_and_cancelled():
+    rest = FakeRest().on("create_order", unknown())
+    v, _, out, clock = make(rest, reconcile_missing_after_s=30.0, missing_recheck_s=(10.0, 30.0))
+    v.submit([po("c-1")], clock())
+    await v.wait_idle(1.0)
+    for _ in range(10):
+        clock.advance(5 * NS_PER_S)
+        await v.reconcile_due()
+        if out:
+            break
+    assert out[-1].reason == "reconciled_missing" and v.has_pending_creates([TK])
+    rest.orders["late"] = order_row("c-1", "late", TK, created_ns=clock())  # a slow shard: it exists after all
+    clock.advance(11 * NS_PER_S)
+    await v.reconcile_due()
+    await v.wait_idle(1.0)
+    upd = [e for e in out if isinstance(e, KalshiOrderUpdate)]
+    assert upd and upd[0].order_id == "late" and upd[0].status == "resting" and v.stats.revived == 1
+    assert rest.of("cancel_order")[0][0] == ("late",) and rest.orders["late"]["status"] == "canceled"
+    # the OrderManager sees it resting after the reject ('resting_after_reject' -> the strategy cancels it too)
+    om = OrderManager()
+    om.request_place(po("c-1"), 0)
+    kinds = [x.kind for e in out for x in om.on_event(e)]
+    assert "reconcile_needed" in kinds and om.order("c-1").state is not OrderState.REJECTED
+
+
+async def test_rate_budget_reservation_released_when_the_limiter_grants_tokens():
+    """m2: an in-flight create's tokens are taken by the limiter; its reservation must not be
+    counted again while the HTTP response is outstanding."""
+    import asyncio
+
+    lim = KalshiRateLimiter(write=BucketLimit(refill_rate=50.0, bucket_capacity=50.0))
+    rest = FakeRest(limiter=lim)
+    gate = asyncio.Event()
+
+    async def create_order(body):  # like KalshiRest: the limiter first, then the (slow) request
+        await lim.acquire("POST", "/portfolio/events/orders")
+        await gate.wait()
+        return {"order_id": "x" + body["client_order_id"], "client_order_id": body["client_order_id"],
+                "fill_count": "0.00", "remaining_count": body["count"], "ts_ms": 1}
+
+    rest.create_order = create_order
+    v, _, out, clock = make(rest, max_batch=1, max_place_wait_s=0.5)
+    for i in range(5):
+        v.submit([po(f"c-{i}")], clock())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    assert v.reserved_write_tokens() == 0.0  # all five went through the limiter
+    v.submit([po("c-5")], clock())  # ~0 tokens left: the true wait is 0.2 s <= 0.5 s
+    assert not any(isinstance(e, OrderReject) for e in out)
+    gate.set()
+    await v.wait_idle(1.0)
+    assert len([e for e in out if isinstance(e, OrderAck)]) == 6 and v.reserved_write_tokens() == 0.0
+
+
+async def test_every_request_carries_the_subaccount_explicitly():
+    """M4: an omitted subaccount means ALL subaccounts on GET orders / GET fills / cancel-all."""
+    rest = FakeRest()
+    rest.orders["o-1"] = order_row("c-1", "o-1", TK)
+    v, _, out, clock = make(rest)  # subaccount: None = primary -> 0 on the wire
+    v.submit([po("c-9"), CancelOrder("c-1", TK, "o-1"), CancelAll("x")], clock())
+    await v.wait_idle(1.0)
+    await v.resting_orders()
+    await v.fetch_fills(0)
+    await v.fetch_positions()
+    await v.ensure_order_group("dh-main", 100)
+    assert rest.of("create_order")[0][0][0]["subaccount"] == 0
+    for name in ("cancel_order", "cancel_all_orders", "iter_orders", "iter_fills", "get_all_positions",
+                 "create_order_group", "get_order_groups"):
+        assert all(k.get("subaccount") == 0 for _, k in rest.of(name)), name
+
+
+async def test_cancel_all_verified_cancels_leftovers_and_reports_them():
+    rest = FakeRest()
+    rest.orders["o-1"] = order_row("c-1", "o-1", TK)
+    v, _, out, clock = make(rest)
+    orig = rest.cancel_all_orders
+
+    async def cancel_all_noop(**kw):  # "succeeds" but the order still rests (read lag / race)
+        rest.calls.append(("cancel_all_orders", (), dict(kw)))
+        return {}
+
+    rest.cancel_all_orders = cancel_all_noop
+    assert await v.cancel_all_verified("startup") == []
+    assert rest.orders["o-1"]["status"] == "canceled" and rest.of("cancel_order")[0][0] == ("o-1",)
+    rest.cancel_all_orders = orig
+    rest.on("cancel_all_orders", http_error(500, "x", "y", "DELETE"))
+    with pytest.raises(RuntimeError):
+        await v.cancel_all_verified("startup")

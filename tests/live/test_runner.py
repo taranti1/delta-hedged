@@ -43,12 +43,14 @@ TK = SPEC.ticker
 P_MS = 50
 
 
-def cfg(mode: str = "live", **venue) -> LiveConfig:
-    v = dict(positions_interval_s=0.0, queue_positions_interval_s=0.0, ghost_sweep=False)
+def cfg(mode: str = "live", loop: dict | None = None, **venue) -> LiveConfig:
+    v = dict(positions_interval_s=0.0, queue_positions_interval_s=0.0, ghost_sweep=False, fills_backfill_interval_s=0.0,
+             reconnect_settle_s=0.0)
     v.update(venue)
-    return LiveConfig(mode=mode, loop=LoopCfg(heartbeat_interval_s=0.05, kill_check_interval_s=0.02, clock_sample_s=0.0,
-                                              metrics_refresh_s=0.05, shutdown_timeout_s=2.0, max_lag_s=5.0),
-                      metrics=MetricsCfg(enabled=False), venue=VenueCfg(**v))
+    lc = dict(heartbeat_interval_s=0.05, kill_check_interval_s=0.02, clock_sample_s=0.0, metrics_refresh_s=0.05,
+              shutdown_timeout_s=2.0, max_lag_s=5.0, lag_resume_s=0.0, risk_state_interval_s=0.0)
+    lc.update(loop or {})
+    return LiveConfig(mode=mode, loop=LoopCfg(**lc), metrics=MetricsCfg(enabled=False), venue=VenueCfg(**v))
 
 
 def tick(v: float = 84_000.0) -> IndexTick:
@@ -77,7 +79,8 @@ class OrderingStrategy(RecordingStrategy):
 
 def live_runner(strategy, rest=None, tmp_path=None, **kw):
     rest = rest or FakeRest()
-    venue = KalshiVenue(rest, sink=lambda e: None, cfg=kw.pop("venue_cfg", cfg().venue))
+    vkw = {"clock_ns": kw["clock_ns"]} if "clock_ns" in kw else {}  # one clock for runner and venue (as in the app)
+    venue = KalshiVenue(rest, sink=lambda e: None, cfg=kw.pop("venue_cfg", cfg().venue), **vkw)
     r = LiveRunner(strategy, mode="live", period_ns=P_MS * NS_PER_MS, cfg=kw.pop("config", cfg()), venue=venue,
                    universe=[SPEC], **kw)
     venue.sink = r.push_result
@@ -362,8 +365,8 @@ async def test_fee_reconciliation_per_order_rounding(reported, ok):
     await venue.wait_idle(1.0)
     assert (not r.gate.closed) is ok
     assert ("cancel_all_orders" in rest.names()) is (not ok)
-    if not ok:
-        assert r.gate.reasons.keys() == {"fee_mismatch"}
+    if not ok:  # new orders blocked; the REST cancel-all also holds new orders for its 1-minute tail
+        assert r.gate.reasons.keys() == {"fee_mismatch", "cancel_all_hold"}
 
 
 async def test_paper_mode_fills_from_simulator_and_no_rest_orders(tmp_path):
@@ -524,3 +527,27 @@ async def test_fee_override_is_followed_not_blocked():
     r.push(KalshiFill(time.time_ns(), 0, TK, "tr-2", "o-2", "c-2", "bid", 4500, 200, False, 0, 400))
     r.process_pending()
     assert "fee_mismatch" in r.gate.reasons
+
+
+async def test_fee_override_present_at_startup_then_cleared_restores_the_base_fee():
+    """The spec discovered at start-up carries an event override ('quadratic', no maker fee)
+    on top of the base 'quadratic_with_maker_fees'. Clearing the override must restore the
+    BASE fee (not the override the spec was built with)."""
+    from dh.core.events import KalshiFeeUpdate
+    from dh.kalshi.fees import FeeEngine
+
+    spec = replace(SPEC, fee_type="quadratic", base_fee_type="quadratic_with_maker_fees", base_fee_multiplier=1.0)
+    s = RecordingStrategy()
+    rest = FakeRest()
+    venue = KalshiVenue(rest, sink=lambda e: None, cfg=cfg().venue)
+    r = LiveRunner(s, mode="live", period_ns=P_MS * NS_PER_MS, cfg=cfg(), venue=venue, universe=[spec],
+                   fee_engine=FeeEngine.from_config())
+    venue.sink = r.push_result
+    r.push(KalshiFill(time.time_ns(), 0, TK, "tr-1", "o-1", "c-1", "bid", 4500, 200, False, 0, 200))
+    r.process_pending()
+    assert not r.gate.closed  # zero maker fee is right under the override
+    r.push(KalshiFeeUpdate(time.time_ns(), 0, SPEC.event_ticker, None, None))  # override cleared
+    r.push(KalshiFill(time.time_ns(), 0, TK, "tr-2", "o-2", "c-2", "bid", 4500, 200, False, 0, 400))
+    r.process_pending()
+    assert "fee_mismatch" in r.gate.reasons  # the base schedule charges maker fees again
+    await venue.wait_idle(1.0)

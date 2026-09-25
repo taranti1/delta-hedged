@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,17 +51,40 @@ def unknown(method: str = "POST", path: str = "/portfolio/events/orders") -> Unk
     return UnknownOutcome(method, path, None, "ResponseLostError: timeout")
 
 
+def _iso(ns: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ns // NS_PER_S)) + f".{(ns // 1_000_000) % 1000:03d}Z"
+
+
 def order_row(coid: str, oid: str, ticker: str, *, status: str = "resting", side: str = "bid", px: str = "0.4500",
-              filled: str = "0.00", remaining: str = "2.00", initial: str = "2.00") -> dict[str, Any]:
-    """openapi Order object (spec field names)."""
-    return {
+              filled: str = "0.00", remaining: str = "2.00", initial: str = "2.00", created_ns: int | None = None,
+              subaccount: int | None = None) -> dict[str, Any]:
+    """openapi Order object (spec field names). ``created_ns`` None: 2026-09-25T12:00:00Z."""
+    row = {
         "order_id": oid, "user_id": "u-1", "client_order_id": coid, "ticker": ticker,
         "outcome_side": "yes" if side == "bid" else "no", "book_side": side, "type": "limit", "status": status,
         "yes_price_dollars": px, "no_price_dollars": f"{1 - float(px):.4f}", "fill_count_fp": filled,
         "remaining_count_fp": remaining, "initial_count_fp": initial, "taker_fees_dollars": "0.000000",
         "maker_fees_dollars": "0.000000", "taker_fill_cost_dollars": "0.000000", "maker_fill_cost_dollars": "0.000000",
-        "created_time": "2026-09-25T12:00:00Z", "last_update_time": "2026-09-25T12:00:01Z",
+        "created_time": "2026-09-25T12:00:00Z" if created_ns is None else _iso(created_ns),
+        "last_update_time": "2026-09-25T12:00:01Z",
     }
+    if subaccount:  # omitempty: the primary account's rows carry no subaccount_number
+        row["subaccount_number"] = subaccount
+    return row
+
+
+def fill_row(fid: str, oid: str, ticker: str, *, side: str = "bid", px: str = "0.4500", count: str = "1.00",
+             fee: str = "0.000000", taker: bool = False, created_ns: int | None = None, coid: str = "",
+             subaccount: int | None = None) -> dict[str, Any]:
+    """openapi Fill object (GET /portfolio/fills)."""
+    row = {"fill_id": fid, "trade_id": fid, "order_id": oid, "client_order_id": coid, "ticker": ticker,
+           "market_ticker": ticker, "outcome_side": "yes" if side == "bid" else "no", "book_side": side,
+           "count_fp": count, "yes_price_dollars": px, "no_price_dollars": f"{1 - float(px):.4f}", "is_taker": taker,
+           "fee_cost": fee, "exchange_index": 0,
+           "created_time": "2026-09-25T12:00:00Z" if created_ns is None else _iso(created_ns)}
+    if subaccount:
+        row["subaccount_number"] = subaccount
+    return row
 
 
 class FakeRest:
@@ -80,6 +104,8 @@ class FakeRest:
         self.queue_positions: dict[str, str] = {}  # oid -> queue_position_fp
         self.groups: list[dict[str, Any]] = []
         self.fills: list[dict[str, Any]] = []  # REST Fill rows
+        self.settlements: list[dict[str, Any]] = []  # REST Settlement rows
+        self.clock: Callable[[], int] = time.time_ns  # created_time of orders this fake creates
         self.cf_history: Callable[[str | None, str | None], Any] | None = None
         self.series: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}
@@ -124,7 +150,7 @@ class FakeRest:
         def ok() -> dict[str, Any]:
             oid = self._oid()
             self.orders[oid] = order_row(body["client_order_id"], oid, body["ticker"], side=body["side"], px=body["price"],
-                                         remaining=body["count"], initial=body["count"])
+                                         remaining=body["count"], initial=body["count"], created_ns=self.clock())
             return {"order_id": oid, "client_order_id": body["client_order_id"], "fill_count": "0.00",
                     "remaining_count": body["count"], "ts_ms": 1790300000123}
         return await self._call("create_order", (body,), {}, ok)
@@ -135,7 +161,7 @@ class FakeRest:
             for b in orders:
                 oid = self._oid()
                 self.orders[oid] = order_row(b["client_order_id"], oid, b["ticker"], side=b["side"], px=b["price"],
-                                             remaining=b["count"], initial=b["count"])
+                                             remaining=b["count"], initial=b["count"], created_ns=self.clock())
                 out.append({"order_id": oid, "client_order_id": b["client_order_id"], "fill_count": "0.00",
                             "remaining_count": b["count"], "ts_ms": 1790300000123})
             return {"orders": out}
@@ -230,6 +256,11 @@ class FakeRest:
         for r in rows:
             yield r
 
+    async def iter_settlements(self, **filters: Any):  # async generator (like KalshiRest.iter_settlements)
+        rows = await self._call("iter_settlements", (), filters, lambda: copy.deepcopy(self.settlements))
+        for r in rows:
+            yield r
+
     async def get_queue_positions(self, **kw: Any) -> Any:
         return await self._call("get_queue_positions", (), kw, lambda: {"queue_positions": [
             {"order_id": oid, "market_ticker": self.orders[oid]["ticker"] if oid in self.orders else "", "queue_position_fp": q}
@@ -313,9 +344,13 @@ def kxbtcd_spec(strike: float = 84_000.0, *, hour_ns: int | None = None, ticker:
                       fee_multiplier=1.0, title="test")
 
 
+NO_SEQ_CHANNELS = frozenset({"fill", "user_orders", "market_positions"})  # asyncapi: no seq on these payloads
+
+
 @dataclass
 class WsFrames:
-    """Builders for spec-shaped Kalshi WS frames (sid/seq managed per channel)."""
+    """Builders for spec-shaped Kalshi WS frames (sid/seq managed per channel; the own-activity
+    channels fill / user_orders / market_positions carry NO seq, as in the asyncapi)."""
 
     sids: dict[str, int] = field(default_factory=dict)
     seqs: dict[int, int] = field(default_factory=dict)
@@ -331,6 +366,8 @@ class WsFrames:
 
     def frame(self, typ: str, ch: str, msg: dict[str, Any]) -> bytes:
         sid = self._sid(ch)
+        if ch in NO_SEQ_CHANNELS:
+            return orjson.dumps({"type": typ, "sid": sid, "msg": msg})
         return orjson.dumps({"type": typ, "sid": sid, "seq": self._seq(sid), "msg": msg})
 
     def subscribed(self, ch: str) -> bytes:
