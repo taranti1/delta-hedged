@@ -67,6 +67,18 @@ class MarketSpec:
     fee_type: str = ""  # resolved from series/event at runtime; '' = unresolved
     fee_multiplier: float = 1.0
     title: str = ""
+    # the fee WITHOUT any event override (series, else market): what applies again when an
+    # override is cleared. '' = same as fee_type (no override known at construction)
+    base_fee_type: str = ""
+    base_fee_multiplier: float | None = None
+
+    @property
+    def base_fee(self) -> tuple[str, float]:
+        """(fee_type, multiplier) without event overrides (falls back to the effective fee)."""
+        if self.base_fee_type:
+            mult = self.base_fee_multiplier
+            return self.base_fee_type, (1.0 if mult is None else float(mult))
+        return self.fee_type, self.fee_multiplier
 
     def __post_init__(self) -> None:
         if self.strike_type not in SUPPORTED_STRIKE_TYPES:

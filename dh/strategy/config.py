@@ -97,6 +97,11 @@ class RiskCfg:
     book_resume_after_s: float = 5.0  # after a book gap/resync, wait before quoting that market
     own_gap_pause_s: float = 30.0  # pause after a sequence gap on our own fill/order channels
     kalshi_stream: str = "kalshi.ws"
+    # runner-emitted FeedStatus streams (audit live M1/M3): consumer/data lag ('stale' ->
+    # cancel all + no quoting until 'resumed') and own-activity reconciliation after a
+    # reconnect ('stale' = reconciling ... 'resynced')
+    lag_stream: str = "runner.lag"
+    reconcile_stream: str = "kalshi.reconcile"
     hedge_stream: str = "kalshi_perp.ws"  # FeedStatus stream of the hedge venue
 
 

@@ -59,7 +59,7 @@ NOT_FOUND_REASONS = frozenset({"not_found", "order_not_found", "404"})
 EVENT_KINDS = (
     "accepted", "rejected", "fill", "filled", "canceled", "amended", "decreased", "cancel_rejected",
     "amend_rejected", "decrease_rejected", "cancel_ready", "reconcile_needed", "position_mismatch",
-    "orphan_fill", "unknown_order", "group_triggered", "group_reset",
+    "fill_position_mismatch", "orphan_fill", "unknown_order", "group_triggered", "group_reset",
 )
 
 
@@ -233,6 +233,18 @@ class OrderManager:
             return False
         return True
 
+    def retry_cancel(self, client_order_id: str, now_ns: int) -> bool:
+        """Re-arm a PENDING_CANCEL whose cancel got no definite answer (cancel_timeout): the
+        caller re-sends the CancelOrder (cancels are idempotent). True if it should be sent."""
+        o = self._by_coid.get(client_order_id)
+        if o is None or o.state is not OrderState.PENDING_CANCEL or not o.order_id:
+            return False
+        o.cancel_sent_ns = now_ns
+        o.updated_ns = now_ns
+        o.flagged = False
+        self.stats["cancel_retries"] = self.stats.get("cancel_retries", 0) + 1
+        return True
+
     def request_cancel_all(self, a: CancelAll, now_ns: int) -> list[str]:
         """Mark every live order (in a.tickers, or all) PENDING_CANCEL; returns their ids."""
         out = []
@@ -349,8 +361,11 @@ class OrderManager:
         if f.has_post_position:
             self._exch_pos[t] = f.post_position
             if f.post_position != self._pos[t]:
+                # a fill's post_position can disagree transiently (a missed fill being
+                # back-filled): the strategy pauses and requests reconciliation; only a confirmed
+                # snapshot mismatch (reconcile_position -> 'position_mismatch') halts
                 self.stats["position_mismatches"] += 1
-                out.append(OrderEvent(f.ts, "position_mismatch", f.client_order_id, t, f.order_id,
+                out.append(OrderEvent(f.ts, "fill_position_mismatch", f.client_order_id, t, f.order_id,
                                       detail=f"ours={self._pos[t]} exchange={f.post_position}"))
         return out
 

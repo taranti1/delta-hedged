@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import importlib.util
 import sys
 from pathlib import Path
@@ -113,6 +114,20 @@ async def test_collector_end_to_end_against_loopback_venue(tmp_path):
     from websockets.asyncio.server import serve
 
     frames = [raw.decode() for _t, _s, _q, raw in load_fixture("coinbase")[1:9] if not raw.startswith(b'{"_dh"')]
+    # trades executed before the connection opened are the venue's history replay and are
+    # dropped (dh.feeds.base.is_history), so re-stamp the fixture's trades as executing now
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _fresh(f: str) -> str:
+        m = orjson.loads(f)
+        if m.get("channel") != "market_trades":
+            return f
+        for ev in m.get("events", ()):
+            for t in ev.get("trades", ()):
+                t["time"] = now
+        return orjson.dumps(m).decode()
+
+    frames = [_fresh(f) for f in frames]
 
     async def handler(ws):
         subs = [await ws.recv() for _ in range(3)]

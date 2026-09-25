@@ -129,7 +129,7 @@ def test_fill_example_uses_book_side_not_deprecated_fields(asyncapi_examples):
         ts=R, ts_exch=1671899397000 * NS_PER_MS, ticker="HIGHNY-22DEC23-B53.5",
         trade_id="d91bc706-ee49-470d-82d8-11418bda6fed", order_id="ee587a1c-8b87-4dcf-b721-9f6f790619fa",
         client_order_id="my-order-1", book_side="bid", yes_px=7500, qty=27800, is_taker=True,
-        fee_micros=10000, post_position=50000, has_post_position=True,
+        fee_micros=10000, post_position=50000, has_post_position=True, subaccount=3,
     )
     m = ex(asyncapi_examples, "fill")
     m["msg"].update(side="no", action="sell")  # deprecated fields must be ignored
@@ -393,3 +393,29 @@ def test_lifecycle_created_carries_strike_fields(asyncapi_examples):
         md = p["msg"]["additional_metadata"]
         assert lc.strike_type == md["strike_type"] and lc.floor_strike == float(md["floor_strike"])
         assert lc.event_ticker == md["event_ticker"] and lc.expected_expiration_ts == md["expected_expiration_ts"] * 10**9
+
+
+def test_own_activity_events_carry_the_subaccount(asyncapi_examples):
+    """Audit live M4: the runner drops fills/orders/positions of other subaccounts, so the
+    normalizer must keep the field (fill/market_position: `subaccount`; user_order and REST
+    Order: `subaccount_number`; missing -> 0 = primary; unparseable -> -1, never matched)."""
+    from dh.core.events import KalshiPositionSnapshot
+    from dh.kalshi.normalize import rest_fill_to_event, subaccount_of
+
+    m = ex(asyncapi_examples, "fill")
+    assert ws_message_to_events(m, R)[0].subaccount == 3  # the spec's example fill is subaccount 3
+    del m["msg"]["subaccount"]
+    assert ws_message_to_events(m, R)[0].subaccount == 0
+    o = ex(asyncapi_examples, "userOrder")
+    o["msg"]["subaccount_number"] = 2
+    assert ws_message_to_events(o, R)[0].subaccount == 2
+    for p in asyncapi_examples["marketPosition"]:
+        m = copy.deepcopy(p)
+        m["msg"]["subaccount"] = 5
+        (ev,) = [e for e in ws_message_to_events(m, R) if isinstance(e, KalshiPositionSnapshot)]
+        assert ev.subaccount == 5
+    row = {"fill_id": "f1", "order_id": "o1", "ticker": "T", "book_side": "bid", "yes_price_dollars": "0.4500",
+           "count_fp": "1.00", "is_taker": False, "fee_cost": "0.0000", "created_time": "2026-09-25T00:00:00Z",
+           "subaccount_number": 4}
+    assert rest_fill_to_event(row, R).subaccount == 4
+    assert subaccount_of({}) == 0 and subaccount_of({"subaccount": "x"}) == -1

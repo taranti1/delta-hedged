@@ -132,6 +132,7 @@ class KalshiFill:
     post_position: int  # signed YES position after the fill (qty units), if known
     has_post_position: bool = True
     fill_id: str = ""  # REST fill_id when known; dedupe key if WS/REST trade_ids ever differ
+    subaccount: int = 0  # Kalshi subaccount (0 = primary); the live runner drops other accounts'
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,7 @@ class KalshiOrderUpdate:
     remaining_qty: int
     maker_fees_micros: int = 0
     taker_fees_micros: int = 0
+    subaccount: int = 0  # Kalshi subaccount (0 = primary)
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +214,7 @@ class KalshiPositionSnapshot:
     realized_pnl_micros: int = 0
     fees_paid_micros: int = 0
     source: str = "ws"  # ws|rest
+    subaccount: int = 0  # Kalshi subaccount (0 = primary)
 
 
 # ----------------------------------------------------------------------------- settlement benchmark
@@ -394,6 +397,29 @@ class Settlement:
     settlement_px: int = 0  # YES payout in px units (10_000 for YES)
 
 
+@dataclass(frozen=True, slots=True)
+class RiskStateSeed:
+    """Risk state carried over from earlier sessions of the same UTC day (audit live C1).
+
+    Pushed once by the live runner at start-up, before any Timer, from its persisted state and
+    the day's REST fills/settlements; recorded, so replay reproduces it. Without it a restart
+    would silently reset the daily-loss halt and any pause.
+
+    day_pnl_usd: net P&L of the UTC day starting at ``day_start_ns`` before this session (fees,
+    settlements and events excluded from this session included; negative = loss). It counts
+    toward the daily-loss limit on that UTC day only. ``halted`` carries over a Halt(all);
+    ``pause_until_ns`` carries over a pause (e.g. the settlement-loss pause).
+    """
+
+    ts: int
+    ts_exch: int
+    day_start_ns: int
+    day_pnl_usd: float = 0.0
+    halted: bool = False
+    halt_reason: str = ""
+    pause_until_ns: int = 0
+
+
 EVENT_TYPES: dict[str, type] = {
     cls.__name__: cls
     for cls in (
@@ -423,6 +449,7 @@ EVENT_TYPES: dict[str, type] = {
         FeedStatus,
         Timer,
         Settlement,
+        RiskStateSeed,
     )
 }
 
@@ -453,6 +480,7 @@ Event = (
     | FeedStatus
     | Timer
     | Settlement
+    | RiskStateSeed
 )
 
 __all__ = [name for name in EVENT_TYPES] + ["Event", "EVENT_TYPES", "YesNo", "BookSide", "Aggressor", "field"]

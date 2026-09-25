@@ -42,6 +42,7 @@ from dh.core.events import (
     FeedStatus,
     HedgeFill,
     HedgeOrderUpdate,
+    RiskStateSeed,
     IndexTick,
     KalshiBookDelta,
     KalshiBookSnapshot,
@@ -125,6 +126,7 @@ class MarketMaker:
         as_coefs: dict | None = None,
         book_includes_own: bool = False,
         use_order_group: bool = True,
+        id_prefix: str | None = None,
         log_fv_every_ns: int = NS_PER_S,
         requote_move_sigma: float = 2.0,
     ) -> None:
@@ -153,7 +155,9 @@ class MarketMaker:
         self.flow = FillIntensityModel(cfg.fill, dict(flow_segments or {}))
         self.adverse = AdverseSelectionModel(cfg.adverse, dict(as_coefs or {}))
         self.risk = RiskEngine(cfg.risk)
-        self.ids = IdGen(cfg.run_prefix)
+        # client_order_ids must not repeat across sessions (audit live M6): the live runner passes
+        # f"{run_prefix}-{session token}" (recorded, so replay uses the same prefix)
+        self.ids = IdGen(id_prefix or cfg.run_prefix)
         self.alt_tail = make_tail(cfg.fair_value.band_tail_alt) if cfg.fair_value.band_tail_alt else GAUSS
         self.hedge_pos = 0.0
         self.hedge_cash = 0.0
@@ -174,9 +178,12 @@ class MarketMaker:
         self.use_order_group = use_order_group
         self.group_created = False
         self.group_triggered_at = 0
+        self.group_reset_sent_at = 0  # re-sent every cooldown until the reset is confirmed
+        self._last_prune_ns = 0
         self.halted_all = False
         self.paused: set[str] = set()
-        self.base_fee: dict[str, tuple[str, float]] = {t: (sp.fee_type, sp.fee_multiplier) for t, sp in self.specs.items()}
+        # fee without event overrides (restored when an override is cleared; audit live m7)
+        self.base_fee: dict[str, tuple[str, float]] = {t: sp.base_fee for t, sp in self.specs.items()}
         self.fee_tolerance_micros = 10_000  # one cent of balance rounding per fill
         self.stats = MMStats()
         self.brti_hist: deque[tuple[int, float]] = deque()
@@ -193,7 +200,7 @@ class MarketMaker:
             self.specs[s.ticker] = s
             self.books[s.ticker] = KalshiBook(s.ticker)
             self.fv_hist[s.ticker] = deque()
-            self.base_fee[s.ticker] = (s.fee_type, s.fee_multiplier)
+            self.base_fee[s.ticker] = s.base_fee
             self._resolve_fee(s.ticker, s)
             added.append(s.ticker)
         return added
@@ -325,6 +332,9 @@ class MarketMaker:
                 if ev.status == "rejected":
                     out.append(Log("hedge_rejected", {"coid": ev.client_order_id, "venue": ev.venue,
                                                       "reason": ev.reason}))
+        elif isinstance(ev, RiskStateSeed):
+            for a in self.risk.on_seed(ev):
+                out += self._apply_risk_action(ev.ts, a)
         elif isinstance(ev, (Settlement, KalshiMarketLifecycle)):
             out += self._on_settlement(ev)
         elif isinstance(ev, Timer):
@@ -363,8 +373,11 @@ class MarketMaker:
         return out
 
     def _on_order_event(self, ev) -> list[Action]:
+        return self._handle_order_events(self.om.on_event(ev))
+
+    def _handle_order_events(self, oes) -> list[Action]:
         out: list[Action] = []
-        for oe in self.om.on_event(ev):
+        for oe in oes:
             k = oe.kind
             if k == "accepted":
                 w = self.om.order(oe.client_order_id)
@@ -396,14 +409,35 @@ class MarketMaker:
                                     reason="deferred")
                     if self.om.request_cancel(a, oe.ts):
                         out.append(a)
-            elif k == "position_mismatch":
+            elif k == "position_mismatch":  # confirmed snapshot mismatch (REST / forwarded WS)
                 for a in self.risk.on_reconciliation_mismatch(oe.ts, oe.detail or oe.ticker):
                     out += self._apply_risk_action(oe.ts, a)
+            elif k == "fill_position_mismatch":
+                # a fill's post_position disagrees: stop quoting and reconcile; the runner's REST
+                # check halts if the mismatch is confirmed (audit live m3)
+                self.risk.pause_until_ns = max(self.risk.pause_until_ns,
+                                               oe.ts + int(self.cfg.risk.own_gap_pause_s * NS_PER_S))
+                out += self._apply_risk_action(oe.ts, CancelAll(reason="fill_position_mismatch"))
+                out.append(Log("risk", {"event": "reconcile_requested", "channel": "fill", "ticker": oe.ticker,
+                                        "detail": oe.detail}))
+            elif k == "reconcile_needed":
+                w = self.om.order(oe.client_order_id)
+                if oe.detail == "cancel_timeout" and w is not None and self.om.retry_cancel(oe.client_order_id, oe.ts):
+                    # no definite answer to our cancel: send it again (idempotent), every
+                    # change timeout until the order resolves (audit live C2)
+                    self.stats.bump("cancel_retry")
+                    out.append(CancelOrder(client_order_id=w.client_order_id, ticker=w.ticker, order_id=w.order_id,
+                                           reason="cancel_retry"))
+                elif oe.detail == "resting_after_reject" and w is not None:
+                    out += self._cancel(oe.ts, w, "revived")  # declared missing, found resting: pull it
+                out.append(Log("order", {"event": "reconcile_needed", "coid": oe.client_order_id,
+                                         "ticker": oe.ticker, "detail": oe.detail}))
             elif k == "group_triggered":
                 self.group_triggered_at = oe.ts
                 self.risk.on_feed_status(FeedStatus(ts=oe.ts, ts_exch=0, stream=f"kalshi.order_group:{oe.client_order_id or self.ORDER_GROUP_ID}", status="error"))
                 out.append(Log("risk", {"event": "order_group_triggered"}))
             elif k == "group_reset":
+                self.group_reset_sent_at = 0
                 self.risk.on_feed_status(FeedStatus(ts=oe.ts, ts_exch=0, stream=f"kalshi.order_group:{oe.client_order_id or self.ORDER_GROUP_ID}", status="resynced"))
         return out
 
@@ -442,7 +476,7 @@ class MarketMaker:
         for t, spec in list(self.specs.items()):
             if spec.event_ticker != ev.event_ticker:
                 continue
-            base_type, base_mult = self.base_fee.get(t, (spec.fee_type, spec.fee_multiplier))
+            base_type, base_mult = self.base_fee.get(t, spec.base_fee)
             ftype = ev.fee_type_override if ev.fee_type_override is not None else base_type
             mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else base_mult
             self.fee_sched.pop(t, None)
@@ -528,19 +562,32 @@ class MarketMaker:
             if now - t >= 30 * NS_PER_S:
                 del self._own_delta_seen[coid]
 
+    PRUNE_EVERY_NS = 60 * NS_PER_S
+    PRUNE_AGE_NS = 600 * NS_PER_S
+
     def _on_timer(self, now: int) -> list[Action]:
         out: list[Action] = []
-        self.om.on_event(Timer(ts=now))  # ack/change timeouts -> unknown-outcome handling
+        # ack/change timeouts -> unknown-outcome handling (re-cancel, revive; audit live C2)
+        out += self._handle_order_events(self.om.on_event(Timer(ts=now)))
         if self._queue_pending_since or self._own_delta_seen:
             self._expire_queue_pending(now)
+        if now - self._last_prune_ns >= self.PRUNE_EVERY_NS:
+            # bounded order book-keeping over a long session (audit live M5); deterministic in
+            # event time, so replay prunes identically
+            self._last_prune_ns = now
+            self.om.prune(now - self.PRUNE_AGE_NS)
         if self.use_order_group and not self.group_created:
             self.group_created = True
             lim = int(self.cfg.risk.order_group_limit_contracts * QTY_SCALE)
             out.append(CreateOrderGroup(order_group_id=self.ORDER_GROUP_ID, contracts_limit=lim, reason="startup"))
-        if (self.group_triggered_at and now - self.group_triggered_at
-                >= int(self.cfg.risk.order_group_cooldown_s * NS_PER_S)):
+        cool = int(self.cfg.risk.order_group_cooldown_s * NS_PER_S)
+        if self.group_triggered_at and now - self.group_triggered_at >= cool:
             self.group_triggered_at = 0
+            self.group_reset_sent_at = now
             out.append(ResetOrderGroup(order_group_id=self.ORDER_GROUP_ID, reason="cooldown elapsed"))
+        elif self.group_reset_sent_at and self.risk.groups_triggered and now - self.group_reset_sent_at >= cool:
+            self.group_reset_sent_at = now  # reset not confirmed yet: send it again (audit live m11)
+            out.append(ResetOrderGroup(order_group_id=self.ORDER_GROUP_ID, reason="reset not confirmed"))
         if now - self.last_cycle_ns >= self.cfg.timers.quote_period_ms * NS_PER_MS:
             out += self._cycle(now)
         return out
@@ -580,6 +627,10 @@ class MarketMaker:
         self.last_cycle_ns = now
         self.stats.cycles += 1
         health = self.risk.health(now)
+        # loss limits first and every cycle, healthy or not: a cycle that halts sends no new
+        # orders (audit live m5), and losses are checked while quoting is paused too
+        for a in self.risk.on_equity(now, self.equity(self._spot())):
+            out += self._apply_risk_action(now, a)
         if self.halted_all or not health.quoting_allowed or not self.fv.ready:
             self.stats.halted_cycles += 1
             for r in (health.reasons or (["fv_not_ready"] if not self.fv.ready else ["halted"])):
@@ -675,10 +726,6 @@ class MarketMaker:
         # ---------------------------------------------------- hedge
         if cfg.hedge.enabled and health.hedging_allowed:
             out += self._hedge(now, S, D)
-        # ---------------------------------------------------- equity
-        eq = self.equity(S)
-        for a in self.risk.on_equity(now, eq):
-            out += self._apply_risk_action(now, a)
         return out
 
     def _quote_market(self, now, s: MarketSpec, f: MarketFV, grid, ev, base, S, D, c_h, health):

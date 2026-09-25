@@ -305,6 +305,18 @@ def _ticker(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
     ]
 
 
+def subaccount_of(m: dict) -> int:
+    """Subaccount number of an own-activity message or REST object: `subaccount` (fill,
+    market_position) or `subaccount_number` (user_order, Order); missing -> 0 (primary)."""
+    v = m.get("subaccount")
+    if v in (None, ""):
+        v = m.get("subaccount_number")
+    try:
+        return int(v) if v not in (None, "") else 0
+    except (TypeError, ValueError):
+        return -1  # unparseable: never matches a configured subaccount, so it is dropped
+
+
 def _fill(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
     has_pos = m.get("post_position_fp") not in (None, "")
     return [
@@ -322,6 +334,7 @@ def _fill(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
             fee_micros=opt_micros(m.get("fee_cost")),
             post_position=opt_qty(m.get("post_position_fp")),
             has_post_position=has_pos,
+            subaccount=subaccount_of(m),
         )
     ]
 
@@ -349,6 +362,7 @@ def order_to_update(m: dict, recv_ns: int) -> KalshiOrderUpdate:
         remaining_qty=opt_qty(m.get("remaining_count_fp")),
         maker_fees_micros=opt_micros(m.get("maker_fees_dollars")),
         taker_fees_micros=opt_micros(m.get("taker_fees_dollars")),
+        subaccount=subaccount_of(m),
     )
 
 
@@ -468,7 +482,7 @@ def _market_position(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]
         KalshiPositionSnapshot(
             ts=recv_ns, ts_exch=0, ticker=snap.ticker, position=snap.position,
             cost_micros=snap.position_cost_micros, realized_pnl_micros=snap.realized_pnl_micros,
-            fees_paid_micros=snap.fees_paid_micros, source="ws",
+            fees_paid_micros=snap.fees_paid_micros, source="ws", subaccount=subaccount_of(m),
         )
     ]
 
@@ -670,6 +684,7 @@ def rest_fill_to_event(row: dict, recv_ns: int) -> KalshiFill:
         fee_micros=opt_micros(row.get("fee_cost")),
         post_position=0,
         has_post_position=False,
+        subaccount=subaccount_of(row),
     )
 
 
@@ -838,6 +853,7 @@ def rest_market_to_spec(
     exp_raw = market.get("expected_expiration_time")
     exp_ns = iso_to_ns(str(exp_raw)) if exp_raw else close_ns
     fee_type, mult, _src = resolve_fee_fields(series, event, market)
+    base_type, base_mult, _bsrc = resolve_fee_fields(series, None, market)  # without event override
     floor = market.get("floor_strike")
     cap = market.get("cap_strike")
     try:
@@ -856,6 +872,8 @@ def rest_market_to_spec(
             fee_type=fee_type,
             fee_multiplier=float(mult) if mult is not None else 1.0,
             title=str(market.get("title") or market.get("yes_sub_title") or ""),
+            base_fee_type=base_type,
+            base_fee_multiplier=float(base_mult) if base_mult is not None else None,
         )
     except ValueError as exc:  # MarketSpec validation (e.g. strike missing)
         raise UnsupportedMarket(str(exc)) from exc

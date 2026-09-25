@@ -59,6 +59,11 @@ class RiskEngine:
         self.hedge_venue_ok = True
         self.day = -1
         self.day_start_equity = 0.0
+        # carried over from earlier sessions of the same UTC day (RiskStateSeed; audit live C1)
+        self.seed_day = -1
+        self.seed_day_pnl = 0.0
+        self.lag_ok = True  # runner consumer/data lag (audit live M1)
+        self.reconciling = False  # own-activity reconciliation after a reconnect (audit live M3)
         self.fee_mismatch = False
         self.recon_mismatch = False
         self.log: list[tuple[int, str]] = []  # (ts, message) informational, bounded by caller
@@ -90,10 +95,44 @@ class RiskEngine:
     def note_ext(self, venue: str, ts_ns: int) -> None:
         self.last_ext_ns[venue] = max(self.last_ext_ns.get(venue, 0), ts_ns)
 
+    def on_seed(self, ev) -> list[Action]:
+        """RiskStateSeed: the UTC day's P&L before this session, a carried-over halt or pause."""
+        day_ns = 86_400 * NS_PER_S
+        day = ev.day_start_ns // day_ns
+        out: list[Action] = [Log("risk", {"event": "risk_seed", "day_start_ns": ev.day_start_ns,
+                                          "day_pnl_usd": ev.day_pnl_usd, "halted": ev.halted,
+                                          "halt_reason": ev.halt_reason, "pause_until_ns": ev.pause_until_ns})]
+        if day != ev.ts // day_ns:
+            out.append(Log("risk", {"event": "risk_seed_ignored", "reason": "seed is for another UTC day"}))
+            return out
+        self.seed_day, self.seed_day_pnl = day, float(ev.day_pnl_usd)
+        self.pause_until_ns = max(self.pause_until_ns, int(ev.pause_until_ns))
+        if ev.halted and not self.halted_all:
+            out += self._halt(ev.ts, f"carried_over:{ev.halt_reason or 'halt'}", scope="all")
+        elif not self.halted_all and self.seed_day_pnl <= -self.cfg.daily_loss_halt:
+            out += self._halt(ev.ts, "daily_loss", scope="all")
+        return out
+
     def on_feed_status(self, ev: FeedStatus) -> list[Action]:
         c = self.cfg
         out: list[Action] = []
         st = ev.stream
+        if st == c.lag_stream:
+            if ev.status in ("stale", "gap", "disconnected"):
+                if self.lag_ok:
+                    out.append(CancelAll(reason="runner_lag"))
+                self.lag_ok = False
+            elif ev.status in ("resumed", "resynced", "connected"):
+                self.lag_ok = True
+            return out
+        if st == c.reconcile_stream:
+            if ev.status in ("stale", "gap", "disconnected"):
+                if not self.reconciling:
+                    out.append(CancelAll(reason="reconciling"))
+                self.reconciling = True
+            elif ev.status in ("resynced", "resumed", "connected"):
+                self.reconciling = False
+            return out
         if st == c.kalshi_stream:
             if ev.status in ("disconnected", "gap", "stale"):
                 if self.kalshi_ok or ev.status == "gap":
@@ -157,6 +196,12 @@ class RiskEngine:
         if now_ns < self.pause_until_ns:
             quoting = False
             reasons.append("paused")
+        if not self.lag_ok:
+            quoting = False
+            reasons.append("runner_lag")
+        if self.reconciling:
+            quoting = False
+            reasons.append("reconciling")
         if now_ns < self.group_pause_until_ns or self.groups_triggered:
             quoting = False
             reasons.append("order_group_triggered")
@@ -217,9 +262,16 @@ class RiskEngine:
         if day != self.day:
             self.day = day
             self.day_start_equity = equity
-        if not self.halted_all and equity - self.day_start_equity <= -self.cfg.daily_loss_halt:
+        carried = self.seed_day_pnl if day == self.seed_day else 0.0  # earlier sessions today
+        if not self.halted_all and equity - self.day_start_equity + carried <= -self.cfg.daily_loss_halt:
             return self._halt(now_ns, "daily_loss", scope="all")
         return []
+
+    def day_pnl(self, now_ns: int, equity: float) -> float:
+        """The UTC day's P&L so far, including sessions before this one (for the runner)."""
+        day = now_ns // (86_400 * NS_PER_S)
+        start = self.day_start_equity if day == self.day else equity
+        return equity - start + (self.seed_day_pnl if day == self.seed_day else 0.0)
 
     def on_settlement_pnl(self, now_ns: int, pnl: float) -> list[Action]:
         if pnl <= -self.cfg.settlement_loss_halt:

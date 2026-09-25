@@ -155,7 +155,7 @@ def test_post_position_mismatch_and_reconcile_position():
     om.request_place(P, 0)
     assert kinds(om.on_event(fill(1, "c1", "X1", "bid", 4500, 100, "t1", post=600))) == ["fill"]
     evs = om.on_event(fill(2, "c1", "X1", "bid", 4500, 100, "t2", post=900))
-    assert kinds(evs) == ["fill", "position_mismatch"] and om.exchange_position(T) == 900
+    assert kinds(evs) == ["fill", "fill_position_mismatch"] and om.exchange_position(T) == 900
     evs = om.reconcile_position(T, 900, 3, adopt=True)
     assert kinds(evs) == ["position_mismatch"] and om.position(T) == 900
     assert om.reconcile_position(T, 900, 4) == []
@@ -308,3 +308,19 @@ def test_exchange_evidence_overrides_a_wrong_reject():
     om2.on_event(reject(1, "c1", "bad_request"))
     evs = om2.on_event(update(2, "c1", "X1", "resting", "bid", 4500, 1000, 0, 1000))
     assert kinds(evs)[0] == "reconcile_needed" and om2.order("c1").state is OrderState.RESTING
+
+
+def test_retry_cancel_rearms_the_cancel_timeout():
+    """Audit live C2: a cancel with no definite answer is re-sent every change timeout."""
+    om = OrderManager(change_timeout_ns=1 * S)
+    om.request_place(P, 0)
+    om.on_event(ack(1, "c1", "X1", 0, 1000))
+    assert om.request_cancel(CancelOrder("c1", T, "X1"), 2)
+    assert not om.request_cancel(CancelOrder("c1", T, "X1"), 3)  # already pending
+    evs = om.on_event(Timer(2 * S))
+    assert kinds(evs) == ["reconcile_needed"] and evs[0].detail == "cancel_timeout"
+    assert om.on_event(Timer(2 * S + 1)) == []  # flagged once
+    assert om.retry_cancel("c1", 2 * S + 2)
+    evs = om.on_event(Timer(4 * S))
+    assert kinds(evs) == ["reconcile_needed"]  # re-armed: flags again after another timeout
+    assert not om.retry_cancel("nope", 5 * S)

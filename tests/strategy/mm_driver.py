@@ -25,11 +25,11 @@ def spec(ticker=TICK, K=84000.0, strike_type="greater", exp=EXP, cap=None, event
 
 
 class Driver:
-    def __init__(self, specs, cfg=None, S0: float = 84000.0) -> None:
+    def __init__(self, specs, cfg=None, S0: float = 84000.0, **mm_kw) -> None:
         self.cfg = cfg or default_kat_config()
         fv = FairValueModel.from_config(load_recommended_config())
         warm_fv_model(fv, T0, S0, 0.35)
-        self.mm = MarketMaker(self.cfg, specs, fv_model=fv, fee_engine=FeeEngine.from_config())
+        self.mm = MarketMaker(self.cfg, specs, fv_model=fv, fee_engine=FeeEngine.from_config(), **mm_kw)
         self.now = T0
         self.S = S0
 

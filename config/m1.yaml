@@ -24,7 +24,8 @@ quoting:
   price_cap_px: 9700
   requote_min_interval_ms: 500
   post_only: true
-  order_expiry_s: 0.0
+  order_expiry_s: 120.0     # exchange-side dead-man: a quote outlives a lost host by <= 2 min
+                           # (orders are replaced about this often anyway; E4 prices priority)
 fill:
   taker_rate_per_s: 0.3
   taker_size_mean: 20.0
