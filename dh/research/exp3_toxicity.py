@@ -28,8 +28,14 @@ threshold. Reported under B and C: net c/contract change vs the baseline (paired
 and fill loss.
 
 Decision rule (docs/TEST_MATRIX.md E3): accept if the toxicity-aware cancel policy raises net
-c/contract by >= 0.1c (CI > 0) at <= 20% fill loss; reject on no OOS lift or if the lift vanishes
-under policy C.
+c/contract by >= 0.1c (CI > 0) at <= 20% fill loss with $/day not lower, under BOTH fill policies
+B and C (audit C2/M1: the contract loss is bounded by the 20 % fill-loss rule of E3 itself, which
+takes precedence over the general "contracts/day not lower" convention); reject on no OOS lift
+(walk-forward Brier improvement over the base rate with CI upper bound <= 0) or if the lift
+vanishes under policy C. The rule is trained on policy-B fills only, and only on fills whose 60 s
+label ended before the scored half starts (audit m2). Features are captured at MATCH time (the
+simulator's fill hook: the strategy has seen only earlier events, audit m1); markouts use the
+logged fair value only when it is at most 5 s old (audit m6).
 """
 
 from __future__ import annotations
@@ -53,20 +59,39 @@ from dh.execution.markout import DEFAULT_HORIZONS_S, AsOf, compute_markouts
 from dh.feeds.registry import SPOT_CONSTITUENTS
 from dh.research.exp_common import (
     Report,
+    add_regimes,
     cluster_mean_ci,
+    day_block_ok,
     fmt_ns,
     n_events,
     paired_diff_ci,
+    paired_regime_table,
     policy_letter,
+    regime_table,
+    vol_cuts,
+    with_day,
     write_csv,
 )
-from dh.research.replay_env import Universe, build_universe, inputs_meta, prime_probe, probe_for_window, run_replay
+from dh.research.replay_env import (
+    Universe,
+    build_universe,
+    describe_latency,
+    inputs_meta,
+    inputs_status,
+    prime_probe,
+    probe_for_window,
+    research_latency,
+    run_replay,
+    settlement_cluster,
+)
 from dh.strategy.config import StrategyConfig
 from dh.strategy.mm import MarketMaker
 
 SEC_YR = 365.0 * 24 * 3600
 RULE_E3 = ("accept if the toxicity-aware cancel policy raises net c/contract by >= 0.1c (CI > 0) at <= 20% fill "
-           "loss; reject if there is no OOS lift or the lift vanishes under policy C")
+           "loss with $/day not lower, under both B and C; reject if there is no OOS lift or the lift vanishes under "
+           "policy C")
+RULE_LABEL_H_S = 60.0  # the cancel rule is scored on the 60 s net markout: its training labels end 60 s later
 FEATURES = ("queue_at_place_ct", "quote_age_s", "adv_ext_0.1s", "adv_ext_0.5s", "adv_ext_1s", "adv_ext_5s",
             "kalshi_imb_side", "venue_imb_adv", "taker_ct_10s", "taker_ct_60s", "takers_against_10s", "log_tau",
             "abs_z", "yes_px", "spread_ticks", "sigma_ann", "fv_edge_c")
@@ -176,14 +201,31 @@ def features_at(mm: MarketMaker, st: ToxicityState, now: int, ticker: str, side:
 
 
 class ToxicityCollector:
-    """run_replay collector: features of every simulated fill, captured before the strategy
-    processes the fill (queue at placement and order age as the strategy knew them)."""
+    """run_replay collector: features of every simulated fill captured at MATCH time through the
+    simulator's fill hook (the strategy and this collector have processed only events before the
+    match; queue at placement and order age as the strategy knew them). Without a simulator hook
+    (e.g. an older simulator) features fall back to the fill's delivery time (``at_match`` 0)."""
 
     def __init__(self, mm: MarketMaker) -> None:
         self.mm = mm
         self.state = ToxicityState()
         self.rows: list[dict[str, Any]] = []
         self.q_place: dict[str, float] = {}
+        self._seen: set[str] = set()
+
+    def attach_sim(self, sim: Any) -> None:
+        if hasattr(sim, "fill_hooks"):
+            sim.fill_hooks.append(self._on_match)
+
+    def _on_match(self, rec: Any) -> None:
+        w = self.mm.om.order(rec.client_order_id)
+        t = int(rec.sim_ts)
+        age = (t - w.created_ns) / NS_PER_S if w is not None else math.nan
+        row = features_at(self.mm, self.state, t, rec.ticker, rec.book_side, rec.yes_px,
+                          self.q_place.get(rec.client_order_id, math.nan), age)
+        row.update({"trade_id": rec.trade_id, "t_match": t, "at_match": 1})
+        self._seen.add(rec.trade_id)
+        self.rows.append(row)
 
     def on_action(self, ts: int, a: Any) -> None:
         if type(a) is PlaceOrder:
@@ -191,12 +233,14 @@ class ToxicityCollector:
 
     def on_event(self, ev: Any) -> None:
         if type(ev) is KalshiFill:
+            if ev.trade_id in self._seen:
+                return
             mm = self.mm
             w = mm.om.order(ev.client_order_id)
             age = (ev.ts - w.created_ns) / NS_PER_S if w is not None else math.nan
             row = features_at(mm, self.state, ev.ts, ev.ticker, ev.book_side, ev.yes_px,
                               self.q_place.get(ev.client_order_id, math.nan), age)
-            row["trade_id"] = ev.trade_id
+            row.update({"trade_id": ev.trade_id, "t_match": ev.ts, "at_match": 0})
             self.rows.append(row)
         else:
             self.state.update(ev, self.mm.ext)
@@ -206,8 +250,11 @@ class ToxicityCollector:
 
 
 # ============================================================================ fill tables
+FV_MAX_AGE_NS = 5 * NS_PER_S  # like the ledger's markout_max_age (audit m6)
+
+
 def _fv_lookup(ledger) -> dict[str, AsOf]:
-    return {t: AsOf(s.ts, s.F) for t, s in ledger.fv.items() if s.ts}
+    return {t: AsOf(s.ts, s.F, max_age_ns=FV_MAX_AGE_NS) for t, s in ledger.fv.items() if s.ts}
 
 
 def add_fill_markouts(res) -> None:
@@ -226,7 +273,7 @@ def add_fill_markouts(res) -> None:
                         qty=int(round(r.contracts * QTY_SCALE)), is_taker=bool(r.is_taker),
                         fee_micros=int(round(r.fee * 1e6)), post_position=0) for r in df.itertuples()]
     mk = compute_markouts(fills, _fv_lookup(res.ledger), DEFAULT_HORIZONS_S, settlement=dict(res.ledger.settle),
-                          time_basis="recv")
+                          time_basis="recv", max_age_ns=FV_MAX_AGE_NS)
     for j, h in enumerate(DEFAULT_HORIZONS_S):
         df[f"mkpx_{h:g}s_c"] = [m.markouts_c[j] for m in mk]
     df["mkpx_settle_c"] = [m.settle_c for m in mk]
@@ -282,7 +329,9 @@ def live_fill_table(root: str | Path, t0: int, t1: int, cfg: StrategyConfig, uni
                 probe.mm.fvc[f.ticker] = fv
             row = features_at(probe.mm, st, f.ts, f.ticker, f.book_side, f.yes_px, math.nan, math.nan)
             spec = probe.mm.specs.get(f.ticker)
-            row.update({"ts": f.ts, "ticker": f.ticker, "event": spec.event_ticker if spec else f.ticker,
+            row.update({"ts": f.ts, "ticker": f.ticker,
+                        "event": settlement_cluster(spec.expiration_ts) if spec else f.ticker,
+                        "event_ticker": spec.event_ticker if spec else f.ticker,
                         "side": 1 if f.book_side == "bid" else -1, "px": f.yes_px / PX_SCALE,
                         "contracts": f.qty / QTY_SCALE, "fee_c": 100.0 * f.fee_micros / 1e6 / (f.qty / QTY_SCALE),
                         "F": fv.F if fv else math.nan, "tau_s": (spec.expiration_ts - f.ts) / NS_PER_S if spec else math.nan,
@@ -411,6 +460,30 @@ def walk_forward_models(df: pd.DataFrame, feats: Sequence[str] = FEATURES, n_fol
     return pd.DataFrame(rows), d
 
 
+def oos_lift(pred: pd.DataFrame, n_boot: int = 400) -> pd.DataFrame:
+    """Walk-forward OOS lift of each classifier over the base rate: per-fill Brier improvement
+    (base - model), mean with a settlement-event CI. 'No OOS lift' = CI upper bound <= 0."""
+    rows = []
+    if pred is None or not len(pred) or "pred_base_rate" not in pred:
+        return pd.DataFrame()
+    d = pred[pred["pred_base_rate"].notna()]
+    y = d["toxic"].to_numpy(dtype=float)
+    b = (d["pred_base_rate"].to_numpy(dtype=float) - y) ** 2
+    for m in ("logistic", "gbm_cls"):
+        col = f"pred_{m}"
+        if col not in d:
+            continue
+        p = d[col].to_numpy(dtype=float)
+        ok = np.isfinite(p)
+        if ok.sum() < 10:
+            continue
+        lift = b[ok] - (p[ok] - y[ok]) ** 2
+        ci = cluster_mean_ci(lift, None, d.loc[ok, "event"].to_numpy(), n_boot)
+        rows.append({"model": m, "n_oos": int(ok.sum()), "brier_lift": ci.mean, "lift_lo": ci.lo, "lift_hi": ci.hi,
+                     "events": ci.clusters})
+    return pd.DataFrame(rows)
+
+
 def univariate_table(df: pd.DataFrame, feats: Sequence[str] = FEATURES) -> pd.DataFrame:
     """Spearman correlation of each feature with the net 10 s markout (sign diagnostics)."""
     d = df[df["net_mk_10s_c"].notna()]
@@ -522,26 +595,65 @@ class ToxicityGuardMM(MarketMaker):
 
 
 # ============================================================================ runner
+def _cancel_ok(r: Any) -> bool:
+    """Acceptance of one policy's cancel-rule replay row (TEST_MATRIX E3 + audit M1)."""
+    day = day_block_ok(_DayCI(getattr(r, "d_day_lo_c", math.nan), int(getattr(r, "day_blocks", 0) or 0)))
+    return bool(r.d_net_lo_c > 0 and r.d_net_c >= 0.1 and r.fill_loss_pct <= 20.0 and r.usd_day_guard >= r.usd_day_base
+                and day is not False)
+
+
+@dataclass
+class _DayCI:
+    lo: float
+    clusters: int
+
+
+def e3_verdict(cancel: pd.DataFrame, lift: pd.DataFrame, rule: ToxicityRule | None) -> str:
+    """Rule outcome on the sample (docs/TEST_MATRIX.md E3; B and C both required)."""
+    no_lift = bool(len(lift)) and bool((lift["lift_hi"] <= 0).all())
+    if len(cancel):
+        rows = {r.policy: r for r in cancel.itertuples()}
+        if {"B", "C"} <= set(rows) and all(_cancel_ok(rows[p]) for p in ("B", "C")):
+            return ("ACCEPT (cancel rule: net c/contract +>= 0.1c with CI > 0, <= 20% fill loss and $/day not lower "
+                    "under B and C)")
+        if "B" in rows and "C" in rows and rows["B"].d_net_lo_c > 0 and not rows["C"].d_net_lo_c > 0:
+            return "REJECT (the cancel-rule lift vanishes under policy C)"
+        if no_lift:
+            return "REJECT (no OOS lift: walk-forward Brier improvement CI upper bound <= 0 for every model)"
+        return "INCONCLUSIVE (cancel-rule lift not established under B and C)"
+    if no_lift:
+        return "REJECT (no OOS lift: walk-forward Brier improvement CI upper bound <= 0 for every model)"
+    if rule is not None:
+        return "REJECT (no threshold improves the training markout within 20% fill loss)"
+    return "INCONCLUSIVE (no cancel rule could be fitted: too few policy-B training fills)"
+
+
 def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyConfig | None = None,
         policies=("B", "C"), split_frac: float = 0.5, n_folds: int = 5, warm: str = "recorded",
         universe: Universe | None = None, live: bool = False, seed: int = 1, n_boot: int = 400,
-        n_jobs: int = 1, progress=None) -> dict[str, Any]:
+        n_jobs: int = 1, progress=None, latency=None) -> dict[str, Any]:
     Path(out).mkdir(parents=True, exist_ok=True)
     from dh.research.replay_grid import Variant, run_variants, run_warnings
 
     cfg = cfg or StrategyConfig()
     uni = universe or build_universe(root, t0, t1)
+    lat = research_latency(uni, latency)
     t_split = t0 + int(split_frac * (t1 - t0))
     pols = [policy_letter(p) for p in policies]
     runs = run_variants(root, t0, t1, [Variant("baseline", cfg, postprocess=add_fill_markouts)], pols, universe=uni,
-                        warm=warm, seed=seed, n_jobs=n_jobs, collectors=[ToxicityCollector], progress=progress)
+                        warm=warm, seed=seed, n_jobs=n_jobs, collectors=[ToxicityCollector], progress=progress,
+                        latency=lat)
     fills: dict[str, pd.DataFrame] = {r.policy: r.df for r in runs}
-    metrics, uni_tabs, cancel_rows = [], [], []
+    metrics, uni_tabs, cancel_rows, lifts, regimes = [], [], [], [], []
     for L, df in fills.items():
         if len(df):
-            m, _pred = walk_forward_models(df, n_folds=n_folds)
+            m, pred = walk_forward_models(df, n_folds=n_folds)
             m.insert(0, "policy", L)
             metrics.append(m)
+            lt = oos_lift(pred, n_boot)
+            if len(lt):
+                lt.insert(0, "policy", L)
+                lifts.append(lt)
             u = univariate_table(df)
             u.insert(0, "policy", L)
             uni_tabs.append(u)
@@ -552,14 +664,16 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
             m, _ = walk_forward_models(lv, n_folds=n_folds)
             m.insert(0, "policy", "live")
             metrics.append(m)
-    # cancel rule: fit on [t0, t_split) shadow fills of policy B, replay on [t_split, t1)
-    train_src = fills.get("B") if "B" in fills else next(iter(fills.values()), pd.DataFrame())
-    rule = fit_rule(train_src[train_src["ts"] < t_split]) if len(train_src) else None
+    # cancel rule: fitted on POLICY-B shadow fills of [t0, t_split) whose 60 s label ended before
+    # t_split (audit C2/m2), replayed on [t_split, t1) under every policy
+    train_src = fills.get("B", pd.DataFrame())
+    train = train_src[train_src["ts"] + int(RULE_LABEL_H_S * NS_PER_S) <= t_split] if len(train_src) else train_src
+    rule = fit_rule(train) if len(train) else None
     if rule is not None and rule.threshold <= 1.0:
         ev_runs = run_variants(root, t_split, t1, [Variant("base", cfg),
                                                     Variant("guard", cfg, strategy_factory=ToxicityGuardMM,
                                                             factory_kwargs={"rule": rule})],
-                               pols, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs, progress=progress)
+                               pols, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs, progress=progress, latency=lat)
         by = {(r.variant, r.policy): r for r in ev_runs}
         for L in pols:
             base, guard = by[("base", L)], by[("guard", L)]
@@ -568,21 +682,35 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
             d = paired_diff_ci(a, b, "net_c_per_ct", n_boot=n_boot) if len(a) and len(b) else None
             fa = float(a["contracts"].sum()) if len(a) else 0.0
             fb = float(b["contracts"].sum()) if len(b) else 0.0
-            cancel_rows.append({"policy": L, "threshold": rule.threshold, "fills_base": len(a), "fills_guard": len(b),
-                                "fill_loss_pct": 100.0 * (1 - fb / fa) if fa > 0 else math.nan,
-                                "net_c_base": base.summary.get("net_c_per_contract", math.nan),
-                                "net_c_guard": guard.summary.get("net_c_per_contract", math.nan),
-                                "d_net_c": d.mean if d else math.nan, "d_net_lo_c": d.lo if d else math.nan,
-                                "d_net_hi_c": d.hi if d else math.nan,
-                                "markout_10s_base_c": base.summary.get("markout_10s_c", math.nan),
-                                "markout_10s_guard_c": guard.summary.get("markout_10s_c", math.nan),
-                                "usd_day_base": base.summary.get("net_usd_per_day", 0.0),
-                                "usd_day_guard": guard.summary.get("net_usd_per_day", 0.0),
-                                "events": n_events(a, b)})
+            row = {"policy": L, "threshold": rule.threshold, "fills_base": len(a), "fills_guard": len(b),
+                   "fill_loss_pct": 100.0 * (1 - fb / fa) if fa > 0 else math.nan,
+                   "net_c_base": base.summary.get("net_c_per_contract", math.nan),
+                   "net_c_guard": guard.summary.get("net_c_per_contract", math.nan),
+                   "d_net_c": d.mean if d else math.nan, "d_net_lo_c": d.lo if d else math.nan,
+                   "d_net_hi_c": d.hi if d else math.nan,
+                   "markout_10s_base_c": base.summary.get("markout_10s_c", math.nan),
+                   "markout_10s_guard_c": guard.summary.get("markout_10s_c", math.nan),
+                   "usd_day_base": base.summary.get("net_usd_per_day", 0.0),
+                   "usd_day_guard": guard.summary.get("net_usd_per_day", 0.0),
+                   "contracts_day_base": base.summary.get("contracts_per_day", 0.0),
+                   "contracts_day_guard": guard.summary.get("contracts_per_day", 0.0),
+                   "events": n_events(a, b)}
+            if d is not None:
+                dd = paired_diff_ci(with_day(a), with_day(b), "net_c_per_ct", cluster="day", n_boot=n_boot)
+                row.update({"d_day_lo_c": dd.lo, "d_day_hi_c": dd.hi, "day_blocks": dd.clusters})
+                cuts = vol_cuts(a.get("rv_1h", []), b.get("rv_1h", []))
+                rt = paired_regime_table(add_regimes(a, cuts=cuts), add_regimes(b, cuts=cuts), n_boot=min(n_boot, 200))
+                if len(rt):
+                    rt.insert(0, "policy", L)
+                    regimes.append(rt)
+            if len(a) and len(b) and math.isfinite(row["d_net_c"]):
+                cancel_rows.append(row)
     cancel = pd.DataFrame(cancel_rows)
+    lift = pd.concat(lifts, ignore_index=True) if lifts else pd.DataFrame()
     met = pd.concat(metrics, ignore_index=True) if metrics else pd.DataFrame()
     unit = pd.concat(uni_tabs, ignore_index=True) if uni_tabs else pd.DataFrame()
     mk_rows = []
+    reg_rows = []
     for L, df in fills.items():
         if not len(df):
             continue
@@ -595,34 +723,44 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
             mk_rows.append({"policy": L, "horizon": f"{h:g}s" if h != "settle" else "settle", "fills": len(ok),
                             "net_markout_c": ci.mean if ci else math.nan, "lo_c": ci.lo if ci else math.nan,
                             "hi_c": ci.hi if ci else math.nan})
+        if "net_mk_10s_c" in df and L != "live":
+            rt = regime_table(add_regimes(df[df["net_mk_10s_c"].notna()]).assign(policy=L), "net_mk_10s_c",
+                              n_boot=min(n_boot, 200))
+            if len(rt):
+                reg_rows.append(rt)
     mko = pd.DataFrame(mk_rows)
     rep = Report("e3_toxicity", "E3 — Predictability of fill toxicity and a toxicity-aware cancel rule", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E3,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "rule_fit_until": fmt_ns(t_split),
-                       **inputs_meta(uni, t0)[0],
+                       **inputs_meta(uni, t0)[0], "latency": describe_latency(lat, uni),
                        "label": f"toxic = fair value moved against the fill within {LABEL_H_S:g}s",
-                       "rule_threshold": rule.threshold if rule else "n/a (too few training fills)",
+                       "rule_training": f"policy-B fills with t + {RULE_LABEL_H_S:g} s <= split (label embargo)",
+                       "features": "captured at match time (simulator fill hook)",
+                       "rule_threshold": rule.threshold if rule else "n/a (too few policy-B training fills)",
                        "rule_train_fills": rule.train_fills if rule else 0,
                        "rule_removed_share_train": rule.removed_share_train if rule else math.nan})
-    rep.decision_events = int(cancel["events"].min()) if len(cancel) else None
-    if len(cancel):
-        good = all((r.d_net_lo_c > 0) and (r.d_net_c >= 0.1) and (r.fill_loss_pct <= 20.0) for r in cancel.itertuples())
-        vanish_c = any(r.policy == "C" and not (r.d_net_lo_c > 0) for r in cancel.itertuples())
-        rep.verdict = "ACCEPT" if good else ("REJECT (lift absent or vanishes under C)" if vanish_c else "INCONCLUSIVE")
-    elif rule is not None:
-        rep.verdict = "REJECT (no threshold improves the training markout within 20% fill loss)"
-    else:
-        rep.verdict = "INCONCLUSIVE (no cancel rule could be fitted: too few training fills)"
+    rep.decision_events = int(cancel["events"].min()) if len(cancel) else (
+        int(lift["events"].min()) if len(lift) else None)
+    rep.policies = sorted(set(cancel["policy"])) if len(cancel) else sorted(set(lift["policy"])) if len(lift) else []
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.verdict = e3_verdict(cancel, lift, rule)
     for w in run_warnings(runs):
         rep.line(f"WARNING: {w}")
     rep.table("markouts", mko, "Net markout (vs fill price, after fees) of replayed shadow fills, c/contract, "
-                               "event-bootstrap CI.")
+                               "settlement-event CI.")
     rep.table("models", met, "Walk-forward OOS metrics (folds = consecutive settlement events).")
+    rep.table("oos_lift", lift, "OOS Brier improvement over the base rate per fill (settlement-event CI); no OOS lift "
+                                "= CI upper bound <= 0.")
     rep.table("univariate", unit, "Spearman correlation of each fill-time feature with the net 10 s markout.")
     rep.table("cancel_rule", cancel, "Replay of the toxicity-aware cancel rule on the held-out part vs baseline "
-                                     "(paired by event).")
+                                     "(paired by settlement event; day blocks as a second check).")
+    rep.table("regimes", pd.concat(reg_rows, ignore_index=True) if reg_rows else pd.DataFrame(),
+              "Net 10 s markout of shadow fills by regime (tau bucket, vol tercile, weekday).")
+    rep.table("cancel_rule_regimes", pd.concat(regimes, ignore_index=True) if regimes else pd.DataFrame(),
+              "Cancel rule: paired net c/contract difference (guard - base) by regime.")
     for L, df in fills.items():
         if len(df):
             write_csv(df, Path(out) / f"e3_toxicity_fills_{L}.csv", uni.synthetic)
     rep.write()
-    return {"fills": fills, "models": met, "cancel_rule": cancel, "markouts": mko, "rule": rule, "univariate": unit}
+    return {"fills": fills, "models": met, "cancel_rule": cancel, "markouts": mko, "rule": rule, "univariate": unit,
+            "oos_lift": lift, "verdict": rep.final_verdict(), "rule_outcome": rep.verdict}

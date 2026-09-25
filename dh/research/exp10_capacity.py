@@ -6,10 +6,11 @@ fixed) so the limits do not cap size before the market does. Queue dilution is t
 our larger orders wait behind the same displayed queue and only fill from prints beyond it; other
 participants do not react to us (no market impact: capacity is therefore an UPPER bound).
 
-Per k x policy: net c/contract (event CI), fills/day, contracts/day, $/day, share of the taker
-flow in the quoted markets (our filled contracts / recorded public traded contracts: in the
-simulator our maker fills are carved out of the recorded prints), inventory sd (net YES
-position, 1 s samples), mean |position|.
+Per k x policy: net c/contract (settlement-event CI), fills/day, contracts/day, $/day, share of
+the taker flow the strategy could have quoted (our filled contracts / recorded public contracts
+traded in markets quotable AT THE TIME of the print: known to the strategy, 0 < tau <= max_tau_s,
+enabled series, far strikes only inside min_tau_s; audit m5), inventory sd (net YES position,
+1 s samples), mean |position|; regime splits (tau bucket, vol tercile, weekday).
 Capacity (per policy): the largest clip multiple (log-linear interpolation on the grid) at which
 net c/contract stays above 1.0, 0.75, 0.5, 0.05 c and 0 (breakeven), with contracts/day and $/day
 at that size. docs/TEST_MATRIX.md E10: measurement only (no accept/reject).
@@ -24,9 +25,26 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from dh.research.exp_common import Report, fmt_ns
-from dh.research.replay_env import PortfolioSampler, Universe, build_universe, inputs_meta
-from dh.research.replay_grid import Variant, interp_capacity, run_variants, run_warnings, scaled_cfg, variant_table
+from dh.research.exp_common import Report, add_regimes, fmt_ns, regime_table
+from dh.research.replay_env import (
+    PortfolioSampler,
+    Universe,
+    build_universe,
+    describe_latency,
+    inputs_meta,
+    inputs_status,
+    research_latency,
+)
+from dh.research.replay_grid import (
+    Variant,
+    interp_capacity,
+    policies_with_results,
+    run_variants,
+    run_warnings,
+    scaled_cfg,
+    settled,
+    variant_table,
+)
 from dh.strategy.config import StrategyConfig
 
 RULE_E10 = "measurement: report capacity at > 1.0, 0.75, 0.5, 0.05 c/contract and breakeven under B and C"
@@ -36,19 +54,20 @@ LEVELS_C = (1.0, 0.75, 0.5, 0.05, 0.0)
 def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyConfig | None = None,
         policies=("B", "C"), multipliers: Sequence[float] = (1, 2, 5, 10, 20, 50), scale_limits: bool = True,
         warm: str = "recorded", n_jobs: int = 1, universe: Universe | None = None, seed: int = 1,
-        progress=None) -> dict[str, Any]:
+        progress=None, latency=None) -> dict[str, Any]:
     Path(out).mkdir(parents=True, exist_ok=True)
     cfg = cfg or StrategyConfig()
     uni = universe or build_universe(root, t0, t1)
+    lat = research_latency(uni, latency)
     variants = [Variant(f"x{k:g}", scaled_cfg(cfg, float(k), scale_limits)) for k in multipliers]
     runs = run_variants(root, t0, t1, variants, policies, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs,
-                        collectors=[PortfolioSampler], progress=progress)
+                        collectors=[PortfolioSampler], progress=progress, latency=lat)
     tab = variant_table(runs, ref=variants[0].name)
     extra = []
     for r in runs:
         ps = r.collectors[0] if r.collectors else pd.DataFrame()
         ours = float(r.df["contracts"].sum()) if len(r.df) else 0.0
-        pub = float(r.summary.get("public_contracts_quoted", 0.0))
+        pub = float(r.summary.get("public_contracts_quotable", r.summary.get("public_contracts_quoted", 0.0)))
         extra.append({"variant": r.variant, "policy": r.policy, "clip_multiple": float(r.variant[1:]),
                       "clip_contracts": cfg.quoting.clip_contracts * float(r.variant[1:]),
                       # our simulated fills are carved out of the recorded public prints (queue model):
@@ -72,10 +91,15 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     cap = pd.DataFrame(cap_rows)
     rep = Report("e10_capacity", "E10 — Capacity: net edge vs quote size", Path(out), synthetic=uni.synthetic,
                  rule=RULE_E10, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
+                                      "latency": describe_latency(lat, uni),
                                       "base_clip_contracts": cfg.quoting.clip_contracts,
                                       "limits_scaled_with_size": scale_limits})
     bk = cap[(cap.level_c == 0.0) & (cap.basis == "point")]
     rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
+    rep.policies = policies_with_results(runs)
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    reg = [regime_table(add_regimes(settled(r.df)).assign(policy=r.policy, variant=r.variant), group=("variant", "policy"))
+           for r in runs if len(settled(r.df))]
     rep.verdict = "MEASUREMENT — breakeven clip multiple: " + ", ".join(
         f"{r.policy}: {r.max_clip_multiple:.3g}" for r in bk.itertuples()) if len(bk) else "MEASUREMENT"
     for w in run_warnings(runs):
@@ -83,5 +107,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     rep.table("by_size", tab, "Per clip multiple x policy (upper bound: no market impact modeled).")
     rep.table("capacity", cap, "Largest clip multiple with net c/contract above each level (point estimate and "
                                "CI lower bound); contracts/day and $/day interpolated at that size.")
+    rep.table("regimes", pd.concat(reg, ignore_index=True) if reg else pd.DataFrame(),
+              "Net c/contract by regime (tau bucket, vol tercile, weekday) per clip multiple and policy.")
     rep.write()
     return {"table": tab, "capacity": cap, "runs": runs}

@@ -27,7 +27,10 @@ plugs into E3 (``replay_fill_table(..., strategy_factory=NowcastMarketMaker)``) 
 toxicity with the better nowcast, and its fair value is E1's x series.
 
 Decision rule (docs/TEST_MATRIX.md E2): accept if RMSE improves >= 10% at 0.2-1 s AND the E1/E3
-P&L improves in replay; reject on < 5% RMSE gain or no P&L gain.
+P&L improves in replay under BOTH fill policies B and C: net c/contract CI > 0 (settlement-event
+clusters; day blocks as a second check from 5 days on) with contracts/day and $/day not lower
+(audit M1); reject on < 5% RMSE gain or no P&L gain. Regime splits (vol tercile, weekday; tau for
+the P&L hook) are reported (audit m8).
 """
 
 from __future__ import annotations
@@ -50,13 +53,28 @@ from dh.core.units import NS_PER_MS, NS_PER_S
 from dh.feeds.composite import BrtiParams, brti_replica, nowcast
 from dh.feeds.registry import SPOT_CONSTITUENTS, has_normalizer
 from dh.kalshi.normalize import ws_message_to_events
-from dh.research.exp_common import Report, fmt_ns, n_events, paired_diff_ci, policy_letter
+from dh.research.exp_common import (
+    Report,
+    add_regimes,
+    day_block_ok,
+    fmt_ns,
+    n_events,
+    paired_diff_ci,
+    paired_regime_table,
+    policy_letter,
+    vol_cuts,
+    with_day,
+)
 from dh.research.replay_env import (
     MD_CACHE_PREFIX,
     Universe,
     build_universe,
+    describe_latency,
     inputs_meta,
+    inputs_status,
     kalshi_ws_streams,
+    realized_vol_asof,
+    research_latency,
 )
 from dh.core.market import SettlementSpec
 from dh.settlement.window import SettlementTracker
@@ -370,10 +388,11 @@ def window_average_eval(wr: pd.DataFrame, panel: pd.DataFrame, preds: pd.DataFra
 
 
 def fit_beta(panel: pd.DataFrame, horizon_s: float = 0.5, feature: str = "g_med", t_end: int | None = None) -> float:
-    """OLS slope (no intercept) of y_h on the venue gap using rows before t_end: the P&L hook's
-    nowcast weight (share of the venue-vs-BRTI gap that the next prints close)."""
+    """OLS slope (no intercept) of y_h on the venue gap using rows whose target ended before t_end
+    (t + h + 5 s embargo): the P&L hook's nowcast weight (share of the venue-vs-BRTI gap that the
+    next prints close)."""
     tgt = f"y_{horizon_s:g}s"
-    d = panel if t_end is None else panel[panel["t"] < t_end]
+    d = panel if t_end is None else panel[panel["t"] < t_end - int((horizon_s + 5.0) * NS_PER_S)]
     d = d[np.isfinite(d[tgt]) & np.isfinite(d[feature])]
     x, y = d[feature].to_numpy(), d[tgt].to_numpy()
     den = float(x @ x)
@@ -407,16 +426,18 @@ class NowcastMarketMaker(MarketMaker):
 
 def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta: float, *, policies=("B", "C"),
              universe: Universe | None = None, warm: str = "recorded", seed: int = 1, n_boot: int = 400,
-             n_jobs: int = 1, progress=None) -> pd.DataFrame:
-    """Replay baseline vs NowcastMarketMaker(beta) on [t_split, t1) under each policy; paired
-    event-bootstrap CI of the net c/contract difference and of the 1 s / 10 s markouts."""
+             n_jobs: int = 1, progress=None, latency=None, regimes: list | None = None) -> pd.DataFrame:
+    """Replay baseline vs NowcastMarketMaker(beta) on [t_split, t1) under each policy (``latency``
+    threaded to every replay); paired CI of the net c/contract difference (settlement-event
+    clusters, day blocks as a second check), contracts/day and $/day of both arms. Per-regime
+    paired differences are appended to ``regimes`` when given."""
     from dh.research.replay_grid import Variant, run_variants
 
     uni = universe or build_universe(root, t_split, t1)
     runs = run_variants(root, t_split, t1, [Variant("base", cfg),
                                             Variant("nowcast", cfg, strategy_factory=NowcastMarketMaker,
                                                     factory_kwargs={"nowcast_beta": beta})],
-                        policies, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs, progress=progress)
+                        policies, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs, progress=progress, latency=latency)
     by = {(r.variant, r.policy): r for r in runs}
     rows = []
     warns = sorted({w for r in runs for w in r.summary.get("warnings", []) or []})
@@ -427,11 +448,22 @@ def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta:
                "net_c_base": base.summary.get("net_c_per_contract", math.nan),
                "net_c_nowcast": nc.summary.get("net_c_per_contract", math.nan),
                "usd_day_base": base.summary.get("net_usd_per_day", 0.0),
-               "usd_day_nowcast": nc.summary.get("net_usd_per_day", 0.0)}
+               "usd_day_nowcast": nc.summary.get("net_usd_per_day", 0.0),
+               "contracts_day_base": base.summary.get("contracts_per_day", 0.0),
+               "contracts_day_nowcast": nc.summary.get("contracts_per_day", 0.0)}
         a, b = _settled(base.df), _settled(nc.df)
         d = paired_diff_ci(a, b, "net_c_per_ct", n_boot=n_boot) if len(a) and len(b) else None
         row.update({"d_net_c": d.mean if d else math.nan, "d_net_lo_c": d.lo if d else math.nan,
                     "d_net_hi_c": d.hi if d else math.nan})
+        if d is not None and "ts" in a and "ts" in b:
+            dd = paired_diff_ci(with_day(a), with_day(b), "net_c_per_ct", cluster="day", n_boot=n_boot)
+            row.update({"d_day_lo_c": dd.lo, "d_day_hi_c": dd.hi, "day_blocks": dd.clusters})
+        if regimes is not None and len(a) and len(b):
+            cuts = vol_cuts(a.get("rv_1h", []), b.get("rv_1h", []))
+            rt = paired_regime_table(add_regimes(a, cuts=cuts), add_regimes(b, cuts=cuts), n_boot=min(n_boot, 200))
+            if len(rt):
+                rt.insert(0, "policy", L)
+                regimes.append(rt)
         # adverse selection on a COMMON reference: gross P&L to settlement per contract minus the edge
         # at the fill (to_settle_c = (settle - F_fill) s uses each run's own F, so compare the net)
         for name, df_ in (("base", a), ("nowcast", b)):
@@ -442,6 +474,29 @@ def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta:
     return pd.DataFrame(rows)
 
 
+@dataclass
+class _DayCI:
+    lo: float
+    clusters: int
+
+
+def hook_decision(hook: pd.DataFrame) -> tuple[bool, bool, list[str]]:
+    """(pnl_ok, pnl_bad, policies with results) of the P&L hook table: ok = net c/contract CI > 0,
+    the day-block check agrees (from 5 days on), contracts/day and $/day not lower (audit M1),
+    under BOTH B and C; bad = CI upper bound < 0 under B or C."""
+    if hook is None or not len(hook):
+        return False, False, []
+    have = [str(r.policy) for r in hook.itertuples() if math.isfinite(r.d_net_c)]
+    bc = hook[hook["policy"].isin(["B", "C"]) & hook["d_net_c"].notna()]
+    ok = {"B", "C"} <= set(bc["policy"])
+    for r in bc.itertuples():
+        day = day_block_ok(_DayCI(getattr(r, "d_day_lo_c", math.nan), int(getattr(r, "day_blocks", 0) or 0)))
+        ok &= bool(r.d_net_lo_c > 0 and day is not False and r.contracts_day_nowcast >= r.contracts_day_base
+                   and r.usd_day_nowcast >= r.usd_day_base)
+    bad = bool(len(bc)) and bool((bc["d_net_hi_c"] < 0).any())
+    return ok, bad, have
+
+
 def _settled(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["settle"].notna()] if len(df) and "settle" in df else df
 
@@ -450,7 +505,7 @@ def _settled(df: pd.DataFrame) -> pd.DataFrame:
 def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyConfig | None = None, step_ms: int = 200,
         horizons_s: Sequence[float] = HORIZONS_S, n_folds: int = 5, replica: bool = True, pnl: bool = True,
         policies=("B", "C"), split_frac: float = 0.5, hook_horizon_s: float = 0.5, warm: str = "recorded",
-        seed: int = 0, universe: Universe | None = None, n_jobs: int = 1, progress=None) -> dict[str, Any]:
+        seed: int = 0, universe: Universe | None = None, n_jobs: int = 1, progress=None, latency=None) -> dict[str, Any]:
     """Full E2: panel -> walk-forward metrics -> window-average errors -> P&L hook. Writes CSV +
     markdown to ``out``; returns the tables."""
     Path(out).mkdir(parents=True, exist_ok=True)
@@ -462,33 +517,76 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     wa = window_average_eval(pr.window_rows, pr.panel, preds, "ridge_y_1s")
     t_split = t0 + int(split_frac * (t1 - t0))
     beta = fit_beta(pr.panel, hook_horizon_s, "g_med", t_end=t_split) if len(pr.panel) else 0.0
+    lat = research_latency(uni, latency)
+    hook_regimes: list[pd.DataFrame] = []
     hook = (pnl_hook(root, t_split, t1, cfg, beta, policies=policies, universe=uni, warm=warm, n_jobs=n_jobs,
-                     progress=progress) if pnl else pd.DataFrame())
+                     progress=progress, latency=lat, regimes=hook_regimes) if pnl else pd.DataFrame())
+    fc_regimes = forecast_regimes(pr.panel, preds, horizons_s)
     rep = Report("e2_nowcast", "E2 — Nowcasting the next BRTI print and the settlement average", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E2,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "panel_rows": len(pr.panel),
                        "step_ms": step_ms, "folds": n_folds, "brti_ticks": len(pr.brti),
                        "hook_beta(g_med, h=%gs)" % hook_horizon_s: beta,
-                       **({"P&L hook " + k: v for k, v in inputs_meta(uni, t_split)[0].items()} if pnl else {})})
+                       **({"P&L hook " + k: v for k, v in inputs_meta(uni, t_split)[0].items()} if pnl else {}),
+                       **({"P&L hook latency": describe_latency(lat, uni)} if pnl else {})})
     short = metrics[metrics["horizon"].isin([f"{h:g}s" for h in horizons_s])]
     best = short[short["model"].isin(["ridge", "lgbm"])]
     gain_ok = bool(len(best)) and bool((best.groupby("horizon")["rmse_gain_pct"].max() >= 10.0).all())
     gain_bad = bool(len(best)) and bool((best.groupby("horizon")["rmse_gain_pct"].max() < 5.0).all())
-    pnl_ok = bool(len(hook)) and bool((hook["d_net_lo_c"] > 0).all())
+    pnl_ok, pnl_bad, have = hook_decision(hook)
     rep.decision_events = int(hook["events"].min()) if len(hook) and "events" in hook else None
+    rep.policies = have
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t_split) if pnl else (False, "")
     if gain_ok and pnl_ok:
-        rep.verdict = "ACCEPT (RMSE gain >= 10% at every short horizon and replay P&L improves under B and C)"
-    elif gain_bad or (len(hook) and (hook["d_net_hi_c"] < 0).any()):
-        rep.verdict = "REJECT"
+        rep.verdict = ("ACCEPT (RMSE gain >= 10% at every short horizon; replay net c/contract CI > 0 with contracts/day "
+                       "and $/day not lower under B and C)")
+    elif gain_bad or pnl_bad:
+        rep.verdict = "REJECT (" + ("RMSE gain < 5%" if gain_bad else "replay P&L CI below 0 under B or C") + ")"
     else:
         rep.verdict = "INCONCLUSIVE (RMSE gain %s; P&L gain %s)" % ("ok" if gain_ok else "insufficient",
-                                                                   "ok" if pnl_ok else "not established")
+                                                                   "ok" if pnl_ok else "not established under B and C")
     rep.table("forecast", metrics, "Walk-forward OOS errors of the BRTI change over each horizon ($); gain vs the "
                                    "last print with a 60 s moving-block bootstrap CI.")
     rep.table("window_average", wa, "Error of the settlement-average estimate in the last 120 s before expiry "
                                      "(model: brti_last + ridge 1 s nowcast for every unfixed print).")
     rep.table("pnl_hook", hook, "Replay on the second part of the window: NowcastMarketMaker(beta) minus baseline "
-                                "(paired by event, realized net c/contract to settlement: the common yardstick; "
-                                "fair-value markouts are not comparable across nowcast definitions).")
+                                "(paired by settlement event, realized net c/contract to settlement: the common "
+                                "yardstick; fair-value markouts are not comparable across nowcast definitions); "
+                                "contracts/day and $/day of both arms (acceptance needs neither lower).")
+    rep.table("forecast_regimes", fc_regimes, "RMSE gain of the ridge nowcast vs the last print by regime (benchmark "
+                                              "realized-vol tercile over the prior hour, weekday/weekend).")
+    rep.table("pnl_hook_regimes", pd.concat(hook_regimes, ignore_index=True) if hook_regimes else pd.DataFrame(),
+              "Paired net c/contract difference (nowcast - baseline) by regime (tau bucket, vol tercile, weekday).")
     rep.write()
-    return {"forecast": metrics, "window_average": wa, "pnl_hook": hook, "beta": beta, "panel": pr.panel}
+    return {"forecast": metrics, "window_average": wa, "pnl_hook": hook, "beta": beta, "panel": pr.panel,
+            "verdict": rep.final_verdict(), "rule_outcome": rep.verdict}
+
+
+def forecast_regimes(panel: pd.DataFrame, preds: pd.DataFrame, horizons_s: Sequence[float] = HORIZONS_S,
+                     model: str = "ridge") -> pd.DataFrame:
+    """RMSE gain (%) of ``model`` vs the last print per regime: vol tercile of the benchmark's
+    realized vol over the prior hour (from the panel's own causal brti series) and weekday."""
+    if panel is None or not len(panel) or preds is None or not len(preds) or "brti" not in panel:
+        return pd.DataFrame()
+    t = panel["t"].to_numpy(dtype=np.int64)
+    rv = realized_vol_asof(t, panel["brti"].to_numpy(dtype=float), t)
+    reg = add_regimes(pd.DataFrame({"ts": t, "rv_1h": rv}), tau_col="-")
+    rows = []
+    for h in horizons_s:
+        tgt = f"y_{h:g}s"
+        col = f"{model}_{tgt}"
+        if tgt not in panel or col not in preds:
+            continue
+        y = panel[tgt].to_numpy(dtype=float)
+        p = preds[col].to_numpy(dtype=float)
+        ok = np.isfinite(y) & np.isfinite(p)
+        for fam in ("vol_tercile", "weekday"):
+            for r in sorted(set(reg.loc[ok, fam])):
+                m = ok & (reg[fam].to_numpy() == r)
+                if m.sum() < 20:
+                    continue
+                rb = float(np.sqrt(np.mean(y[m] ** 2)))
+                rm = float(np.sqrt(np.mean((y[m] - p[m]) ** 2)))
+                rows.append({"horizon": f"{h:g}s", "family": fam, "regime": r, "n": int(m.sum()),
+                             "rmse_gain_pct": 100.0 * (1 - rm / rb) if rb > 0 else math.nan})
+    return pd.DataFrame(rows)

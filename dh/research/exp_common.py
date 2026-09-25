@@ -134,15 +134,95 @@ def price_bucket(px_dollars: Iterable[float]) -> pd.Series:
 
 
 # ----------------------------------------------------------------------------- inference
+# Every CI below is the HULL (union) of two 95 % intervals over clusters (settlement events,
+# i.e. expirations: markets of every series expiring at the same time settle on one BRTI
+# average, audit M5): a studentized (bootstrap-t) interval with the cluster-robust linearized
+# standard error, and a jackknife-t interval (t with k-1 df). The plain percentile bootstrap of
+# a contract-weighted ratio mean over few, unequal clusters is anti-conservative: simulated
+# one-sided error P(lo > 0 | mean 0) with settlement-driven per-event P&L (audit m7,
+# scratchpad r7 design): percentile 4.6 % (k=20) / 3.9 % (k=200) vs 2.5 % nominal; this hull
+# 2.5 % / 2.8 % (4 000 / 3 000 simulated datasets). One-sided p-values (``CI.p_greater`` /
+# ``p_less``) use the jackknife-t statistic; multiple segments are controlled with ``holm``.
+CI_METHOD = "hull of studentized cluster bootstrap-t and jackknife-t (95 %)"
+DAY_NS = 86_400 * NS_PER_S
+MIN_DAY_BLOCKS = 5  # the day-block bootstrap (second check) is applied from this many UTC days on
+
+
 @dataclass(frozen=True)
 class CI:
     mean: float
     lo: float
     hi: float
     clusters: int
+    se: float = math.nan  # jackknife standard error of the mean
+    method: str = CI_METHOD
 
     def as_dict(self, prefix: str) -> dict[str, float]:
         return {prefix: self.mean, f"{prefix}_lo": self.lo, f"{prefix}_hi": self.hi}
+
+    def _t(self, c: float) -> float:
+        if self.clusters < 2 or not math.isfinite(self.mean):
+            return math.nan
+        if not (self.se > 0):
+            return math.inf if self.mean > c else (-math.inf if self.mean < c else 0.0)
+        return (self.mean - c) / self.se
+
+    def p_greater(self, c: float = 0.0) -> float:
+        """One-sided p-value of H0 'true mean <= c' (jackknife-t, k-1 df); nan without data."""
+        t = self._t(c)
+        if math.isnan(t):
+            return math.nan
+        from scipy import stats
+
+        return float(stats.t.sf(t, self.clusters - 1))
+
+    def p_less(self, c: float = 0.0) -> float:
+        """One-sided p-value of H0 'true mean >= c'."""
+        t = self._t(c)
+        if math.isnan(t):
+            return math.nan
+        from scipy import stats
+
+        return float(stats.t.cdf(t, self.clusters - 1))
+
+
+def _tq(k: int, level: float = 0.95) -> float:
+    from scipy import stats
+
+    return float(stats.t.ppf(0.5 + level / 2.0, max(k - 1, 1)))
+
+
+def _hull(theta: float, se_lin: float, se_jack: float, k: int, t_boot: np.ndarray) -> tuple[float, float]:
+    """Union of the jackknife-t and the bootstrap-t 95 % intervals."""
+    tq = _tq(k)
+    los, his = [], []
+    if math.isfinite(se_jack):
+        los.append(theta - tq * se_jack)
+        his.append(theta + tq * se_jack)
+    t = t_boot[np.isfinite(t_boot)]
+    if len(t) >= 20 and se_lin > 0 and math.isfinite(se_lin):
+        ql, qh = np.quantile(t, [0.025, 0.975])
+        los.append(theta - qh * se_lin)
+        his.append(theta - ql * se_lin)
+    if not los:
+        return math.nan, math.nan
+    return float(min(los)), float(max(his))
+
+
+_EVENT_TICKER = re.compile(r"^[A-Z0-9]+-(\d{2}[A-Z]{3}\d{2})(\d{2})(\d{2})?$")
+
+
+def settlement_key(event: Any) -> str:
+    """Settlement cluster of an event label: Kalshi BTC event tickers of different series that
+    expire at the same time (KXBTCD-26OCT0114, KXBTC-26OCT0114, KXBTC15M-26OCT011400) settle on
+    the same BRTI average and map to one key; other labels (e.g. replay ledgers' 'exp ...' keys)
+    are returned unchanged (audit M5)."""
+    m = _EVENT_TICKER.match(str(event))
+    return f"{m.group(1)}{m.group(2)}{m.group(3) or '00'}" if m else str(event)
+
+
+def settlement_clusters(labels: Any) -> np.ndarray:
+    return np.array([settlement_key(x) for x in np.asarray(labels, dtype=object)], dtype=object)
 
 
 def _cluster_sums(values: np.ndarray, weights: np.ndarray, clusters: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -152,10 +232,38 @@ def _cluster_sums(values: np.ndarray, weights: np.ndarray, clusters: np.ndarray)
     return keys, s, w
 
 
+def ratio_ci(s: np.ndarray, w: np.ndarray, n_boot: int = 500, seed: int = 11) -> CI:
+    """CI of sum(s)/sum(w) over clusters with per-cluster sums s (numerator) and w (weights)."""
+    s = np.asarray(s, dtype=float)
+    w = np.asarray(w, dtype=float)
+    k = len(s)
+    W = float(w.sum())
+    if not k or W <= 0:
+        return CI(math.nan, math.nan, math.nan, 0)
+    theta = float(s.sum() / W)
+    if k < 2:
+        return CI(theta, math.nan, math.nan, k)
+    se_lin = math.sqrt(k / (k - 1) * float(np.sum((s - theta * w) ** 2))) / W
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jack = (s.sum() - s) / (W - w)
+    jack = jack[np.isfinite(jack)]
+    se_jack = math.sqrt((k - 1) / k * float(np.sum((jack - jack.mean()) ** 2))) if len(jack) >= 2 else math.nan
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, k, size=(n_boot, k))
+    Sb, Wb = s[idx].sum(axis=1), w[idx].sum(axis=1)
+    ss, sw, ww = (s * s)[idx].sum(axis=1), (s * w)[idx].sum(axis=1), (w * w)[idx].sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tb = Sb / Wb
+        var = k / (k - 1) * np.maximum(ss - 2 * tb * sw + tb * tb * ww, 0.0) / (Wb * Wb)
+        t_boot = (tb - theta) / np.sqrt(var)
+    lo, hi = _hull(theta, se_lin, se_jack, k, t_boot[Wb > 0])
+    return CI(theta, lo, hi, k, se_jack)
+
+
 def cluster_mean_ci(values: Sequence[float], weights: Sequence[float] | None, clusters: Sequence[Any],
                     n_boot: int = 500, seed: int = 11) -> CI:
-    """Weighted mean sum(v w)/sum(w) with a 95% percentile CI from resampling clusters
-    (settlement events) with replacement. NaN values are dropped."""
+    """Weighted mean sum(v w)/sum(w) with a 95 % CI over clusters (settlement events; module
+    note on the interval). NaN values are dropped."""
     v = np.asarray(values, dtype=float)
     w = np.ones_like(v) if weights is None else np.asarray(weights, dtype=float)
     c = np.asarray(clusters)
@@ -164,17 +272,47 @@ def cluster_mean_ci(values: Sequence[float], weights: Sequence[float] | None, cl
     if not len(v) or w.sum() <= 0:
         return CI(math.nan, math.nan, math.nan, 0)
     _, s, ws = _cluster_sums(v, w, c)
-    mean = float(s.sum() / ws.sum())
-    k = len(s)
+    return ratio_ci(s, ws, n_boot, seed)
+
+
+def paired_ratio_ci(an: np.ndarray, ad: np.ndarray, bn: np.ndarray, bd: np.ndarray, n_boot: int = 500,
+                    seed: int = 17) -> CI:
+    """CI of sum(bn)/sum(bd) - sum(an)/sum(ad) over clusters aligned across the two arms (per-
+    cluster numerator and denominator sums; paired resampling of clusters)."""
+    an, ad, bn, bd = (np.asarray(x, dtype=float) for x in (an, ad, bn, bd))
+    k = len(an)
+    if not k:
+        return CI(math.nan, math.nan, math.nan, 0)
+    An, Ad, Bn, Bd = an.sum(), ad.sum(), bn.sum(), bd.sum()
+    if Ad <= 0 or Bd <= 0:
+        return CI(math.nan, math.nan, math.nan, k)
+    ta, tb = An / Ad, Bn / Bd
+    d = float(tb - ta)
     if k < 2:
-        return CI(mean, math.nan, math.nan, k)
+        return CI(d, math.nan, math.nan, k)
+    u = (bn - tb * bd) / Bd - (an - ta * ad) / Ad
+    se_lin = math.sqrt(k / (k - 1) * float(np.sum(u * u)))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jack = (Bn - bn) / (Bd - bd) - (An - an) / (Ad - ad)
+    jack = jack[np.isfinite(jack)]
+    se_jack = math.sqrt((k - 1) / k * float(np.sum((jack - jack.mean()) ** 2))) if len(jack) >= 2 else math.nan
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, k, size=(n_boot, k))
-    num = s[idx].sum(axis=1)
-    den = ws[idx].sum(axis=1)
-    bs = num[den > 0] / den[den > 0]
-    lo, hi = np.percentile(bs, [2.5, 97.5]) if len(bs) else (math.nan, math.nan)
-    return CI(mean, float(lo), float(hi), k)
+
+    def rs(x: np.ndarray) -> np.ndarray:
+        return x[idx].sum(axis=1)
+
+    Anb, Adb, Bnb, Bdb = rs(an), rs(ad), rs(bn), rs(bd)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tab, tbb = Anb / Adb, Bnb / Bdb
+        # sum_g u_g^2 with replicate totals, expanded into resampled sums of per-cluster products
+        sb2 = rs(bn * bn) - 2 * tbb * rs(bn * bd) + tbb * tbb * rs(bd * bd)
+        sa2 = rs(an * an) - 2 * tab * rs(an * ad) + tab * tab * rs(ad * ad)
+        sab = (rs(bn * an) - tab * rs(bn * ad) - tbb * rs(bd * an) + tbb * tab * rs(bd * ad))
+        var = k / (k - 1) * np.maximum(sb2 / (Bdb * Bdb) + sa2 / (Adb * Adb) - 2 * sab / (Bdb * Adb), 0.0)
+        t_boot = ((tbb - tab) - d) / np.sqrt(var)
+    lo, hi = _hull(d, se_lin, se_jack, k, t_boot[(Adb > 0) & (Bdb > 0)])
+    return CI(d, lo, hi, k, se_jack)
 
 
 def paired_diff_ci(a: pd.DataFrame, b: pd.DataFrame, value: str, weight: str = "contracts", cluster: str = "event",
@@ -186,35 +324,101 @@ def paired_diff_ci(a: pd.DataFrame, b: pd.DataFrame, value: str, weight: str = "
         if df is None or not len(df):
             return {}
         d = df[np.isfinite(df[value].to_numpy(dtype=float))]
-        keys, s, w = _cluster_sums(d[value].to_numpy(dtype=float), d[weight].to_numpy(dtype=float),
-                                   d[cluster].to_numpy())
+        cl = settlement_clusters(d[cluster]) if cluster == "event" else d[cluster].to_numpy()
+        keys, s, w = _cluster_sums(d[value].to_numpy(dtype=float), d[weight].to_numpy(dtype=float), cl)
         return {k: (si, wi) for k, si, wi in zip(keys, s, w)}
 
     sa, sb = sums(a), sums(b)
     keys = sorted(set(sa) | set(sb))
     if not keys:
         return CI(math.nan, math.nan, math.nan, 0)
-    A = np.array([sa.get(k, (0.0, 0.0)) for k in keys])
-    B = np.array([sb.get(k, (0.0, 0.0)) for k in keys])
+    A = np.array([sa.get(x, (0.0, 0.0)) for x in keys], dtype=float)
+    B = np.array([sb.get(x, (0.0, 0.0)) for x in keys], dtype=float)
+    return paired_ratio_ci(A[:, 0], A[:, 1], B[:, 0], B[:, 1], n_boot, seed)
 
-    def diff(ix: np.ndarray | slice) -> np.ndarray | float:
-        an, ad = A[ix, 0].sum(axis=-1), A[ix, 1].sum(axis=-1)
-        bn, bd = B[ix, 0].sum(axis=-1), B[ix, 1].sum(axis=-1)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return bn / bd - an / ad
 
-    full = diff(slice(None))
+def sum_diff_ci(a: pd.DataFrame, b: pd.DataFrame, value: str, cluster: str = "event", scale: float = 1.0,
+                n_boot: int = 500, seed: int = 19) -> CI:
+    """CI of scale * (sum of `value` in b - sum in a) resampling the union of clusters jointly
+    (e.g. the paired difference in net $/day with scale = 1/days)."""
+    def sums(df: pd.DataFrame) -> dict[str, float]:
+        if df is None or not len(df):
+            return {}
+        d = df[np.isfinite(df[value].to_numpy(dtype=float))]
+        g = d.groupby(d[cluster].astype(str))[value].sum()
+        return {str(k): float(v) for k, v in g.items()}
+
+    sa, sb = sums(a), sums(b)
+    keys = sorted(set(sa) | set(sb))
     k = len(keys)
+    if not k:
+        return CI(math.nan, math.nan, math.nan, 0)
+    x = scale * np.array([sb.get(q, 0.0) - sa.get(q, 0.0) for q in keys], dtype=float)
+    tot = float(x.sum())
     if k < 2:
-        return CI(float(full), math.nan, math.nan, k)
+        return CI(tot, math.nan, math.nan, k)
+    se_lin = math.sqrt(k / (k - 1) * float(np.sum((x - x.mean()) ** 2)))
+    jack = (x.sum() - x) * k / (k - 1)  # leave-one-out total rescaled to k clusters
+    se_jack = math.sqrt((k - 1) / k * float(np.sum((jack - jack.mean()) ** 2)))
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, k, size=(n_boot, k))
-    an, ad = A[idx, 0].sum(axis=1), A[idx, 1].sum(axis=1)
-    bn, bd = B[idx, 0].sum(axis=1), B[idx, 1].sum(axis=1)
-    ok = (ad > 0) & (bd > 0)
-    bs = bn[ok] / bd[ok] - an[ok] / ad[ok]
-    lo, hi = np.percentile(bs, [2.5, 97.5]) if len(bs) else (math.nan, math.nan)
-    return CI(float(full), float(lo), float(hi), k)
+    xb = x[idx]
+    tb = xb.sum(axis=1)
+    sd_b = xb.std(axis=1, ddof=1) * math.sqrt(k)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t_boot = (tb - tot) / sd_b
+    lo, hi = _hull(tot, se_lin, se_jack, k, t_boot)
+    return CI(tot, lo, hi, k, se_jack)
+
+
+def slope_ci(x: Sequence[float], y: Sequence[float], clusters: Sequence[Any], n_boot: int = 300, seed: int = 3) -> CI:
+    """OLS slope of y on x (with intercept) and a 95 % CI over clusters (e.g. time blocks shared
+    by every market): hull of the studentized cluster bootstrap-t (cluster-robust linearized SE)
+    and the delete-one-cluster jackknife-t, as for the ratio means above."""
+    xv = np.asarray(x, dtype=float)
+    yv = np.asarray(y, dtype=float)
+    c = np.asarray(clusters)
+    ok = np.isfinite(xv) & np.isfinite(yv)
+    xv, yv, c = xv[ok], yv[ok], c[ok]
+    if len(xv) < 3:
+        return CI(math.nan, math.nan, math.nan, 0)
+    _, inv = np.unique(c.astype(str), return_inverse=True)
+    k = int(inv.max()) + 1
+    m = np.stack([np.bincount(inv, weights=w, minlength=k) for w in (np.ones_like(xv), xv, yv, xv * xv, xv * yv)])
+
+    def slope(M: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        n, sx, sy, sxx, sxy = M
+        with np.errstate(invalid="ignore", divide="ignore"):
+            xb, yb = sx / n, sy / n
+            Sxx = sxx - sx * xb
+            b = (sxy - sx * yb) / Sxx
+        return b, xb, yb, Sxx
+
+    tot = m.sum(axis=1)
+    b0, xb0, yb0, Sxx0 = (float(v) for v in slope(tot))
+    if not math.isfinite(b0) or k < 2:
+        return CI(b0, math.nan, math.nan, k)
+    n_g, sx_g, sy_g, sxx_g, sxy_g = m
+
+    def u_sum_sq(pick: np.ndarray | slice, b, xb, yb, Sxx) -> np.ndarray:
+        # sum over the (resampled) clusters of u_g^2, u_g = sum_i (x - xb)(y - yb - b (x - xb)) / Sxx
+        u = (sxy_g[pick] - yb[..., None] * sx_g[pick] - xb[..., None] * sy_g[pick] + n_g[pick] * xb[..., None] * yb[..., None]
+             - b[..., None] * (sxx_g[pick] - 2 * xb[..., None] * sx_g[pick] + n_g[pick] * xb[..., None] ** 2))
+        return (u * u).sum(axis=-1) / (Sxx * Sxx)
+
+    se_lin = math.sqrt(k / (k - 1) * float(u_sum_sq(slice(None), *(np.asarray(v) for v in (b0, xb0, yb0, Sxx0)))))
+    jb, _, _, _ = slope(tot[:, None] - m)
+    jb = jb[np.isfinite(jb)]
+    se_jack = math.sqrt((k - 1) / k * float(np.sum((jb - jb.mean()) ** 2))) if len(jb) >= 2 else math.nan
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, k, size=(n_boot, k))
+    Mb = m[:, idx].sum(axis=2)
+    bb, xbb, ybb, Sxxb = slope(Mb)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        seb = np.sqrt(k / (k - 1) * u_sum_sq(idx, bb, xbb, ybb, Sxxb))
+        t_boot = (bb - b0) / seb
+    lo, hi = _hull(b0, se_lin, se_jack, k, t_boot)
+    return CI(b0, lo, hi, k, se_jack)
 
 
 def net_ci(df: pd.DataFrame, n_boot: int = 500, seed: int = 11) -> CI:
@@ -222,7 +426,127 @@ def net_ci(df: pd.DataFrame, n_boot: int = 500, seed: int = 11) -> CI:
     if df is None or not len(df):
         return CI(math.nan, math.nan, math.nan, 0)
     d = df[df["settle"].notna()] if "settle" in df else df
-    return cluster_mean_ci(d["net_c_per_ct"], d["contracts"], d["event"], n_boot, seed)
+    return cluster_mean_ci(d["net_c_per_ct"], d["contracts"], settlement_clusters(d["event"]), n_boot, seed)
+
+
+def with_day(df: pd.DataFrame, ts_col: str = "ts") -> pd.DataFrame:
+    """Copy of df with a ``day`` column (UTC day of ``ts_col``, ns) for the day-block bootstrap."""
+    d = df.copy()
+    if len(d) and ts_col in d:
+        d["day"] = (d[ts_col].to_numpy(dtype=np.int64) // DAY_NS).astype(np.int64)
+    else:
+        d["day"] = pd.Series(dtype=np.int64)
+    return d
+
+
+def day_block_ok(ci_day: CI, direction: str = "gt", threshold: float = 0.0) -> bool | None:
+    """Second check (audit M5): the same decision with UTC days as clusters. None when the
+    sample spans fewer than MIN_DAY_BLOCKS days (not applicable); else whether it agrees."""
+    if ci_day is None or ci_day.clusters < MIN_DAY_BLOCKS:
+        return None
+    if direction == "gt":
+        return bool(math.isfinite(ci_day.lo) and ci_day.lo > threshold)
+    return bool(math.isfinite(ci_day.hi) and ci_day.hi < threshold)
+
+
+# ----------------------------------------------------------------------------- regimes (TEST_MATRIX)
+REGIME_FAMILIES = ("tau_bucket", "vol_tercile", "weekday")
+
+
+def vol_cuts(*rvs: Iterable[float]) -> tuple[float, float]:
+    """Tercile cut points of realized vol pooled over the given samples (nan if none)."""
+    v = np.concatenate([np.asarray(list(r), dtype=float) for r in rvs]) if rvs else np.zeros(0)
+    v = v[np.isfinite(v)]
+    if len(v) < 3:
+        return math.nan, math.nan
+    c1, c2 = np.quantile(v, [1 / 3, 2 / 3])
+    return float(c1), float(c2)
+
+
+def add_regimes(df: pd.DataFrame, *, ts_col: str = "ts", tau_col: str = "tau_s", rv_col: str = "rv_1h",
+                cuts: tuple[float, float] | None = None) -> pd.DataFrame:
+    """Copy of df with regime columns: tau_bucket (TEST_MATRIX tau split), vol_tercile (low / mid /
+    high realized benchmark vol over the prior hour, causal; cut points from ``cuts`` or this
+    sample) and weekday ('weekday' / 'weekend', UTC)."""
+    d = df.copy()
+    n = len(d)
+    d["tau_bucket"] = tau_bucket(d[tau_col]).astype(str).to_numpy() if tau_col in d and n else "n/a"
+    rv = d[rv_col].to_numpy(dtype=float) if rv_col in d and n else np.full(n, np.nan)
+    c1, c2 = cuts if cuts is not None else vol_cuts(rv)
+    lab = np.where(rv <= c1, "low", np.where(rv <= c2, "mid", "high"))
+    d["vol_tercile"] = np.where(np.isfinite(rv) & math.isfinite(c1), lab, "n/a") if n else "n/a"
+    if ts_col in d and n:
+        dow = pd.to_datetime(d[ts_col].to_numpy(dtype=np.int64), unit="ns", utc=True).dayofweek
+        d["weekday"] = np.where(np.asarray(dow) >= 5, "weekend", "weekday")
+    else:
+        d["weekday"] = "n/a"
+    return d
+
+
+def regime_table(df: pd.DataFrame, value: str = "net_c_per_ct", weight: str = "contracts", cluster: str = "event",
+                 group: Sequence[str] = ("policy",), n_boot: int = 200, families: Sequence[str] = REGIME_FAMILIES) -> pd.DataFrame:
+    """Contract-weighted mean of ``value`` with a cluster CI per regime (df from add_regimes)."""
+    rows = []
+    if df is None or not len(df):
+        return pd.DataFrame()
+    grp = [g for g in group if g in df]
+    for fam in families:
+        if fam not in df:
+            continue
+        for key, g in df.groupby([*grp, fam], observed=True, sort=True):
+            key = key if isinstance(key, tuple) else (key,)
+            ci = cluster_mean_ci(g[value], g[weight], g[cluster], n_boot)
+            rows.append({**dict(zip(grp, key[:-1])), "family": fam, "regime": key[-1], "fills": len(g),
+                         "contracts": float(g[weight].sum()), "events": ci.clusters, "mean": ci.mean, "lo": ci.lo,
+                         "hi": ci.hi})
+    return pd.DataFrame(rows)
+
+
+def paired_regime_table(a: pd.DataFrame, b: pd.DataFrame, value: str = "net_c_per_ct", cluster: str = "event",
+                        n_boot: int = 200, families: Sequence[str] = REGIME_FAMILIES) -> pd.DataFrame:
+    """Paired difference (b - a) of the contract-weighted mean per regime (both from add_regimes
+    with the same cut points)."""
+    rows = []
+    if a is None or b is None or not len(a) or not len(b):
+        return pd.DataFrame()
+    for fam in families:
+        if fam not in a or fam not in b:
+            continue
+        for r in sorted(set(a[fam].astype(str)) | set(b[fam].astype(str))):
+            aa, bb = a[a[fam].astype(str) == r], b[b[fam].astype(str) == r]
+            if not len(aa) or not len(bb):
+                continue
+            ci = paired_diff_ci(aa, bb, value, cluster=cluster, n_boot=n_boot)
+            rows.append({"family": fam, "regime": r, "events": ci.clusters, "d_mean": ci.mean, "d_lo": ci.lo, "d_hi": ci.hi})
+    return pd.DataFrame(rows)
+
+
+def holm(pvals: Sequence[float], alpha: float = 0.025) -> np.ndarray:
+    """Holm step-down: boolean rejections at family-wise level ``alpha`` (NaN p never rejects;
+    the family size counts every finite p-value, i.e. every segment examined)."""
+    p = np.asarray(list(pvals), dtype=float)
+    rej = np.zeros(len(p), dtype=bool)
+    fin = np.flatnonzero(np.isfinite(p))
+    m = len(fin)
+    for rank, i in enumerate(fin[np.argsort(p[fin], kind="stable")]):
+        if p[i] <= alpha / (m - rank):
+            rej[i] = True
+        else:
+            break
+    return rej
+
+
+def holm_adjusted(pvals: Sequence[float]) -> np.ndarray:
+    """Holm-adjusted p-values (monotone step-down; NaN stays NaN)."""
+    p = np.asarray(list(pvals), dtype=float)
+    out = np.full(len(p), np.nan)
+    fin = np.flatnonzero(np.isfinite(p))
+    m = len(fin)
+    running = 0.0
+    for rank, i in enumerate(fin[np.argsort(p[fin], kind="stable")]):
+        running = max(running, min(1.0, (m - rank) * p[i]))
+        out[i] = running
+    return out
 
 
 def segment_rows(df: pd.DataFrame, by: list[str], days: float, n_boot: int = 300, seed: int = 11,
@@ -234,12 +558,14 @@ def segment_rows(df: pd.DataFrame, by: list[str], days: float, n_boot: int = 300
         return pd.DataFrame()
     for key, g in df.groupby(by, observed=True, sort=True):
         key = key if isinstance(key, tuple) else (key,)
-        ci = cluster_mean_ci(g["net_c_per_ct"], g["contracts"], g["event"], n_boot, seed)
+        cl = settlement_clusters(g["event"])
+        ci = cluster_mean_ci(g["net_c_per_ct"], g["contracts"], cl, n_boot, seed)
         ct = float(g["contracts"].sum())
-        row = {**dict(zip(by, key)), "fills": len(g), "contracts": ct, "events": int(g["event"].nunique()),
+        row = {**dict(zip(by, key)), "fills": len(g), "contracts": ct, "events": int(len(set(cl))),
                "fills_per_day": len(g) / days if days > 0 else math.nan,
                "contracts_per_day": ct / days if days > 0 else math.nan,
                "net_c": ci.mean, "net_lo_c": ci.lo, "net_hi_c": ci.hi,
+               "p_pos": ci.p_greater(0.0), "p_neg": ci.p_less(0.0),
                "gross_edge_c": float(np.average(g["gross_edge_c"], weights=g["contracts"])) if ct > 0 else math.nan,
                "fee_c": 100.0 * float(g["fee"].sum()) / ct if ct > 0 else math.nan,
                "net_usd_per_day": float(g["net"].sum()) / days if days > 0 else math.nan}
@@ -320,20 +646,40 @@ def markdown_table(df: pd.DataFrame, max_rows: int = 60) -> str:
 
 
 MIN_DECISION_EVENTS = 20  # settlement events behind an ACCEPT/REJECT (event-clustered CIs need many clusters)
+DECISIONS = ("ACCEPT", "REJECT", "MEASUREMENT")  # rule outcomes that the evidence guards can downgrade
+OUTCOMES = ("ACCEPT", "REJECT", "INCONCLUSIVE", "MEASUREMENT", "NO DECISION")
 
 
 def n_events(*dfs: pd.DataFrame | None) -> int:
-    """Distinct settlement events over ledger-like frames (column ``event``)."""
+    """Distinct settlement clusters over ledger-like frames (column ``event``: the expiration key
+    in replay ledgers, see replay_env.settlement_cluster)."""
     evs: set[Any] = set()
     for d in dfs:
         if d is not None and len(d) and "event" in d:
-            evs.update(d["event"].dropna().unique().tolist())
+            evs.update(settlement_key(e) for e in d["event"].dropna().unique().tolist())
     return len(evs)
+
+
+def rule_outcome(verdict: str) -> str:
+    """Leading outcome keyword of a verdict string ('' if none)."""
+    v = (verdict or "").strip().upper()
+    for o in sorted(OUTCOMES, key=len, reverse=True):
+        if v.startswith(o):
+            return o
+    return ""
 
 
 @dataclass
 class Report:
-    """CSV per table + one short markdown file per experiment.
+    """CSV per table + one short markdown file (+ ``<name>_verdict.json``) per experiment.
+
+    ``verdict`` is the decision rule's outcome ON THIS SAMPLE; it must start with one of OUTCOMES.
+    The reported verdict (``final_verdict``) applies the evidence guards (docs/TEST_MATRIX.md):
+    a decision (ACCEPT / REJECT / MEASUREMENT) becomes INCONCLUSIVE when fewer than
+    ``min_events`` settlement events stand behind it, or when it is policy-based and results
+    under BOTH fill policies B and C are missing; an ACCEPT also becomes INCONCLUSIVE on a
+    synthetic recording or with in-sample (or unknown-status) fitted inputs. The rule's own
+    outcome is kept in a separate field (never inside the INCONCLUSIVE text).
 
     ``synthetic`` adds SYNTHETIC_BANNER at the top of the markdown and a ``synthetic`` column
     to every CSV so a table can never be mistaken for evidence.
@@ -350,16 +696,41 @@ class Report:
     verdict: str = ""
     decision_events: int | None = None  # settlement events behind the verdict (None: not event-based)
     min_events: int = MIN_DECISION_EVENTS
+    policies: Sequence[str] | None = None  # fill policies WITH RESULTS behind the verdict (None: not policy-based)
+    in_sample: bool | None = None  # fitted inputs in-sample or of unknown status: an ACCEPT is capped
+    in_sample_why: str = ""
+    guards_extra: list[str] = field(default_factory=list)  # further reasons that make a decision INCONCLUSIVE
+
+    @property
+    def outcome(self) -> str:
+        return rule_outcome(self.verdict)
+
+    def guards(self) -> list[str]:
+        """Reasons that downgrade the rule's decision to INCONCLUSIVE (empty: it stands)."""
+        o = self.outcome
+        out: list[str] = []
+        if o not in DECISIONS:
+            return out
+        if self.policies is not None:
+            have = sorted({str(p) for p in self.policies})
+            if not {"B", "C"} <= set(have):
+                out.append(f"needs results under both fill policies B and C (have: {','.join(have) or 'none'})")
+        if self.decision_events is not None and self.decision_events < self.min_events:
+            out.append(f"only {self.decision_events} settlement event(s) behind the decision (< {self.min_events}; "
+                       "event-clustered CIs over so few events are unreliable)")
+        out += list(self.guards_extra)
+        if o == "ACCEPT":
+            if self.synthetic:
+                out.append("synthetic recording (pipeline check only)")
+            if self.in_sample:
+                out.append("fitted inputs in sample or of unknown status" + (f": {self.in_sample_why}" if self.in_sample_why else ""))
+        return out
 
     def final_verdict(self) -> str:
-        """The verdict, downgraded to INCONCLUSIVE when fewer than ``min_events`` settlement events
-        stand behind it (the rule's outcome on the sample is kept in the text)."""
-        v = self.verdict
-        if v and self.decision_events is not None and self.decision_events < self.min_events:
-            v = (f"INCONCLUSIVE — only {self.decision_events} settlement event(s) behind the decision (< "
-                 f"{self.min_events}; event-bootstrap CIs over so few events are unreliable). Rule outcome on this "
-                 f"sample: {self.verdict}")
-        return v
+        g = self.guards()
+        if g:
+            return "INCONCLUSIVE — " + "; ".join(g)
+        return self.verdict
 
     def table(self, key: str, df: pd.DataFrame, note: str = "") -> None:
         self.tables.append((key, df if df is not None else pd.DataFrame(), note))
@@ -367,7 +738,16 @@ class Report:
     def line(self, text: str) -> None:
         self.lines.append(text)
 
+    def verdict_record(self) -> dict[str, Any]:
+        return {"experiment": self.name, "verdict": self.final_verdict(), "outcome": rule_outcome(self.final_verdict()),
+                "rule_outcome": self.verdict, "guards": self.guards(), "decision_events": self.decision_events,
+                "min_events": self.min_events, "policies": list(self.policies) if self.policies is not None else None,
+                "in_sample": self.in_sample, "in_sample_why": self.in_sample_why, "synthetic": self.synthetic,
+                "rule": self.rule}
+
     def write(self) -> Path:
+        import json
+
         out = Path(self.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         for key, df, _ in self.tables:
@@ -381,6 +761,8 @@ class Report:
         meta = dict(self.meta)
         if self.decision_events is not None:
             meta["settlement events behind the decision"] = self.decision_events
+        if self.policies is not None:
+            meta["fill policies with results"] = ",".join(sorted({str(p) for p in self.policies})) or "none"
         if meta:
             md.append("| run | |")
             md.append("|---|---|")
@@ -390,8 +772,11 @@ class Report:
         if self.rule:
             md += [f"**Decision rule (docs/TEST_MATRIX.md):** {self.rule}", ""]
         if self.verdict:
-            v = self.final_verdict() + (" _(synthetic: pipeline check only, not a trading decision)_" if self.synthetic else "")
-            md += [f"**Verdict:** {v}", ""]
+            fv = self.final_verdict()
+            md += [f"**Verdict:** {fv}" + (" _(synthetic: pipeline check only, not a trading decision)_"
+                                           if self.synthetic else ""), ""]
+            if fv != self.verdict:
+                md += [f"**Rule outcome on this sample (before the evidence guards):** {self.verdict}", ""]
         md += [f"- {x}" for x in self.lines]
         if self.lines:
             md.append("")
@@ -404,6 +789,7 @@ class Report:
             md.append("")
         path = out / f"{self.name}.md"
         path.write_text("\n".join(md))
+        (out / f"{self.name}_verdict.json").write_text(json.dumps(self.verdict_record(), indent=1, default=str))
         return path
 
 

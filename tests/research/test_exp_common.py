@@ -95,12 +95,20 @@ def test_verdicts_need_enough_settlement_events(tmp_path):
     r = Report("ex", "Example", tmp_path, rule="accept if x")
     r.verdict = "ACCEPT"
     r.decision_events = 4
-    assert r.final_verdict().startswith("INCONCLUSIVE") and "Rule outcome on this sample: ACCEPT" in r.final_verdict()
-    assert "settlement events behind the decision | 4" in r.write().read_text()
+    fv = r.final_verdict()
+    assert fv.startswith("INCONCLUSIVE") and "ACCEPT" not in fv  # audit m9: rule outcome kept apart
+    md = r.write().read_text()
+    assert "settlement events behind the decision | 4" in md
+    assert "**Rule outcome on this sample (before the evidence guards):** ACCEPT" in md
+    import json
+
+    rec = json.loads((tmp_path / "ex_verdict.json").read_text())
+    assert rec["rule_outcome"] == "ACCEPT" and rec["outcome"] == "INCONCLUSIVE" and rec["guards"]
     r.decision_events = MIN_DECISION_EVENTS
     assert r.final_verdict() == "ACCEPT"
     assert n_events(pd.DataFrame({"event": ["a", "b"]}), pd.DataFrame({"event": ["b", "c"]}), None) == 3
     t = pd.DataFrame({"tau_bucket": ["x", "x", "y", "y", "z"], "policy": ["B", "C", "B", "C", "B"],
                       "events": [25, 25, 4, 4, 30], "net_lo_c": [0.1, 0.2, 0.1, 0.2, 0.5], "net_hi_c": [1, 1, 1, 1, 1]})
     rec = add_recommendation(t, ["tau_bucket"]).groupby("tau_bucket")["recommendation"].first().to_dict()
-    assert rec == {"x": "quote", "y": "insufficient data", "z": "insufficient data"}  # z: C missing
+    # without a later confirmation sample a significant bucket is only a candidate (audit C5)
+    assert rec == {"x": "candidate (not confirmed)", "y": "insufficient data", "z": "insufficient data"}  # z: C missing

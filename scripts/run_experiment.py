@@ -72,13 +72,54 @@ def load_cfg(path: str | None, synthetic_series: str | None = None):
     return load_config(path) if path else load_config(REPO / "config" / "m1.yaml")
 
 
-def latency_from(args):
+def latency_from(args, uni=None):
+    """--latency-ms submit,response,ws[,md] (ms, fixed) -> LatencyModel; without the flag the research
+    placeholders; md defaults to the recording's measured Kalshi market-data latency (audit M4)."""
     from dh.execution.latency import LatencyModel
+    from dh.research.replay_env import research_latency
 
     if not args.latency_ms:
-        return None
-    sub, resp, ws = (float(x) for x in args.latency_ms.split(","))
-    return LatencyModel.fixed(sub, resp, ws, seed=args.seed)
+        return research_latency(uni, None, seed=args.seed) if uni is not None else None
+    parts = [float(x) for x in args.latency_ms.split(",")]
+    if len(parts) not in (3, 4):
+        raise SystemExit("--latency-ms needs submit,response,ws[,md] in ms")
+    md = parts[3] if len(parts) == 4 else None
+    lat = LatencyModel.fixed(parts[0], parts[1], parts[2], md_ms=md or 0.0, seed=args.seed)
+    return research_latency(uni, lat, md_ms=md, seed=args.seed) if uni is not None else lat
+
+
+# options each command consumes (anything else given explicitly is an error: audit C3)
+_REPLAY = {"policies", "warm", "seed", "latency_ms", "quote_period_ms", "max_strikes", "fv_config", "flow_segments", "config"}
+CONSUMES: dict[str, set[str]] = {
+    "universe": {"max_strikes", "config"},
+    "replay": _REPLAY,
+    "flow": {"flow_split", "walk_forward_days", "flow_prior_s", "max_strikes", "config"},
+    "e1": {"step_ms", "latency_ms", "config", "max_strikes"},
+    "e2": _REPLAY | {"step_ms", "split", "no_pnl", "no_replica", "jobs"},
+    "e3": _REPLAY | {"split", "live_fills", "jobs"},
+    "e4": _REPLAY | {"grid", "jobs"},
+    "e67": _REPLAY | {"ledger", "confirm_t0", "confirm_t1", "split", "jobs"},
+    "e8": _REPLAY | {"step_ms", "jobs"},
+    "e9": _REPLAY | {"strikes", "jobs"},
+    "e10": _REPLAY | {"multipliers", "no_scale_limits", "jobs"},
+    "synth": {"events", "spacing", "strike_delay", "overwrite"},
+    "demo": {"jobs", "events", "spacing"},
+}
+CONSUMES["all"] = set().union(*(CONSUMES[e] for e in ("e1", "e2", "e3", "e4", "e67", "e8", "e9", "e10")))
+_ALWAYS = {"name", "root", "t0", "t1", "out", "log_level"}
+
+
+def unconsumed(ap, a) -> list[str]:
+    """Options given with a non-default value that the chosen command does not use."""
+    used = CONSUMES.get(a.name, set()) | _ALWAYS
+    bad = []
+    for act in ap._actions:  # noqa: SLF001 - argparse has no public accessor
+        d = act.dest
+        if d in ("help",) or d in used or not act.option_strings:
+            continue
+        if getattr(a, d, None) != act.default:
+            bad.append(act.option_strings[-1])
+    return bad
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,13 +135,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--jobs", type=int, default=1, help="parallel replays (fork)")
     ap.add_argument("--warm", default="recorded", help="fair-value warm-up: recorded | recorded+gbm | csv:<path> | gbm")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--latency-ms", default="", help="fixed latency 'submit,response,ws' in ms (default: placeholders)")
+    ap.add_argument("--latency-ms", default="",
+                    help="fixed latency 'submit,response,ws[,md]' in ms (default: placeholders; md = the recording's "
+                         "measured Kalshi market-data latency, fallback 25 ms)")
     ap.add_argument("--split", type=float, default=0.5, help="E2/E3: fraction of the window used for fitting")
     ap.add_argument("--grid", default=None, help="E4: JSON string or YAML/JSON file {variant: {section: {field: value}}}")
     ap.add_argument("--multipliers", default="1,2,5,10,20,50", help="E10: clip multiples")
     ap.add_argument("--no-scale-limits", action="store_true", help="E10: keep risk limits fixed as size grows")
     ap.add_argument("--strikes", default="1,3,0", help="E9: strikes per event (0 = all)")
     ap.add_argument("--ledger", action="append", default=[], help="E6/E7: analyze ledger CSV(s) instead of replaying")
+    ap.add_argument("--confirm-t0", default=None, help="E6/E7: start of a LATER, disjoint window confirming the buckets "
+                                                      "selected on [t0, t1) (default: chronological split, --split)")
+    ap.add_argument("--confirm-t1", default=None, help="E6/E7: end of the confirmation window")
     ap.add_argument("--live-fills", action="store_true", help="E3: also analyze our live fills in the recording")
     ap.add_argument("--step-ms", type=int, default=0, help="E2 panel / E8 decision grid step (ms)")
     ap.add_argument("--no-pnl", action="store_true", help="E2: skip the P&L hook replays")
@@ -126,6 +172,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="flow: gamma-Poisson prior exposure (s) shrinking thin segments toward the pooled rate")
     ap.add_argument("--log-level", default="WARNING")
     a = ap.parse_args(argv)
+    bad = unconsumed(ap, a)
+    if bad:
+        ap.error(f"{', '.join(bad)} not used by '{a.name}' (see the command list; nothing was run)")
     logging.basicConfig(level=a.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     wall = time.perf_counter()
 
@@ -173,10 +222,17 @@ def main(argv: list[str] | None = None) -> int:
     for n in uni.notes:
         print("note:", n)
     imeta, iwarn = inputs_meta(uni, t0)
-    if a.name != "flow":
+    lat = None
+    if a.name not in ("flow", "universe"):
         print("; ".join(f"{k}: {v}" for k, v in imeta.items()))
         for w in iwarn:
             print("WARNING:", w)
+        lat = latency_from(a, uni)
+        from dh.research.replay_env import describe_latency
+
+        print("latency:", describe_latency(lat, uni))
+    if set(policies) & {"B", "C"} != {"B", "C"} and a.name not in ("flow", "universe", "e1"):
+        print("WARNING: verdicts need results under BOTH fill policies B and C; they will be INCONCLUSIVE")
 
     def progress(msg: str) -> None:
         print("  ", msg, flush=True)
@@ -206,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
 
             o.mkdir(parents=True, exist_ok=True)
             for p in policies:
-                res = run_replay(root, t0, t1, cfg, p, latency=latency_from(a), warm=a.warm, seed=a.seed, universe=uni)
+                res = run_replay(root, t0, t1, cfg, p, latency=lat, warm=a.warm, seed=a.seed, universe=uni)
                 res.df.to_csv(o / f"ledger_{p}.csv", index=False, float_format="%.6g")
                 (o / f"summary_{p}.json").write_text(json.dumps(res.summary, indent=2, default=str))
                 s = res.summary
@@ -217,44 +273,47 @@ def main(argv: list[str] | None = None) -> int:
         elif name == "e1":
             from dh.research import exp1_staleness as m
 
-            m.run(root, t0, t1, o, cfg=cfg, step_ms=a.step_ms or 100, universe=uni)
+            m.run(root, t0, t1, o, cfg=cfg, step_ms=a.step_ms or 100, universe=uni,
+                  md_latency_ms=lat.dists["md"].median() if lat is not None else None)
         elif name == "e2":
             from dh.research import exp2_nowcast as m
 
             m.run(root, t0, t1, o, cfg=cfg, step_ms=a.step_ms or 200, pnl=not a.no_pnl, policies=policies,
                   split_frac=a.split, warm=a.warm, universe=uni, n_jobs=a.jobs, progress=progress,
-                  replica=not a.no_replica)
+                  replica=not a.no_replica, seed=a.seed, latency=lat)
         elif name == "e3":
             from dh.research import exp3_toxicity as m
 
             m.run(root, t0, t1, o, cfg=cfg, policies=policies, split_frac=a.split, warm=a.warm, universe=uni,
-                  live=a.live_fills, seed=a.seed, n_jobs=a.jobs, progress=progress)
+                  live=a.live_fills, seed=a.seed, n_jobs=a.jobs, progress=progress, latency=lat)
         elif name == "e4":
             from dh.research import exp4_queue as m
 
             m.run(root, t0, t1, o, cfg=cfg, policies=policies, grid=a.grid, warm=a.warm, n_jobs=a.jobs, universe=uni,
-                  seed=a.seed, progress=progress)
+                  seed=a.seed, progress=progress, latency=lat)
         elif name == "e67":
             from dh.research import exp67_segments as m
 
             m.run(root, t0, t1, o, cfg=cfg, policies=parse_policies(a.policies if "A" in a.policies else "A," + a.policies),
-                  warm=a.warm, n_jobs=a.jobs, universe=uni, ledgers=a.ledger, seed=a.seed, progress=progress)
+                  warm=a.warm, n_jobs=a.jobs, universe=uni, ledgers=a.ledger, seed=a.seed, progress=progress, latency=lat,
+                  confirm_t0=parse_time(a.confirm_t0) if a.confirm_t0 else None,
+                  confirm_t1=parse_time(a.confirm_t1) if a.confirm_t1 else None, select_frac=a.split)
         elif name == "e8":
             from dh.research import exp8_taker as m
 
-            m.run(root, t0, t1, o, cfg=cfg, policies=policies, latency=latency_from(a), step_ms=a.step_ms or 250,
+            m.run(root, t0, t1, o, cfg=cfg, policies=policies, latency=lat, step_ms=a.step_ms or 250,
                   warm=a.warm, universe=uni, seed=a.seed, n_jobs=a.jobs)
         elif name == "e9":
             from dh.research import exp9_multistrike as m
 
             m.run(root, t0, t1, o, cfg=cfg, policies=policies, counts=[int(x) for x in a.strikes.split(",")],
-                  warm=a.warm, n_jobs=a.jobs, universe=uni, seed=a.seed, progress=progress)
+                  warm=a.warm, n_jobs=a.jobs, universe=uni, seed=a.seed, progress=progress, latency=lat)
         elif name == "e10":
             from dh.research import exp10_capacity as m
 
             m.run(root, t0, t1, o, cfg=cfg, policies=policies, multipliers=[float(x) for x in a.multipliers.split(",")],
                   scale_limits=not a.no_scale_limits, warm=a.warm, n_jobs=a.jobs, universe=uni, seed=a.seed,
-                  progress=progress)
+                  progress=progress, latency=lat)
         print(f"{name}: wrote {o} ({time.perf_counter() - t_start:.0f}s)")
     return 0
 

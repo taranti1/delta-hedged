@@ -52,13 +52,17 @@ class FillMarkout:
 
 
 class AsOf:
-    """As-of (last value at or before t) lookup over a sorted series; NaN outside its range."""
+    """As-of (last value at or before t) lookup over a sorted series; NaN outside its range, and
+    NaN when the last value is older than ``max_age_ns`` (optional; None = no age limit, the
+    original behaviour)."""
 
-    __slots__ = ("ts", "vals")
+    __slots__ = ("ts", "vals", "max_age_ns")
 
-    def __init__(self, ts: Sequence[int] | np.ndarray, vals: Sequence[float] | np.ndarray) -> None:
+    def __init__(self, ts: Sequence[int] | np.ndarray, vals: Sequence[float] | np.ndarray,
+                 max_age_ns: int | None = None) -> None:
         self.ts = np.asarray(ts, dtype=np.int64)
         self.vals = np.asarray(vals, dtype=float)
+        self.max_age_ns = max_age_ns
         if self.ts.shape != self.vals.shape or self.ts.ndim != 1:
             raise ValueError("ts and values must be 1-d arrays of equal length")
         if len(self.ts) > 1 and np.any(np.diff(self.ts) < 0):
@@ -71,21 +75,25 @@ class AsOf:
         else:
             idx = np.searchsorted(self.ts, t_arr, side="right") - 1
             ok = (idx >= 0) & (t_arr <= self.ts[-1])
+            if self.max_age_ns is not None:
+                ok &= (t_arr - self.ts[np.clip(idx, 0, len(self.ts) - 1)]) <= self.max_age_ns
             out = np.where(ok, self.vals[np.clip(idx, 0, len(self.vals) - 1)], np.nan)
         return float(out) if out.ndim == 0 else out
 
 
-def _lookup(fv: Any) -> Callable[[int], float]:
+def _lookup(fv: Any, max_age_ns: int | None = None) -> Callable[[int], float]:
     if isinstance(fv, tuple) and len(fv) == 2:
-        return AsOf(*fv)
+        return AsOf(*fv, max_age_ns=max_age_ns)
+    if isinstance(fv, AsOf) and max_age_ns is not None and fv.max_age_ns is None:
+        return AsOf(fv.ts, fv.vals, max_age_ns=max_age_ns)
     if callable(fv):
         return fv
     raise TypeError("fv must be a callable fv(ts) or a (ts_array, values_array) tuple")
 
 
-def _resolver(fv: Any, per_ticker: bool) -> Callable[[str, int], float]:
+def _resolver(fv: Any, per_ticker: bool, max_age_ns: int | None = None) -> Callable[[str, int], float]:
     if isinstance(fv, Mapping):
-        table = {k: _lookup(v) for k, v in fv.items()}
+        table = {k: _lookup(v, max_age_ns) for k, v in fv.items()}
 
         def f(ticker: str, t: int) -> float:
             g = table.get(ticker)
@@ -94,7 +102,7 @@ def _resolver(fv: Any, per_ticker: bool) -> Callable[[str, int], float]:
         return f
     if per_ticker:
         return lambda ticker, t: float(fv(ticker, t))
-    g = _lookup(fv)
+    g = _lookup(fv, max_age_ns)
     return lambda ticker, t: float(g(t))
 
 
@@ -109,14 +117,17 @@ def fee_cents_per_contract(fee_micros: int, qty: int) -> float:
 
 def compute_markouts(fills: Iterable[KalshiFill], fv: Any, horizons_s: Sequence[float] = DEFAULT_HORIZONS_S, *,
                      settlement: Mapping[str, float] | None = None, time_basis: str = "exch",
-                     per_ticker: bool = False) -> list[FillMarkout]:
+                     per_ticker: bool = False, max_age_ns: int | None = None) -> list[FillMarkout]:
     """Per-fill signed markouts (cents per contract) at ``horizons_s`` and to settlement.
 
     settlement: {ticker: YES payout in dollars (1.0 / 0.0)}; missing tickers -> NaN.
+    max_age_ns: an as-of fair value older than this is treated as missing (NaN), like the
+    ledger's markout_max_age; None (default) keeps the unlimited as-of lookup. Applies to
+    (ts, values) tuples and AsOf lookups, not to arbitrary callables.
     """
     if time_basis not in ("exch", "recv"):
         raise ValueError("time_basis must be 'exch' or 'recv'")
-    get = _resolver(fv, per_ticker)
+    get = _resolver(fv, per_ticker, max_age_ns)
     hs = tuple(float(h) for h in horizons_s)
     out: list[FillMarkout] = []
     for f in fills:

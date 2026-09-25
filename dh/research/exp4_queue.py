@@ -19,7 +19,12 @@ contracts/day, quote-hours and net $ per quote-hour, quotes/cancels, markouts, f
 quote position at placement (touch / improve / behind); paired difference vs recenter_always.
 
 Decision rule (docs/TEST_MATRIX.md E4): accept "keep priority" if it beats re-centering by
-> 0.05c/contract (CI > 0) and in $/day under B and C; differences within the CI -> no decision.
+> 0.05c/contract (CI > 0) and in $/day under B and C; differences within the CI -> reject.
+Multiplicity (audit M8): only the PRE-REGISTERED keep-priority variants (config,
+hysteresis_strong, age_only_5s; every non-reference variant of a custom grid) are tested, with
+Holm across them (one-sided p-value of d > 0 at family level 2.5 %, required under B and C);
+the other variants are descriptive. Clusters = settlement events (expirations); day blocks
+are a second check from 5 days on. Regime splits: tau bucket, vol tercile, weekday.
 """
 
 from __future__ import annotations
@@ -32,12 +37,23 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from dh.research.exp_common import Report, flag_only_A, fmt_ns
-from dh.research.replay_env import Universe, build_universe, inputs_meta
-from dh.research.replay_grid import Variant, apply_overrides, run_variants, run_warnings, settled, variant_table
+from dh.research.exp_common import Report, fmt_ns, holm
+from dh.research.replay_env import Universe, build_universe, describe_latency, inputs_meta, inputs_status, research_latency
+from dh.research.replay_grid import (
+    Variant,
+    apply_overrides,
+    paired_regimes,
+    policies_with_results,
+    run_variants,
+    run_warnings,
+    settled,
+    variant_table,
+)
 from dh.strategy.config import StrategyConfig
 
-RULE_E4 = ("accept keep-priority if it beats always-re-centering by > 0.05c/contract (paired CI > 0) and in $/day "
+KEEP_PRIORITY = ("config", "hysteresis_strong", "age_only_5s")  # pre-registered hypotheses of the default grid
+RULE_E4 = ("accept keep-priority if it beats always-re-centering by > 0.05c/contract (paired CI > 0, Holm across the "
+           "pre-registered keep-priority variants) and in $/day "
            "under B and C; differences within the CI -> no decision")
 REF = "recenter_always"
 
@@ -77,38 +93,63 @@ def position_mix(runs) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def e4_decision(tab: pd.DataFrame, tested: list[str], alpha: float = 0.025) -> tuple[list[str], dict[str, bool]]:
+    """(winners, {policy: all-tested-present}): a tested variant wins if, under BOTH B and C, it is
+    Holm-significant (d > 0 across the tested variants of that policy), d > 0.05c, $/day higher and
+    the day-block check (when >= 5 days) agrees."""
+    ok: dict[str, set[str]] = {}
+    present: dict[str, bool] = {}
+    for p in ("B", "C"):
+        rows = tab[(tab.policy == p) & tab.variant.isin(tested)].set_index("variant")
+        present[p] = len(rows) == len(tested) and "d_p" in rows
+        if not len(rows) or "d_p" not in rows:
+            ok[p] = set()
+            continue
+        rej = holm(rows["d_p"].to_numpy(dtype=float), alpha)
+        good = set()
+        for (v, r), rj in zip(rows.iterrows(), rej):
+            day = r.get("d_day_lo_c", math.nan)
+            day_ok = not (int(r.get("day_blocks", 0) or 0) >= 5 and not day > 0)
+            if rj and r.get("d_net_vs_ref_c", math.nan) > 0.05 and r.get("d_usd_per_day_vs_ref", math.nan) > 0 and day_ok:
+                good.add(str(v))
+        ok[p] = good
+    return sorted(ok["B"] & ok["C"]), present
+
+
 def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyConfig | None = None,
         policies=("B", "C"), grid: str | None = None, warm: str = "recorded", n_jobs: int = 1,
-        universe: Universe | None = None, seed: int = 1, progress=None) -> dict[str, Any]:
+        universe: Universe | None = None, seed: int = 1, progress=None, latency=None) -> dict[str, Any]:
     Path(out).mkdir(parents=True, exist_ok=True)
     cfg = cfg or StrategyConfig()
     uni = universe or build_universe(root, t0, t1)
+    lat = research_latency(uni, latency)
     g = load_grid(grid)
     variants = [Variant(name, apply_overrides(cfg, over)) for name, over in g.items()]
     runs = run_variants(root, t0, t1, variants, policies, universe=uni, warm=warm, seed=seed, n_jobs=n_jobs,
-                        progress=progress)
-    tab = flag_only_A(variant_table(runs, ref=REF), ["variant"])
+                        progress=progress, latency=lat)
+    tab = variant_table(runs, ref=REF)
     mix = position_mix(runs)
+    tested = [v for v in g if v != REF and (grid or v in KEEP_PRIORITY)]
     rep = Report("e4_queue", "E4 — Queue priority vs continuous repricing", Path(out), synthetic=uni.synthetic,
                  rule=RULE_E4, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
-                                     "variants": len(variants), "policies": ",".join(policies)})
-    winners = []
-    need = [p for p in policies if p in ("B", "C")]
-    for v in g:
-        if v == REF or not need:
-            continue
-        rows = tab[(tab.variant == v) & tab.policy.isin(need)]
-        if len(rows) == len(need) and all(
-                (r.get("d_lo_c", math.nan) > 0) and (r.get("d_net_vs_ref_c", math.nan) > 0.05)
-                and (r.get("d_usd_per_day_vs_ref", math.nan) > 0) for _, r in rows.iterrows()):
-            winners.append(v)
+                                     "latency": describe_latency(lat, uni), "variants": len(variants),
+                                     "tested (pre-registered, Holm)": ", ".join(tested) or "none",
+                                     "policies": ",".join(policies)})
+    winners, _ = e4_decision(tab, tested)
     rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
-    rep.verdict = (f"ACCEPT: {', '.join(winners)} beat re-centering under B and C" if winners else
-                   "NO DECISION: no variant beats always-re-centering by > 0.05c/contract with CI > 0 under both B and C")
+    rep.policies = policies_with_results(runs, [REF, *tested])
+    rep.in_sample, rep.in_sample_why = inputs_status(uni, t0)
+    rep.verdict = (f"ACCEPT: {', '.join(winners)} beat re-centering under B and C (Holm across {len(tested)} "
+                   "pre-registered variants)" if winners else
+                   "REJECT (differences within the CI: no pre-registered keep-priority variant beats always-re-centering "
+                   "by > 0.05c/contract with Holm-adjusted CI > 0 and higher $/day under both B and C)")
     for w in run_warnings(runs):
         rep.line(f"WARNING: {w}")
-    rep.table("variants", tab, "Net c/contract with event-bootstrap CI; d_* = paired difference vs recenter_always "
-                               "(same events). usd_per_quote_hour = net $ per hour of resting quotes.")
+    rep.table("variants", tab, "Net c/contract with settlement-event CI; d_* = paired difference vs recenter_always "
+                               "(same events; d_p = one-sided p-value of d > 0, day-block CI as a second check). "
+                               "usd_per_quote_hour = net $ per hour of resting quotes.")
     rep.table("fill_position_mix", mix, "Fills by the quote's position at placement (touch/improve/behind).")
+    rep.table("regimes", paired_regimes(runs, REF), "Paired net c/contract difference vs recenter_always by regime "
+                                                    "(tau bucket, vol tercile, weekday).")
     rep.write()
-    return {"table": tab, "mix": mix, "runs": runs}
+    return {"table": tab, "mix": mix, "runs": runs, "verdict": rep.final_verdict(), "rule_outcome": rep.verdict}

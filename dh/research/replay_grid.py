@@ -21,7 +21,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from dh.research.exp_common import cluster_mean_ci, paired_diff_ci, policy_letter
+from dh.research.exp_common import (
+    add_regimes,
+    cluster_mean_ci,
+    flag_only_A,
+    paired_diff_ci,
+    paired_regime_table,
+    policy_letter,
+    sum_diff_ci,
+    vol_cuts,
+    with_day,
+)
 from dh.research.replay_env import Universe, build_universe, run_replay
 from dh.strategy.config import StrategyConfig
 
@@ -106,9 +116,42 @@ def settled(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["settle"].notna()] if len(df) and "settle" in df else df
 
 
+def policies_with_results(runs: Sequence[GridRun], variants: Sequence[str] | None = None) -> list[str]:
+    """Fill policies for which every listed variant (default: all) produced settled fills."""
+    names = set(variants) if variants is not None else {r.variant for r in runs}
+    out = []
+    for p in sorted({r.policy for r in runs}):
+        rs = [r for r in runs if r.policy == p and r.variant in names]
+        if rs and len({r.variant for r in rs}) == len(names) and all(len(settled(r.df)) for r in rs):
+            out.append(p)
+    return out
+
+
+def paired_regimes(runs: Sequence[GridRun], ref: str, n_boot: int = 200) -> pd.DataFrame:
+    """Paired net c/contract difference vs ``ref`` per regime (tau bucket, vol tercile, weekday)
+    for every (variant, policy): TEST_MATRIX regime splits (audit m8)."""
+    by = {(r.variant, r.policy): r for r in runs}
+    parts = []
+    for r in runs:
+        if r.variant == ref or (ref, r.policy) not in by:
+            continue
+        a, b = settled(by[(ref, r.policy)].df), settled(r.df)
+        if not len(a) or not len(b):
+            continue
+        cuts = vol_cuts(a.get("rv_1h", []), b.get("rv_1h", []))
+        t = paired_regime_table(add_regimes(a, cuts=cuts), add_regimes(b, cuts=cuts), n_boot=n_boot)
+        if len(t):
+            t.insert(0, "policy", r.policy)
+            t.insert(0, "variant", r.variant)
+            parts.append(t)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
 def variant_table(runs: Sequence[GridRun], ref: str | None = None, n_boot: int = 400) -> pd.DataFrame:
-    """One row per (variant, policy): fills, contracts, net c/contract (event CI), $/day, per-day
-    rates, markouts, quoting activity; paired difference vs the reference variant."""
+    """One row per (variant, policy): fills, contracts, net c/contract (settlement-event CI), $/day,
+    per-day rates, markouts, quoting activity; paired difference vs the reference variant in net
+    c/contract (clusters = expirations; ``d_p`` = one-sided p-value of d > 0; day-block CI as a
+    second check) and in net $/day (``d_usd_day_lo/hi``); ``holds_only_under_A`` when A is run."""
     by = {(r.variant, r.policy): r for r in runs}
     rows = []
     for r in runs:
@@ -132,10 +175,18 @@ def variant_table(runs: Sequence[GridRun], ref: str | None = None, n_boot: int =
             a = settled(by[(ref, r.policy)].df)
             if len(a) and len(d):
                 dd = paired_diff_ci(a, d, "net_c_per_ct", n_boot=n_boot)
-                row.update({"d_net_vs_ref_c": dd.mean, "d_lo_c": dd.lo, "d_hi_c": dd.hi})
+                row.update({"d_net_vs_ref_c": dd.mean, "d_lo_c": dd.lo, "d_hi_c": dd.hi, "d_se_c": dd.se,
+                            "d_p": dd.p_greater(0.0), "d_events": dd.clusters})
+                if "ts" in a and "ts" in d:
+                    dday = paired_diff_ci(with_day(a), with_day(d), "net_c_per_ct", cluster="day", n_boot=n_boot)
+                    row.update({"d_day_lo_c": dday.lo, "d_day_hi_c": dday.hi, "day_blocks": dday.clusters})
+                sd = sum_diff_ci(a, d, "net", scale=1.0 / days if days and days > 0 else math.nan, n_boot=n_boot)
+                row.update({"d_usd_day_lo": sd.lo, "d_usd_day_hi": sd.hi})
             row["d_usd_per_day_vs_ref"] = s.get("net_usd_per_day", 0.0) - by[(ref, r.policy)].summary.get("net_usd_per_day", 0.0)
+            row["d_contracts_per_day_vs_ref"] = (s.get("contracts_per_day", 0.0)
+                                                 - by[(ref, r.policy)].summary.get("contracts_per_day", 0.0))
         rows.append(row)
-    return pd.DataFrame(rows)
+    return flag_only_A(pd.DataFrame(rows), ["variant"])
 
 
 def scaled_cfg(cfg: StrategyConfig, k: float, scale_limits: bool = True) -> StrategyConfig:

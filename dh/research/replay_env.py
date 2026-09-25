@@ -106,7 +106,7 @@ from dh.core.events import (
 from dh.core.market import MarketSpec
 from dh.core.units import NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.execution.exchange_sim import KalshiExchangeSim
-from dh.execution.latency import LatencyModel
+from dh.execution.latency import Dist, Empirical, Fixed, LatencyModel, LogNormal
 from dh.feeds.books import BookTracker
 from dh.feeds.registry import has_normalizer
 from dh.kalshi.fees import FeeEngine, FeeSchedule, OrderFeeAccumulator, apply_scheduled_changes, resolve_fee_fields
@@ -140,8 +140,113 @@ _STRIKE_KEYS = ("strike_type", "floor_strike", "cap_strike", "custom_strike")
 _MARKET_SUBRESOURCES = {"trades", "orderbooks", "candlesticks"}
 
 
+MD_LATENCY_FALLBACK_MS = 25.0  # Kalshi market-data latency when the recording has no usable exchange stamps
+
+
 def _iso(sec: int | float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sec)))
+
+
+def settlement_cluster(expiration_ns: int) -> str:
+    """Inference cluster of a market: its expiration time (audit M5). KXBTCD, KXBTC and KXBTC15M
+    markets expiring at the same time settle on the same BRTI 60-print average, so they are one
+    settlement event for every CI and for the minimum-evidence count."""
+    return "exp " + _iso(int(expiration_ns) // NS_PER_S)
+
+
+# ============================================================================ latency (research layer)
+def measure_md_latency_ms(root: str | Path, t0: int, t1: int | None = None, *, cache: dict[Any, Any] | None = None,
+                          max_msgs: int = 20_000, before_s: float = 2 * HOUR_S, after_s: float = 600.0) -> tuple[float, str]:
+    """Median (receive time - exchange time) of Kalshi public trade / orderbook_delta messages, in
+    ms, and a note. Measured on messages received in [t0 - before_s, t0) (causal; independent of
+    the window end, so truncating a replay never changes it); if there are none, on the first
+    ``after_s`` after t0 (noted). Falls back to MD_LATENCY_FALLBACK_MS without usable
+    (sub-second) exchange stamps or with a negative median (clock skew). ``t1`` is ignored."""
+    key = ("md_latency", str(root), int(t0))
+    if cache is not None and key in cache:
+        return cache[key]
+    streams = kalshi_ws_streams(root)
+
+    def sample(lo: int, hi: int) -> tuple[list[int], int]:
+        lat: list[int] = []
+        whole = 0
+        for rec in iter_raw(root, streams, lo, hi) if streams else ():
+            d = rec.data
+            if b'"trade"' not in d and b"orderbook_delta" not in d:
+                continue
+            try:
+                msg = orjson.loads(d)
+                evs = (ws_message_to_events(msg, rec.t)
+                       if isinstance(msg, dict) and msg.get("type") in ("trade", "orderbook_delta") else [])
+            except (orjson.JSONDecodeError, ValueError, KeyError, TypeError):
+                continue
+            for e in evs:
+                if isinstance(e, (KalshiTrade, KalshiBookDelta)) and e.ts_exch > 0:
+                    lat.append(e.ts - e.ts_exch)
+                    whole += e.ts_exch % NS_PER_S == 0
+            if len(lat) >= max_msgs:
+                break
+        return lat, whole
+
+    lat, whole = sample(t0 - _ns(before_s), t0)
+    where = f"received in the {before_s / 3600:g} h before t0"
+    if len(lat) < 100:
+        lat, whole = sample(t0, t0 + _ns(after_s))
+        where = f"received in the first {after_s:g} s after t0 (no data before t0)"
+    if not lat:
+        out = (MD_LATENCY_FALLBACK_MS, f"fallback {MD_LATENCY_FALLBACK_MS:g} ms (no Kalshi trade/delta exchange stamps)")
+    elif whole > 0.9 * len(lat):
+        out = (MD_LATENCY_FALLBACK_MS, f"fallback {MD_LATENCY_FALLBACK_MS:g} ms (exchange stamps have 1 s resolution)")
+    else:
+        med = float(np.median(np.asarray(lat, dtype=float))) / 1e6
+        out = ((med, f"measured: median receive - exchange time of {len(lat)} Kalshi trade/delta messages {where}")
+               if med >= 0 else (MD_LATENCY_FALLBACK_MS, f"fallback {MD_LATENCY_FALLBACK_MS:g} ms (negative median "
+                                                         f"{med:.1f} ms: clock skew)"))
+    if cache is not None:
+        cache[key] = out
+    return out
+
+
+def research_latency(uni: Universe | None = None, latency: LatencyModel | None = None, *,
+                     md_ms: float | None = None, seed: int = 0) -> LatencyModel:
+    """Latency for research replays (audit M4): ``latency`` if given (its md kept when > 0, else
+    ``md_ms`` or the recording's measured md), otherwise the LatencyModel placeholders for submit /
+    response / ws with md = ``md_ms`` or the recording's measured Kalshi market-data latency
+    (fallback 25 ms). The library default md = 0 is never used here: it lets our orders win
+    races they would lose. Pass ``md_ms`` explicitly (e.g. 0) to override the measurement."""
+    if md_ms is None:
+        md_ms = measure_md_latency_ms(uni.root, uni.t0, cache=uni.cache)[0] if uni is not None else MD_LATENCY_FALLBACK_MS
+    if latency is None:
+        return LatencyModel(seed, md=Fixed(float(md_ms)))
+    d = latency.dists
+    md = d["md"] if d["md"].median() > 0 else Fixed(float(md_ms))
+    return LatencyModel(latency.entropy, submit=d["submit"], cancel=d["cancel"], response=d["response"], ws=d["ws"],
+                        md=md, multiplier=latency.multiplier)
+
+
+def _dist_str(d: Dist) -> str:
+    if isinstance(d, Fixed):
+        return f"{d.ms:g} ms"
+    if isinstance(d, LogNormal):
+        return f"lognormal(median {d.median_ms:g} ms, sigma {d.sigma:g})"
+    if isinstance(d, Empirical):
+        return f"empirical(n={len(d.samples_ms)}, median {d.median():g} ms)"
+    return repr(d)
+
+
+def describe_latency(latency: LatencyModel, uni: Universe | None = None) -> str:
+    """The full latency model for report metadata (policy C scales every delay x1.5)."""
+    d = latency.dists
+    md_note = ""
+    if uni is not None:
+        for k, v in uni.cache.items():
+            if isinstance(k, tuple) and k and k[0] == "md_latency" and abs(v[0] - d["md"].median()) < 1e-9:
+                md_note = f" [{v[1]}]"
+                break
+    cancel = "= submit" if d["cancel"] is d["submit"] else _dist_str(d["cancel"])
+    mult = f", x{latency.multiplier:g}" if latency.multiplier != 1.0 else ""
+    return (f"submit {_dist_str(d['submit'])}; cancel {cancel}; response {_dist_str(d['response'])}; "
+            f"ws {_dist_str(d['ws'])}; md {_dist_str(d['md'])}{md_note}{mult}; policy C x1.5")
 
 
 def _ns(x: float) -> int:
@@ -182,6 +287,7 @@ class MarketRecord:
     settle_px: int | None = None  # YES payout, 1e-4 $
     expiration_value: float | None = None
     settled_ns: int = 0
+    fee_obs: list[tuple[int, dict[str, Any]]] = field(default_factory=list)  # (recv, market fee fields) in order
 
 
 @dataclass
@@ -211,13 +317,15 @@ class Universe:
 
     # ------------------------------------------------------------------ fee resolution
     def series_at(self, series_ticker: str, t: int) -> dict[str, Any] | None:
-        """Series object in force at t: latest snapshot received at or before t (the earliest
-        snapshot if none precedes t) with scheduled fee changes up to t applied."""
+        """Series object in force at t: latest snapshot RECEIVED at or before t with scheduled fee
+        changes up to t applied; None if no snapshot precedes t (never a later snapshot: audit m4)."""
         snaps = self.series.get(series_ticker)
         if not snaps:
             return None
         before = [s for s in snaps if s[0] <= t]
-        recv, obj = before[-1] if before else snaps[0]
+        if not before:
+            return None
+        recv, obj = before[-1]
         ch = [c for c in self.series_fee_changes if str(c.get("series_ticker") or series_ticker) == series_ticker]
         return apply_scheduled_changes(obj, ch, min(recv, t), t) if ch else dict(obj)
 
@@ -226,9 +334,10 @@ class Universe:
         obj: dict[str, Any] = {}
         recv = 0
         if snaps:
-            before = [s for s in snaps if s[0] <= t]
-            recv, obj = before[-1] if before else snaps[0]
-            obj = dict(obj)
+            before = [s for s in snaps if s[0] <= t]  # never a snapshot received after t (audit m4)
+            if before:
+                recv, obj = before[-1]
+                obj = dict(obj)
         ch = [c for c in self.event_fee_changes if str(c.get("event_ticker") or "") == event_ticker]
         if ch:
             obj = apply_scheduled_changes(obj, ch, min(recv, t) if recv else -1, t, type_key="fee_type_override",
@@ -243,12 +352,32 @@ class Universe:
         return obj
 
     def fee_fields(self, ticker: str, t: int) -> tuple[str, float, str]:
+        """Fee type/multiplier of a market as known at time t: series, event and market fee
+        fields RECEIVED at or before t only (no later snapshot, no later market update)."""
         rec = self.markets[ticker]
         spec = rec.spec
         series_t = spec.series_ticker if spec is not None else str(rec.raw.get("event_ticker", "")).split("-", 1)[0]
         event_t = spec.event_ticker if spec is not None else str(rec.raw.get("event_ticker", ""))
-        ftype, mult, src = resolve_fee_fields(self.series_at(series_t, t), self.event_at(event_t, t), rec.raw)
+        mk: dict[str, Any] = {}
+        for recv, f in rec.fee_obs:
+            if recv > t:
+                break
+            mk.update(f)
+        ftype, mult, src = resolve_fee_fields(self.series_at(series_t, t), self.event_at(event_t, t), mk)
         return ftype, float(mult) if mult is not None else 1.0, src
+
+    def fee_update_times(self, ticker: str) -> list[int]:
+        """Receive/effective times at which the fee information of a market can change."""
+        rec = self.markets[ticker]
+        spec = rec.spec
+        series_t = spec.series_ticker if spec is not None else ""
+        event_t = spec.event_ticker if spec is not None else ""
+        out = [r for r, _ in self.series.get(series_t, [])] + [r for r, _ in self.events.get(event_t, [])]
+        out += [r for r, _ in rec.fee_obs] + [r for r, et, _, _ in self.ws_fee_updates if et == event_t]
+        out += [opt_iso_to_ns(c.get("scheduled_ts")) for c in self.series_fee_changes
+                if str(c.get("series_ticker") or series_t) == series_t]
+        out += [opt_iso_to_ns(c.get("scheduled_ts")) for c in self.event_fee_changes if str(c.get("event_ticker")) == event_t]
+        return sorted({int(x) for x in out if x})
 
     def fee_changes_in_window(self) -> list[str]:
         out = []
@@ -514,6 +643,9 @@ def build_universe(root: str | Path, t0: int, t1: int, *, lookback_s: float = 6 
                     rec.settled_ns = recv
                 continue
             _merge(rec.raw, payload)
+            fee = {k: payload[k] for k in ("fee_type", "fee_multiplier") if payload.get(k) is not None}
+            if fee:
+                rec.fee_obs.append((recv, fee))
             if kind == "rest" and str(payload.get("result") or "") in ("yes", "no"):
                 if not rec.result:
                     rec.result = str(payload["result"])
@@ -535,14 +667,31 @@ def build_universe(root: str | Path, t0: int, t1: int, *, lookback_s: float = 6 
     u.markets = mk
 
     # ---------------------------------------------------------------- fees (as of availability)
+    # A market is available only once BOTH its spec and its fee are known from records received
+    # by then (audit m4): if the fee resolves only later, availability moves to that time.
+    shifted = 0
     for t, rec in mk.items():
         if rec.spec is None:
             continue
         t_ref = max(rec.avail_ns, t0)
         ftype, mult, src = u.fee_fields(t, t_ref)
+        if not ftype:
+            for tu in u.fee_update_times(t):
+                if tu <= t_ref:
+                    continue
+                if tu >= hi:
+                    break
+                ftype, mult, src = u.fee_fields(t, tu)
+                if ftype:
+                    rec.avail_ns = max(rec.avail_ns, tu)
+                    shifted += 1
+                    break
         rec.spec = dataclasses.replace(rec.spec, fee_type=ftype, fee_multiplier=mult)
         if not ftype:
             rec.reject = "fee_unresolved (no series/event fee record): MarketMaker will not quote it"
+    if shifted:
+        u.notes.append(f"{shifted} market(s) became available only when their fee was first known (fee record "
+                       "received after the spec)")
 
     # ---------------------------------------------------------------- session metadata
     if "meta" in list_streams(root):
@@ -801,11 +950,18 @@ class ReplayStream:
 
     def __init__(self, root: str | Path, t0: int, t1: int, *, streams: Sequence[str] | None = None,
                  state_warm_s: float = 900.0, tail_s: float = 300.0, own_fills: Mapping[str, KalshiFill] | None = None,
-                 own_filter: bool = True, kalshi_use_yes_price: bool = False, brti_prime_s: float = 120.0) -> None:
+                 own_filter: bool = True, kalshi_use_yes_price: bool = False, brti_prime_s: float = 120.0,
+                 prime_tickers: Iterable[str] | None = None, prime_search_s: float = 6 * HOUR_S) -> None:
         self.root = str(root)
         self.t0, self.t1 = int(t0), int(t1)
         self.streams = list(streams) if streams is not None else default_streams(root)
         self.state_warm_ns = _ns(state_warm_s)
+        # books of these tickers are primed from their LAST orderbook_snapshot before t0, searched
+        # back up to prime_search_s (audit M6: a snapshot older than state_warm_s used to be missed)
+        self.prime_tickers = set(prime_tickers or ())
+        self.prime_search_ns = _ns(prime_search_s)
+        self.prime_start = self.t0 - self.state_warm_ns
+        self.unprimed: list[str] = []  # prime_tickers without a valid book at t0
         self.tail_ns = _ns(tail_s)
         self.own_fills = dict(own_fills or {})
         self.own_filter = own_filter
@@ -824,11 +980,19 @@ class ReplayStream:
         self.pre_brti = []
         self.counts = Counter()
         tracker = BookTracker()
+        self.tracker = tracker
         kalshi_up: bool | None = None
         bad_books: set[str] = set()
         primed = False
         t0, t1 = self.t0, self.t1
-        for rec in iter_raw(self.root, self.streams, t0 - self.state_warm_ns, t1 + self.tail_ns, self.read_stats):
+        start = t0 - self.state_warm_ns
+        if self.prime_tickers and self.prime_search_ns > self.state_warm_ns:
+            last = self._last_snapshots(t0 - self.prime_search_ns, start)
+            older = [last[t] for t in self.prime_tickers if t in last]
+            if older:
+                start = min(start, min(older))
+        self.prime_start = start
+        for rec in iter_raw(self.root, self.streams, start, t1 + self.tail_ns, self.read_stats):
             evs = norm(rec)
             if filt is not None and evs:
                 evs = [x for e in evs for x in filt(e)]
@@ -867,8 +1031,26 @@ class ReplayStream:
         if not primed:
             yield from self._prime(tracker, kalshi_up, bad_books)
 
+    def _last_snapshots(self, lo: int, hi: int) -> dict[str, int]:
+        """{ticker: receive time of its last orderbook_snapshot frame in [lo, hi)} (kalshi.ws)."""
+        out: dict[str, int] = {}
+        ws = [s for s in self.streams if s == "kalshi.ws"]
+        for rec in iter_raw(self.root, ws, lo, hi) if ws and lo < hi else ():
+            if b"orderbook_snapshot" not in rec.data:
+                continue
+            try:
+                msg = orjson.loads(rec.data)
+            except orjson.JSONDecodeError:
+                continue
+            body = msg.get("msg") if isinstance(msg, dict) else None
+            if isinstance(body, dict) and msg.get("type") == "orderbook_snapshot" and body.get("market_ticker"):
+                out[str(body["market_ticker"])] = rec.t
+        return out
+
     def _prime(self, tracker: BookTracker, kalshi_up: bool | None, bad_books: set[str]) -> Iterator[Event]:
         t0 = self.t0
+        valid = {t for t, b in tracker.kalshi.items() if b.valid and t not in bad_books}
+        self.unprimed = sorted(t for t in self.prime_tickers if t not in valid)
         if kalshi_up or (kalshi_up is None and tracker.kalshi):
             yield FeedStatus(ts=t0, ts_exch=0, stream="kalshi.ws", status="connected", detail="replay priming")
         for ev in tracker.state_events(t0):
@@ -910,6 +1092,33 @@ def open_recording(root: str | Path, t0: int, t1: int, *, series: Iterable[str] 
     """build_universe + specs (optionally restricted to series) + per-series fee schedules at t0."""
     u = build_universe(root, t0, t1)
     return Recording(u, u.specs(series), u.fee_schedules(fee_engine), dict(stream_kw))
+
+
+# ============================================================================ regimes
+def realized_vol_asof(tick_ts: np.ndarray, tick_val: np.ndarray, query_ts: np.ndarray, *, window_s: float = HOUR_S,
+                      step_s: float = 60.0) -> np.ndarray:
+    """Annualized realized vol of the benchmark over [t - window_s, t] at each query time, from the
+    last tick RECEIVED at each step boundary (causal); NaN with fewer than 10 returns."""
+    q = np.asarray(query_ts, dtype=np.int64)
+    out = np.full(len(q), np.nan)
+    if not len(q) or len(tick_ts) < 2:
+        return out
+    order = np.argsort(tick_ts, kind="stable")
+    ts, val = np.asarray(tick_ts, dtype=np.int64)[order], np.asarray(tick_val, dtype=float)[order]
+    step = _ns(step_s)
+    g0 = (int(ts[0]) // step + 1) * step
+    grid = np.arange(g0, int(q.max()) + step, step, dtype=np.int64)
+    if len(grid) < 3:
+        return out
+    idx = np.searchsorted(ts, grid, side="right") - 1
+    lv = np.log(np.where(idx >= 0, val[np.clip(idx, 0, None)], np.nan))
+    r = np.diff(lv)  # return ending at grid[1:]
+    n = max(2, int(round(window_s / step_s)))
+    rs = pd.Series(r).rolling(n, min_periods=10).std().to_numpy()
+    j = np.searchsorted(grid[1:], q, side="right") - 1
+    ok = j >= 0
+    out[ok] = rs[j[ok]] * math.sqrt(365.0 * 86400.0 / step_s)
+    return out
 
 
 # ============================================================================ fitted inputs (look-ahead checks)
@@ -976,13 +1185,46 @@ def fv_label_for(uni: Universe, t0: int) -> tuple[dict[str, Any], str | None]:
     return fv_params_status(cfg, src, t0, uni.synthetic)
 
 
+FILL_ADVERSE_NOTE = ("fitting window not recorded in the strategy config: NOT covered by the look-ahead check "
+                     "(fit them on data before the replay window)")
+
+
 def inputs_meta(uni: Universe, t0: int) -> tuple[dict[str, Any], list[str]]:
     """Report metadata + warnings for the fitted inputs of a window's replays (FV parameters and
-    taker-flow segments; in-sample = fitted on data not strictly before t0)."""
+    taker-flow segments; in-sample = fitted on data not strictly before t0). The strategy's
+    fill/adverse config parameters carry no fitting window, so the check cannot cover them."""
     fv_info, fv_warn = fv_label_for(uni, t0)
     fl_info, fl_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
-    return ({"FV parameters": fv_info["fv_params"], "taker flow": fl_info["flow_segments"]},
+    return ({"FV parameters": fv_info["fv_params"], "taker flow": fl_info["flow_segments"],
+             "strategy fill/adverse parameters": FILL_ADVERSE_NOTE},
             [w for w in (fv_warn, fl_warn) if w])
+
+
+def inputs_status(uni: Universe, t0: int) -> tuple[bool, str]:
+    """(in_sample, why): True when the FV parameters or the bound flow segments were fitted on
+    data not strictly before t0 (or their fitting window is unknown). Feeds Report.in_sample,
+    which caps an ACCEPT at INCONCLUSIVE (audit M7)."""
+    fv_info, _ = fv_label_for(uni, t0)
+    fl_info, _ = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
+    why = []
+    if fv_info["fv_params_in_sample"]:
+        why.append(f"FV parameters {fv_info['fv_params']}")
+    if fl_info["flow_in_sample"]:
+        why.append(f"taker flow {fl_info['flow_segments']} fitted on data not before t0")
+    return bool(why), "; ".join(why)
+
+
+def status_columns(uni: Universe, t0: int) -> dict[str, Any]:
+    """Status columns written into every replay ledger (audit M7): synthetic recording, FV
+    parameter status (in_sample / out_of_sample / n/a) and taker-flow status (in_sample /
+    out_of_sample / defaults), so pooled ledgers keep them."""
+    fv_info, _ = fv_label_for(uni, t0)
+    fl_info, _ = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0)
+    fvs = fv_info["fv_params_in_sample"]
+    fls = fl_info["flow_in_sample"]
+    return {"synthetic": bool(uni.synthetic),
+            "fv_status": "n/a" if fvs is None else ("in_sample" if fvs else "out_of_sample"),
+            "flow_status": "defaults" if fls is None else ("in_sample" if fls else "out_of_sample")}
 
 
 def bind_replay_inputs(uni: Universe, *, fv_config: str | Path | Mapping[str, Any] | None = None,
@@ -1064,9 +1306,12 @@ def _brti_scan(root: str | Path, t0: int, t1: int, include_rest: bool) -> list[I
     return uniq
 
 
-def load_price_file(path: str | Path) -> pd.DataFrame:
-    """CSV/Parquet of prices -> DataFrame(ts_ns, price). Columns: ts_ms|ts_ns|timestamp(s) and
-    price|close|value."""
+def load_price_file(path: str | Path, bar_s: float | None = None) -> pd.DataFrame:
+    """CSV/Parquet of prices -> DataFrame(ts_ns, price) where ts_ns is the time the price became
+    KNOWN (audit m3). Time columns: ts_ns | ts_ms | timestamp (s); value columns: price | value
+    (point-in-time prices, known at their stamp) or close (OHLC bars stamped at their OPEN, e.g.
+    Bitstamp/Kraken exports: known at the bar close = stamp + bar length). The bar length is
+    ``bar_s`` if given, else a close_ts_ns / close_ts_ms column, else the median stamp spacing."""
     p = Path(path)
     df = pd.read_parquet(p) if p.suffix in (".parquet", ".pq") else pd.read_csv(p)
     if "ts_ns" in df:
@@ -1077,10 +1322,24 @@ def load_price_file(path: str | Path) -> pd.DataFrame:
         ts = (df["timestamp"].astype("float64") * NS_PER_S).astype("int64")
     else:
         raise KeyError(f"{p}: need ts_ns, ts_ms or timestamp column")
-    col = next((c for c in ("price", "close", "value") if c in df), None)
+    col = next((c for c in ("price", "value", "close") if c in df), None)
     if col is None:
         raise KeyError(f"{p}: need price, close or value column")
-    return pd.DataFrame({"ts_ns": ts.to_numpy(), "price": df[col].astype(float).to_numpy()}).sort_values("ts_ns")
+    known = ts.to_numpy(dtype=np.int64)
+    if "close_ts_ns" in df:
+        known = df["close_ts_ns"].astype("int64").to_numpy()
+    elif "close_ts_ms" in df:
+        known = df["close_ts_ms"].astype("int64").to_numpy() * 1_000_000
+    elif col == "close":
+        if bar_s is not None:
+            bar = _ns(bar_s)
+        else:
+            st = np.sort(known)
+            dif = np.diff(st)
+            dif = dif[dif > 0]
+            bar = int(np.median(dif)) if len(dif) else 0
+        known = known + bar
+    return pd.DataFrame({"ts_ns": known, "price": df[col].astype(float).to_numpy()}).sort_values("ts_ns")
 
 
 @dataclass
@@ -1108,9 +1367,11 @@ def warm_fair_value(fv: FairValueModel, root: str | Path, t0: int, warm: str = "
     """Warm the vol EWMAs with prices received strictly before t0.
 
     Tokens (comma/plus separated): 'recorded' = BRTI ticks in [t0 - fv_warm_s, t0) (WS 1 Hz/5 Hz
-    and CF-history REST records); 'csv:<path>' = price file (dh.research.replay_env.load_price_file);
-    'gbm' = seeded GBM history (vol gbm_vol_ann) ending at the first known price, used only if the
-    other sources left the model not ready -- SYNTHETIC, flagged in WarmInfo/summary.
+    and CF-history REST records); 'csv:<path>' = price file (dh.research.replay_env.load_price_file:
+    each price at the time it became known, i.e. OHLC bars at their CLOSE); 'gbm' = seeded GBM
+    history (vol gbm_vol_ann) ending at the first price known before t0, used only if the other
+    sources left the model not ready -- SYNTHETIC, flagged in WarmInfo/summary. Without any price
+    known before t0 there is no GBM fallback (it would need a later price: audit m3).
     """
     toks = parse_warm(warm)
     src: list[str] = []
@@ -1135,9 +1396,6 @@ def warm_fair_value(fv: FairValueModel, root: str | Path, t0: int, warm: str = "
         from dh.backtest.kat import warm_fv_model
 
         end_ns, S_end = (prices[0][0] - 60 * NS_PER_S, prices[0][1]) if prices else (t0, None)
-        if S_end is None:
-            nxt = brti_ticks(root, t0, t0 + _ns(900))
-            S_end = nxt[0].value if nxt else None
         if S_end is not None:
             fv.vol = FairValueModel.from_config(dict(fv_config) if fv_config else load_recommended_config()).vol  # fresh
             warm_fv_model(fv, end_ns, S_end, gbm_vol_ann, seed=seed)
@@ -1164,6 +1422,7 @@ class TickerFeeExchangeSim(KalshiExchangeSim):
         import inspect
 
         self.schedules = dict(schedules)
+        self.fill_hooks: list[Callable[[Any], None]] = []  # called with each SimFillRecord at match time
         self._fee_ticker = ""
         self._accs: dict[str, OrderFeeAccumulator] = {}
         self.fee_model = "per_fill_trade_fee"
@@ -1192,7 +1451,12 @@ class TickerFeeExchangeSim(KalshiExchangeSim):
 
     def _fill(self, o, qty, px, is_taker, t, mech):  # type: ignore[no-untyped-def]
         self._fee_ticker = o.ticker
-        return super()._fill(o, qty, px, is_taker, t, mech)
+        n = len(self.fill_log)
+        out = super()._fill(o, qty, px, is_taker, t, mech)
+        if len(self.fill_log) > n:
+            for h in getattr(self, "fill_hooks", ()):
+                h(self.fill_log[-1])  # at MATCH time: the strategy has seen only earlier events
+        return out
 
 
 # ============================================================================ availability
@@ -1328,6 +1592,11 @@ class FillCapture:
         self.mm = mm
         self.rows: list[dict[str, Any]] = []
         self.public_qty: Counter[str] = Counter()  # public traded qty (0.01 ct) per ticker
+        # public qty in markets the strategy could quote at the time of the print (audit m5): known
+        # to the strategy, not settled, 0 < tau <= max_tau_s, enabled series; inside min_tau_s only
+        # if the strike was far enough (|z| >= z_min_final) to be quotable there
+        self.public_qty_quotable: Counter[str] = Counter()
+        self.had_book: set[str] = set()  # tickers that received a valid book snapshot
         self.quotes: dict[str, tuple[str, float, float]] = {}  # coid -> (position, q_eff, modeled value)
         self._last_place = ""
 
@@ -1342,10 +1611,29 @@ class FillCapture:
                                              float(p.get("value", math.nan)))
             self._last_place = ""
 
+    def _quotable(self, ticker: str, ts: int) -> bool:
+        mm = self.mm
+        spec = mm.specs.get(ticker)
+        if spec is None or ticker in mm.settled:
+            return False
+        q = mm.cfg.quoting
+        tau = (spec.expiration_ts - ts) / NS_PER_S
+        if tau <= 0 or tau > q.max_tau_s or spec.series_ticker not in q.enabled_series:
+            return False
+        if tau < q.min_tau_s:
+            f = mm.fvc.get(ticker)
+            z = getattr(f, "z_near", None) if f is not None else None
+            return z is not None and math.isfinite(z) and abs(z) >= q.z_min_final
+        return True
+
     def on_event(self, ev: Event) -> None:
         t = type(ev)
         if t is KalshiTrade:
             self.public_qty[ev.ticker] += ev.qty  # type: ignore[union-attr]
+            if self._quotable(ev.ticker, ev.ts):  # type: ignore[union-attr]
+                self.public_qty_quotable[ev.ticker] += ev.qty  # type: ignore[union-attr]
+        elif t is KalshiBookSnapshot:
+            self.had_book.add(ev.ticker)  # type: ignore[union-attr]
         elif t is KalshiFill:
             mm = self.mm
             w = mm.om.order(ev.client_order_id)  # type: ignore[union-attr]
@@ -1435,7 +1723,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
                keep_objects: bool = False, fee_engine: FeeEngine | None = None, n_boot: int = 500,
                postprocess: Callable[[ReplayResult], None] | None = None,
                fv_config: str | Path | Mapping[str, Any] | None = None,
-               flow_segments: str | Path | Mapping[Any, Any] | None = None) -> ReplayResult:
+               flow_segments: str | Path | Mapping[Any, Any] | None = None,
+               prime_search_s: float = 6 * HOUR_S) -> ReplayResult:
     """Replay MarketMaker + KalshiExchangeSim (+ Ledger) over the recording in [t0, t1).
 
     policy: fill policy A/B/C (optimistic/realistic/conservative); latency: LatencyModel
@@ -1448,6 +1737,11 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     columns from the ledger inside a worker process); they are detached unless keep_objects.
     fv_config / flow_segments override the inputs bound to the universe (bind_replay_inputs);
     both are checked for look-ahead against t0 (summary fv_params / flow_segments + warnings).
+    latency: None -> research_latency(universe) (placeholders + the recording's measured Kalshi
+    market-data latency). Books are primed from each market's last snapshot before t0, searched
+    back ``prime_search_s``; markets that never get a valid book are counted and warned about.
+    Ledger rows carry the settlement cluster (``event`` = expiration key; ``event_ticker`` kept),
+    regime columns (``day``, ``weekend``, ``rv_1h``) and the status columns of status_columns().
     Returns ReplayResult(df, summary, ...) (see class doc).
     """
     cfg = cfg or StrategyConfig()
@@ -1471,7 +1765,9 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     if uni.flow_segments:
         factory_kwargs = {"flow_segments": dict(uni.flow_segments), **(factory_kwargs or {})}
     stream = ReplayStream(root, t0, t1, streams=streams, state_warm_s=state_warm_s, tail_s=tail_s,
-                          own_fills=uni.own_fills, own_filter=own_filter)
+                          own_fills=uni.own_fills, own_filter=own_filter, prime_tickers=[s.ticker for s in specs],
+                          prime_search_s=prime_search_s)
+    lat = research_latency(uni, latency)
     horizon = add_horizon_s if add_horizon_s is not None else cfg.quoting.max_tau_s + 300.0
     feed = ReplayFeed(stream, uni, specs, add_horizon_s=horizon)
     factory = strategy_factory or MarketMaker
@@ -1481,19 +1777,26 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         mm = factory(cfg, feed.initial + [s for _, s in feed.pending], fv_model=fv, fee_engine=fee_engine,
                      **(factory_kwargs or {}))
     scheds = {s.ticker: fee_engine.schedule_for_spec(s.fee_type, s.fee_multiplier) for s in specs}
-    sim = TickerFeeExchangeSim(latency or default_latency(), POLICY_FULL[letter], scheds, seed=seed)
+    sim = TickerFeeExchangeSim(lat, POLICY_FULL[letter], scheds, seed=seed)
     for s in feed.initial:
         sim.register_market(s)
     all_specs = {r.ticker: r.spec for r in uni.markets.values() if r.spec is not None}
-    ledger = Ledger({t: s.event_ticker for t, s in all_specs.items()}, {t: s.expiration_ts for t, s in all_specs.items()})
+    # inference clusters = expiration times (audit M5); the event ticker is kept in the ledger
+    ledger = Ledger({t: settlement_cluster(s.expiration_ts) for t, s in all_specs.items()},
+                    {t: s.expiration_ts for t, s in all_specs.items()})
     cap = FillCapture(mm)
     extra = [c(mm) for c in collectors]
+    for c in extra:
+        if hasattr(c, "attach_sim"):
+            c.attach_sim(sim)
+    added: list[str] = [s.ticker for s in feed.initial]
 
     def on_add(batch: list[MarketSpec]) -> None:
         if can_add:
             mm.add_markets(batch)
         for s in batch:
             sim.register_market(s)
+            added.append(s.ticker)
 
     def on_prune(ts: int) -> None:
         if hasattr(mm, "prune_settled"):
@@ -1540,7 +1843,18 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
             ledger.settle[f.ticker] = settle[f.ticker]
             filled_from_rest += 1
     df = ledger.attribute()
+    status = status_columns(uni, t0)
     if len(df):
+        df["event_ticker"] = df["ticker"].map(lambda t: all_specs[t].event_ticker if t in all_specs else t)
+        df["expiration_ns"] = df["ticker"].map(lambda t: all_specs[t].expiration_ts if t in all_specs else 0)
+        df["day"] = (df["ts"].to_numpy(dtype=np.int64) // (86_400 * NS_PER_S)).astype(np.int64)
+        df["weekend"] = pd.to_datetime(df["ts"], unit="ns", utc=True).dt.dayofweek.to_numpy() >= 5
+        bt = [e for e in brti_ticks(root, t0 - _ns(HOUR_S), t1, include_rest=False, cache=uni.cache)
+              if e.feed in ("1hz", "5hz")]
+        df["rv_1h"] = realized_vol_asof(np.array([e.ts for e in bt], dtype=np.int64),
+                                        np.array([e.value for e in bt], dtype=float), df["ts"].to_numpy(dtype=np.int64))
+        for k, v in status.items():
+            df[k] = v
         meta = pd.DataFrame(cap.rows)
         if len(meta) == len(df):
             df = pd.concat([df.reset_index(drop=True), meta.reset_index(drop=True)], axis=1)
@@ -1579,6 +1893,12 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         "mm_top_reasons": dict(sorted(mm.stats.reasons.items(), key=lambda kv: -kv[1])[:8]),
         "sim_stats": dict(sim.stats), "public_contracts": sum(cap.public_qty.values()) / QTY_SCALE,
         "public_contracts_quoted": sum(q for t, q in cap.public_qty.items() if t in {s.ticker for s in specs}) / QTY_SCALE,
+        "public_contracts_quotable": sum(cap.public_qty_quotable.values()) / QTY_SCALE,
+        "latency": describe_latency(lat, uni), "md_latency_ms": lat.dists["md"].median(),
+        "prime_start": stream.prime_start, "books_unprimed_at_t0": len([t for t in stream.unprimed
+                                                                           if t in {s.ticker for s in feed.initial}]),
+        "books_never_valid": sorted(set(added) - cap.had_book),
+        **{f"status_{k}": v for k, v in status.items()},
         "wall_s": wall, "drive_counts": dict(counts), "universe_notes": list(uni.notes),
         "quote_hours": quote_hours(sim, t1 + _ns(tail_s)), "orders": len(sim.orders),
         **fv_info, **flow_info,
@@ -1593,6 +1913,11 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         warns.append("fair-value warm-up used a SYNTHETIC GBM history (vol %g)" % gbm_vol_ann)
     if not specs:
         warns.append("no tradable market specs in the window (check series/enabled_series/fees)")
+    never = summary["books_never_valid"]
+    if never:
+        warns.append(f"{len(never)} of {len(set(added))} quotable market(s) never had a valid order book in the replay "
+                     f"(never quoted), e.g. {', '.join(never[:3])}: no orderbook snapshot within prime_search_s "
+                     f"({prime_search_s / 3600:g} h) before t0 or during the window")
     warns += [w for w in (fv_warn, flow_warn) if w]
     summary["warnings"] = warns
     extras: dict[str, Any] = {"collectors": [c.result() if hasattr(c, "result") else c for c in extra]}
@@ -1620,14 +1945,18 @@ POLICY_FULL = {"A": "optimistic", "B": "realistic", "C": "conservative"}
 
 
 # ============================================================================ spec filters
-@dataclass(frozen=True)
+@dataclass
 class NearestStrikes:
-    """Keep the n strikes of each event nearest to the benchmark at the event's first quotable
-    time (max(availability, expiration - horizon_s)); n <= 0 keeps all. Causal: uses the last
-    BRTI tick received before that time."""
+    """Keep, per event, the n strikes nearest the benchmark at the event's first quotable time
+    t_ref = max(earliest strike availability, earliest expiration - horizon_s, t0), using only the
+    last BRTI tick RECEIVED at or before t_ref (audit C4). A strike listed later is evaluated at
+    its OWN availability time: kept if it is among the n strikes (listed by then) nearest the last
+    tick received at that time. No tick before the reference time -> nothing is kept for that
+    event (never a later price); the event is reported in ``skipped``. n <= 0 keeps all."""
 
     n: int
     horizon_s: float = 3900.0
+    skipped: list[str] = field(default_factory=list, compare=False)
 
     def __call__(self, specs: list[MarketSpec], uni: Universe) -> list[MarketSpec]:
         if self.n <= 0:
@@ -1638,22 +1967,36 @@ class NearestStrikes:
         order = np.argsort(ts, kind="stable")
         ts, vals = ts[order], vals[order]
         avail = uni.availability()
+
+        def spot(t: int) -> float:
+            i = int(np.searchsorted(ts, t, side="right")) - 1
+            return float(vals[i]) if i >= 0 else math.nan
+
+        def dist(s: MarketSpec, S: float) -> float:
+            k = [x for x in (s.floor_strike, s.cap_strike) if x is not None]
+            return abs(float(np.mean(k)) - S) if k and math.isfinite(S) else math.inf
+
         by_event: dict[str, list[MarketSpec]] = defaultdict(list)
         for s in specs:
             by_event[s.event_ticker].append(s)
         keep: list[MarketSpec] = []
+        self.skipped = []
         for ev in sorted(by_event):
             group = by_event[ev]
-            t_ref = max(max(avail.get(s.ticker, uni.t0) for s in group), min(s.expiration_ts for s in group) - _ns(self.horizon_s),
-                        uni.t0)
-            i = int(np.searchsorted(ts, t_ref, side="right")) - 1
-            S = float(vals[i]) if i >= 0 else (float(vals[0]) if len(vals) else math.nan)
-
-            def dist(s: MarketSpec) -> float:
-                k = [x for x in (s.floor_strike, s.cap_strike) if x is not None]
-                return abs(float(np.mean(k)) - S) if k and math.isfinite(S) else math.inf
-
-            keep += sorted(group, key=lambda s: (dist(s), s.ticker))[: self.n]
+            av = {s.ticker: max(avail.get(s.ticker, uni.t0), uni.t0) for s in group}
+            t_ref = max(min(av.values()), min(s.expiration_ts for s in group) - _ns(self.horizon_s), uni.t0)
+            S = spot(t_ref)
+            if not math.isfinite(S):
+                self.skipped.append(ev)
+                continue
+            first = [s for s in group if av[s.ticker] <= t_ref]
+            keep += sorted(first, key=lambda s: (dist(s, S), s.ticker))[: self.n]
+            for s in sorted((s for s in group if av[s.ticker] > t_ref), key=lambda s: (av[s.ticker], s.ticker)):
+                a = av[s.ticker]
+                Sa = spot(a)
+                listed = [x for x in group if av[x.ticker] <= a]
+                if math.isfinite(Sa) and s in sorted(listed, key=lambda x: (dist(x, Sa), x.ticker))[: self.n]:
+                    keep.append(s)
         return sorted(keep, key=lambda s: s.ticker)
 
 
@@ -1703,7 +2046,8 @@ def probe_for_window(root: str | Path, t0: int, t1: int, cfg: StrategyConfig, un
     fv_cfg = universe.fv_config or load_recommended_config()
     fv = FairValueModel.from_config(fv_cfg)
     winfo = warm_fair_value(fv, root, t0, warm, seed=seed, cache=universe.cache, fv_config=fv_cfg)
-    stream = ReplayStream(root, t0, t1, state_warm_s=state_warm_s, own_fills=universe.own_fills, own_filter=own_filter)
+    stream = ReplayStream(root, t0, t1, state_warm_s=state_warm_s, own_fills=universe.own_fills, own_filter=own_filter,
+                          prime_tickers=[s.ticker for s in specs])
     feed = ReplayFeed(stream, universe, specs, add_horizon_s=add_horizon_s if add_horizon_s is not None
                       else cfg.quoting.max_tau_s + 300.0)
     probe = FvProbe(cfg, feed.initial, fv)
