@@ -11,7 +11,13 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from dh.core.units import NS_PER_MS, NS_PER_S, micros_from_dollars, px_from_dollars, qty_from_fp
+from dh.core.units import (
+    NS_PER_MS,
+    NS_PER_S,
+    micros_from_dollars,
+    px_from_dollars,
+    qty_from_fp,
+)
 
 _ISO_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9})\d*)?"
@@ -127,6 +133,11 @@ def number_to_str(value: Any) -> str | None:
     if d == d.to_integral_value():
         return str(d.quantize(Decimal(1)))
     return format(d.normalize(), "f")
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    """value if it is a JSON object, else {} (defensive access to optional sub-objects)."""
+    return value if isinstance(value, dict) else {}
 
 
 def to_decimal(value: Any) -> Decimal:

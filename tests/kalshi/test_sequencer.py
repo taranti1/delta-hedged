@@ -2,8 +2,18 @@ from __future__ import annotations
 
 import orjson
 
-from dh.core.events import FeedStatus, KalshiBookDelta, KalshiBookSnapshot, KalshiFill, KalshiTrade
-from dh.kalshi.sequencer import KalshiWsState, normalize_ws_frame, synthetic_status_frame
+from dh.core.events import (
+    FeedStatus,
+    KalshiBookDelta,
+    KalshiBookSnapshot,
+    KalshiFill,
+    KalshiTrade,
+)
+from dh.kalshi.sequencer import (
+    KalshiWsState,
+    normalize_ws_frame,
+    synthetic_status_frame,
+)
 
 
 def f(obj) -> bytes:
@@ -100,6 +110,16 @@ def test_ok_and_error_responses_consume_sequence_numbers(asyncapi_examples):
     ok = dict(asyncapi_examples["okResponse"][0], sid=1, seq=3)
     evs, st = run([snap(1, 1, "A"), delta(1, 2, "A"), f(ok), delta(1, 4, "A")])
     assert st.counters["gaps"] == 0 and len([e for e in evs if isinstance(e, KalshiBookDelta)]) == 2
+
+
+def test_mid_stream_start_with_ok_first_still_resyncs_books(asyncapi_examples):
+    """Replay from the middle of a session: no 'subscribed' frame, an 'ok' is the sid's first message."""
+    ok = dict(asyncapi_examples["okResponse"][0], sid=4, seq=10)
+    evs, st = run([f(ok), delta(4, 11, "A"), snap(4, 12, "A"), delta(4, 13, "A"), delta(4, 20, "A")])
+    assert st.sids[4].channel == "orderbook_delta"
+    assert ("kalshi.book:A", "gap") in statuses(evs)  # delta before snapshot, then the seq gap
+    assert st.take_resync_requests() == [(4, ("A",)), (4, ("A",))]
+    assert st.sid_for_ticker("A") == 4
 
 
 def test_fill_dedupe(asyncapi_examples):

@@ -399,30 +399,67 @@ def blended_sigma(
 
 @dataclass(frozen=True)
 class VolForecasterConfig:
-    """Configuration of the production vol forecaster (values chosen in docs/research/01)."""
+    """Configuration of the production vol forecaster (values chosen in docs/research/01).
 
-    half_lives_s: tuple[float, ...] = (1800.0, 21600.0)
-    weights: tuple[float, ...] = (0.5, 0.5)
+    half_lives_s        EWMA half-lives (s) of the deseasonalized per-second variance
+    weights             variance weights (used when weights_by_horizon is empty)
+    weights_by_horizon  ((horizon_s, weights), ...) ascending in horizon: the blend weights are
+                        interpolated linearly in the pricing horizon (seconds to expiry) and
+                        clamped outside the knots (HAR-style: short horizons lean on short
+                        half-lives, long horizons on long ones)
+    intercept_var       per-second variance added to the blend (long-run anchor)
+    scale               multiplicative sigma calibration
+    min_dt_s            return sampling interval of the EWMAs (the study validated 60 s)
+    max_dt_s            longer returns are treated as outages (dropped)
+    sigma_floor/cap     clamps on the output sigma (per sqrt(s))
+    """
+
+    half_lives_s: tuple[float, ...] = (600.0, 1800.0, 7200.0, 21600.0, 86400.0)
+    weights: tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2)
+    weights_by_horizon: tuple[tuple[float, tuple[float, ...]], ...] = ()
     intercept_var: float = 0.0
-    scale: float = 1.0  # multiplicative calibration of sigma (variance scaled by scale^2)
-    min_dt_s: float = 1.0
+    scale: float = 1.0
+    min_dt_s: float = 60.0
     max_dt_s: float | None = 600.0
-    sigma_floor: float = 0.0  # per sqrt(s)
+    sigma_floor: float = 0.0
     sigma_cap: float = math.inf
 
     def __post_init__(self) -> None:
-        if len(self.half_lives_s) != len(self.weights) or not self.half_lives_s:
+        n = len(self.half_lives_s)
+        if n == 0 or len(self.weights) != n:
             raise ValueError("half_lives_s and weights must be non-empty and of equal length")
         if any(w < 0 for w in self.weights) or self.intercept_var < 0 or self.scale <= 0:
             raise ValueError("weights/intercept must be >= 0 and scale > 0")
+        hs = [h for h, _ in self.weights_by_horizon]
+        if any(b <= a for a, b in zip(hs, hs[1:])):
+            raise ValueError("weights_by_horizon must be strictly ascending in horizon")
+        for _, w in self.weights_by_horizon:
+            if len(w) != n or any(x < 0 for x in w):
+                raise ValueError("each horizon's weights must match half_lives_s and be >= 0")
+
+    def weights_for(self, horizon_s: float | None) -> tuple[float, ...]:
+        """Blend weights for a pricing horizon (s): linear interpolation between knots."""
+        if not self.weights_by_horizon or horizon_s is None:
+            return self.weights
+        knots = self.weights_by_horizon
+        if horizon_s <= knots[0][0]:
+            return knots[0][1]
+        if horizon_s >= knots[-1][0]:
+            return knots[-1][1]
+        for (h0, w0), (h1, w1) in zip(knots, knots[1:]):
+            if h0 <= horizon_s <= h1:
+                a = (horizon_s - h0) / (h1 - h0)
+                return tuple((1 - a) * x0 + a * x1 for x0, x1 in zip(w0, w1))
+        return knots[-1][1]  # pragma: no cover
 
 
 class VolForecaster:
     """Deseasonalized multi-half-life EWMA blend times the forward seasonal factor.
 
-    sigma(now, until)^2 = scale^2 * mean_f2(now, until) * (intercept + sum_i w_i ewma_i(now))
-    where ewma_i run on deseasonalized returns.  Output in log units per sqrt(second); pass
-    ``sigma_abs = spot * sigma`` to ``dh.models.fairvalue.digital``.
+    sigma(now, until)^2 = scale^2 * mean_f2(now, until) * (intercept + sum_i w_i(h) ewma_i(now))
+    where the ewma_i run on deseasonalized returns and h = until - now is the pricing horizon.
+    Output in log units per sqrt(second); pass ``sigma_abs = spot * sigma`` to
+    ``dh.models.fairvalue.digital``.
     """
 
     def __init__(self, cfg: VolForecasterConfig | None = None, seasonal: SeasonalVol | None = None) -> None:
@@ -442,14 +479,21 @@ class VolForecaster:
     def ready(self) -> bool:
         return all(e.ready for e in self._ewmas)
 
-    def base_sigma(self) -> float:
+    def ewma_sigmas(self) -> list[float]:
+        """Deseasonalized EWMA sigmas (per sqrt(s)), one per half-life."""
+        return [e.sigma() for e in self._ewmas]
+
+    def base_sigma(self, horizon_s: float | None = None) -> float:
         """Deseasonalized blended sigma (per sqrt(s)) before the forward seasonal factor."""
-        return blended_sigma([e.sigma() for e in self._ewmas], self.cfg.weights, self.cfg.intercept_var) * self.cfg.scale
+        w = self.cfg.weights_for(horizon_s)
+        return blended_sigma(self.ewma_sigmas(), w, self.cfg.intercept_var) * self.cfg.scale
 
     def sigma(self, now_ns: int, until_ns: int | None = None) -> float:
         """Sigma per sqrt(s) for pricing the interval [now_ns, until_ns] (default: spot factor)."""
-        ratio = self.seasonal.mean_var_factor(now_ns, until_ns if until_ns is not None else now_ns)
-        s = self.base_sigma() * math.sqrt(ratio)
+        end = until_ns if until_ns is not None else now_ns
+        horizon = max(0.0, (end - now_ns) / NS_PER_S) if until_ns is not None else None
+        ratio = self.seasonal.mean_var_factor(now_ns, end)
+        s = self.base_sigma(horizon) * math.sqrt(ratio)
         if s != s:
             return s
         return min(max(s, self.cfg.sigma_floor), self.cfg.sigma_cap)

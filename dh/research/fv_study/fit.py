@@ -33,8 +33,10 @@ def fit_blend_qlike(X: np.ndarray, y: np.ndarray, max_iter: int = 500) -> np.nda
     Xs = X / sx  # scale columns for conditioning
     w0 = np.full(K, y.mean() / K)
 
+    f_floor = 1e-8 * float(np.mean(y)) if np.mean(y) > 0 else 1e-300
+
     def fun(w):
-        f = np.maximum(Xs @ w, 1e-300)
+        f = np.maximum(Xs @ w, f_floor)
         val = np.mean(y / f + np.log(f))
         g = Xs.T @ (1.0 / f - y / (f * f)) / n
         return val, g

@@ -127,7 +127,7 @@ def test_bitstamp_snapshot_alignment():
 
 
 def test_bitstamp_periodic_resnapshot_refolds_recent_diffs():
-    ev, st = run_fixture("bitstamp")
+    _ev, st = run_fixture("bitstamp")
     norm, _ = normalizer_for("bitstamp.ws")
     body = orjson.dumps({"timestamp": "0", "microtimestamp": str(1790337600 * 10**6 + 1_650_000),
                          "bids": [["84495", "1.0"]], "asks": [["84505", "0.4"]]}).decode()

@@ -199,8 +199,8 @@ def reliability_by_tau(cells: Cells, p: np.ndarray, model: str, bins=None, taus=
     return pd.concat(out, ignore_index=True)
 
 
-TAIL_Q_EDGES = (0.0, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20)
-TAIL_Q_LABELS = ("<0.5%", "0.5-1%", "1-2%", "2-5%", "5-10%", "10-20%")
+TAIL_Q_EDGES = (0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20)
+TAIL_Q_LABELS = ("<0.2%", "0.2-0.5%", "0.5-1%", "1-2%", "2-5%", "5-10%", "10-20%")
 
 
 def tail_calibration(
@@ -252,7 +252,7 @@ def tail_calibration(
 
 
 def exceedance_at_own_sd(
-    P: Panel, R: PeriodResult, model: str, zs=(1.5, 2.0, 2.5, 3.0), n_boot: int = CFG.n_boot, seed: int = 2,
+    P: Panel, R: PeriodResult, model: str, zs=(1.0, 1.5, 2.0, 2.5, 3.0, 3.5), n_boot: int = CFG.n_boot, seed: int = 2,
     taus=CFG.taus_min,
 ) -> pd.DataFrame:
     """Empirical frequency that the proxy lands beyond spot +/- z * (model's own sd).

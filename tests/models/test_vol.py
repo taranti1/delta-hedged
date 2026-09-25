@@ -221,7 +221,7 @@ def test_blended_sigma_and_forecaster():
     now = int(times[-1] * NS_PER_S)
     assert fc.sigma(now) == pytest.approx(ev.sigma(now), rel=1e-12)
     assert fc.sigma_abs(now, now + 600 * NS_PER_S, 2.0) == pytest.approx(2.0 * ev.sigma(now), rel=1e-12)
-    capped = VolForecaster(VolForecasterConfig(half_lives_s=(3600.0,), weights=(1.0,), sigma_cap=1e-6))
+    capped = VolForecaster(VolForecasterConfig(half_lives_s=(3600.0,), weights=(1.0,), min_dt_s=1.0, sigma_cap=1e-6))
     capped.update(0, 100.0)
     capped.update(NS_PER_S, 101.0)
     assert capped.sigma(NS_PER_S) == 1e-6
@@ -236,3 +236,28 @@ def test_blended_sigma_and_forecaster():
     assert s_h10 / s_h0 == pytest.approx(2.0, rel=1e-9)
     with pytest.raises(ValueError):
         VolForecasterConfig(half_lives_s=(1.0, 2.0), weights=(1.0,))
+
+
+def test_horizon_dependent_weights():
+    cfg = VolForecasterConfig(
+        half_lives_s=(600.0, 86400.0),
+        weights=(0.5, 0.5),
+        weights_by_horizon=((120.0, (1.0, 0.0)), (3600.0, (0.2, 0.8))),
+        min_dt_s=1.0,
+    )
+    assert cfg.weights_for(None) == (0.5, 0.5)
+    assert cfg.weights_for(60.0) == (1.0, 0.0)
+    assert cfg.weights_for(7200.0) == (0.2, 0.8)
+    mid = cfg.weights_for(1860.0)
+    assert mid[0] == pytest.approx(0.6) and mid[1] == pytest.approx(0.4)
+    fc = VolForecaster(cfg)
+    fc.update(0, 100.0)
+    fc.update(NS_PER_S, 100.0 * math.exp(1e-3))
+    s_short = fc.sigma(NS_PER_S, NS_PER_S + 60 * NS_PER_S)
+    s_long = fc.sigma(NS_PER_S, NS_PER_S + 3600 * NS_PER_S)
+    # both EWMAs hold the same single sample, so any convex weights give the same sigma
+    assert s_short == pytest.approx(s_long) == pytest.approx(1e-3)
+    with pytest.raises(ValueError):
+        VolForecasterConfig(half_lives_s=(1.0, 2.0), weights=(1.0, 0.0), weights_by_horizon=((10.0, (1.0,)),))
+    with pytest.raises(ValueError):
+        VolForecasterConfig(half_lives_s=(1.0,), weights=(1.0,), weights_by_horizon=((10.0, (1.0,)), (5.0, (1.0,))))

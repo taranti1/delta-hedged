@@ -41,7 +41,6 @@ def main_models(cfg: StudyConfig = CFG) -> list[ModelDef]:
     out += [
         ModelDef("G-blend-raw", "blend_raw", "gauss", "gauss blend"),
         ModelDef("G-blend", "blend", "gauss", "gauss blend"),
-        ModelDef("G-blend-cal", "blend", "gauss_cal", "gauss blend"),
         ModelDef("T-raw-2h", "raw:120", "t", "fat tail"),
         ModelDef("T-blend", "blend", "t", "fat tail"),
         ModelDef("MIX-blend", "blend", "mix", "fat tail"),

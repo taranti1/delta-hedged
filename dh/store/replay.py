@@ -9,10 +9,14 @@
 ``iter_events(root, streams, t0_ns, t1_ns, warmup_ns=0)``
     ``iter_raw`` + on-the-fly normalization with one explicit NormalizerState per stream:
       * external venues (``coinbase.ws``, ``deribit.options``, ...) -> dh.feeds normalizers
-      * ``kalshi.ws``      -> dh.kalshi.normalize.ws_message_to_events(json, t)
+      * ``kalshi.ws``      -> dh.kalshi.sequencer.normalize_ws_frame(raw, t, KalshiWsState) (the
+                              exact code the live KalshiWS runs: per-sid seq checks, synthetic
+                              status frames); falls back to the stateless
+                              dh.kalshi.normalize.ws_message_to_events(json, t) if the
+                              sequencer module does not exist
       * ``kalshi.rest.*``  -> dh.kalshi.normalize.normalize_rest_record(json, t)
       * ``status``, ``events.*`` -> codec-encoded events (dh.store.codec)
-      * ``clock``          -> no events (clock-health samples; read them with iter_raw)
+      * ``clock``, ``meta`` -> no events (clock-health samples, session metadata: iter_raw)
     With ``warmup_ns > 0`` records in [t0 - warmup, t0) are normalized silently and, at t0,
     the tracked state is emitted as synthesized snapshots (dh.feeds.books.BookTracker.
     state_events) before the events from t0 on.
@@ -287,11 +291,31 @@ def _kalshi_fn(name: str) -> Callable[..., list[Event]]:
     return fn
 
 
-class Normalizers:
-    """Per-stream normalizer dispatch with explicit state (one instance per replay)."""
+def _kalshi_sequencer() -> Any | None:
+    """dh.kalshi.sequencer if it exists (None if absent; ReplayError if it is broken)."""
+    try:
+        mod = importlib.import_module("dh.kalshi.sequencer")
+    except ModuleNotFoundError as exc:
+        if exc.name == "dh.kalshi.sequencer":
+            return None
+        raise ReplayError(f"dh.kalshi.sequencer failed to import: {exc!r}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ReplayError(f"dh.kalshi.sequencer failed to import: {exc!r}") from exc
+    if not (hasattr(mod, "normalize_ws_frame") and hasattr(mod, "KalshiWsState")):
+        return None
+    return mod
 
-    def __init__(self, strict: bool = False) -> None:
+
+class Normalizers:
+    """Per-stream normalizer dispatch with explicit state (one instance per replay).
+
+    ``kalshi_use_yes_price`` must match the live KalshiWS setting used when recording
+    (config/kalshi*.yaml ws.use_yes_price, default false).
+    """
+
+    def __init__(self, strict: bool = False, kalshi_use_yes_price: bool = False) -> None:
         self.strict = strict
+        self.kalshi_use_yes_price = kalshi_use_yes_price
         self._fns: dict[str, Callable[[RawRecord], list[Event]]] = {}
         self.states: dict[str, Any] = {}
         self._warned: set[str] = set()
@@ -303,11 +327,16 @@ class Normalizers:
         return fn(rec)
 
     def _resolve(self, stream: str) -> Callable[[RawRecord], list[Event]]:
-        if stream == "clock":
+        if stream in ("clock", "meta"):  # clock-health samples / session metadata: no events
             return lambda rec: []
         if stream == "status" or stream.startswith("events."):
             return _decode_codec
         if stream == "kalshi.ws":
+            seq = _kalshi_sequencer()
+            if seq is not None:
+                kstate = seq.KalshiWsState(use_yes_price=self.kalshi_use_yes_price)
+                self.states[stream] = kstate
+                return lambda rec: _guard(stream, rec, lambda: seq.normalize_ws_frame(rec.data, rec.t, kstate))
             ws_fn = _kalshi_fn("ws_message_to_events")
             return lambda rec: _guard(stream, rec, lambda: ws_fn(_loads(rec.data), rec.t))
         if stream.startswith("kalshi.rest"):

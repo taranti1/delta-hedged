@@ -9,7 +9,7 @@ Every event carries:
 Price/size conventions
   * Kalshi events use exact ints: px in 1e-4 dollars on the YES scale, qty in 0.01 contracts
     (see dh.core.units).  Kalshi's book is published as YES bids and NO bids; adapters keep
-    both sides verbatim (``side='yes'|'no'``) and dh.kalshi.book exposes the YES-book view
+    both sides verbatim (``side='yes'|'no'``) and dh.core.book.KalshiBook exposes the YES-book view
     (a NO bid at q is a YES ask at 1-q).
   * External BTC venues use floats (USD price, BTC size) — they never touch the ledger.
 
@@ -94,6 +94,14 @@ class KalshiMarketLifecycle:
     is_deactivated: bool | None = None
     price_level_structure: str = ""
     price_ranges: tuple[tuple[int, int, int], ...] = ()  # ((start_px, end_px, step_px), ...)
+    # Strike/metadata fields (present on `created` / `metadata_updated`; KXBTC15M sets its
+    # strike after open, so replay must carry them). Empty/None = not present in the message.
+    event_ticker: str = ""
+    strike_type: str = ""
+    floor_strike: float | None = None
+    cap_strike: float | None = None
+    open_ts: int = 0  # ns
+    expected_expiration_ts: int = 0  # ns
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +162,7 @@ class OrderAck:
     order_id: str
     ticker: str
     fill_qty: int  # immediately filled on entry (post_only orders should be 0)
-    remaining_qty: int
+    remaining_qty: int  # -1 = unknown (e.g. amend responses that omit remaining_count)
     request: str = "create"  # create|amend|decrease
 
 
@@ -177,6 +185,32 @@ class CancelAck:
     order_id: str
     ticker: str
     canceled_qty: int  # qty removed from the book by this cancel
+
+
+@dataclass(frozen=True, slots=True)
+class KalshiOrderGroupUpdate:
+    """WS `order_group_updates`: created|triggered|reset|deleted|limit_updated."""
+
+    ts: int
+    ts_exch: int
+    order_group_id: str
+    event_type: str
+    contracts_limit: int = -1  # qty units; -1 = not present
+
+
+@dataclass(frozen=True, slots=True)
+class KalshiPositionSnapshot:
+    """Exchange-reported position (WS `market_positions` or REST /portfolio/positions),
+    used only for reconciliation against the internal ledger."""
+
+    ts: int
+    ts_exch: int
+    ticker: str
+    position: int  # signed YES qty (0.01 units)
+    cost_micros: int = 0
+    realized_pnl_micros: int = 0
+    fees_paid_micros: int = 0
+    source: str = "ws"  # ws|rest
 
 
 # ----------------------------------------------------------------------------- settlement benchmark
@@ -367,6 +401,8 @@ EVENT_TYPES: dict[str, type] = {
         OrderAck,
         OrderReject,
         CancelAck,
+        KalshiOrderGroupUpdate,
+        KalshiPositionSnapshot,
         IndexTick,
         ExtBookSnapshot,
         ExtBookDelta,
@@ -395,6 +431,8 @@ Event = (
     | OrderAck
     | OrderReject
     | CancelAck
+    | KalshiOrderGroupUpdate
+    | KalshiPositionSnapshot
     | IndexTick
     | ExtBookSnapshot
     | ExtBookDelta

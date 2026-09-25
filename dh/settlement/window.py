@@ -182,7 +182,6 @@ def window_state_from_prints(
     k = 0
     s = 0.0
     filled = 0
-    skipped = 0
     last = last_before
     idx_first_unfixed = len(obs)
     for i, t in enumerate(obs):
@@ -195,8 +194,7 @@ def window_state_from_prints(
                 v = last
                 filled += 1
             else:
-                skipped += 1
-                continue
+                continue  # gap_policy == 'skip' (or nothing to carry forward)
         k += 1
         s += v
         last = v

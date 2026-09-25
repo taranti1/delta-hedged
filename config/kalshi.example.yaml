@@ -1,0 +1,55 @@
+# Kalshi adapter configuration (dh.kalshi.config.load_config).
+# Copy to config/kalshi.yaml for local overrides. NEVER put real secrets in the repo: the API
+# key id and private key path are read from the environment by default (secrets/, *.pem and
+# .env are git-ignored).
+env: prod # prod | demo
+
+endpoints:
+  prod:
+    rest: https://external-api.kalshi.com/trade-api/v2 # openapi servers[0]
+    rest_alt: https://api.elections.kalshi.com/trade-api/v2 # "also supported"
+    ws: wss://external-api-ws.kalshi.com/trade-api/ws/v2 # asyncapi servers.production
+  demo:
+    rest: https://external-api.demo.kalshi.co/trade-api/v2 # openapi servers[2]
+    rest_alt: https://demo-api.kalshi.co/trade-api/v2
+    ws: wss://demo-api.kalshi.co/trade-api/ws/v2 # UNVERIFIED: asyncapi lists production only
+
+auth:
+  key_id_env: KALSHI_KEY_ID
+  private_key_path_env: KALSHI_PRIVATE_KEY_PATH
+  key_id: "" # PLACEHOLDER (env var wins when set)
+  private_key_path: ~/.kalshi/PLACEHOLDER_private_key.pem # PLACEHOLDER path, never the key itself
+
+series: [KXBTCD, KXBTC, KXBTC15M]
+index_ids: [BRTI]
+
+rest:
+  timeout_s: 10
+  write_timeout_s: 5 # order writes: timeout -> UnknownOutcome (reconcile, never retried)
+  max_get_retries: 4
+  backoff_base_s: 0.25
+  backoff_max_s: 8
+  cf_history_path: /cfbenchmarks/history/values # CF Benchmarks passthrough (not in openapi)
+  use_env_proxy: true # honour HTTP(S)_PROXY for REST (aiohttp trust_env) and WS
+
+ws:
+  stale_after_s: 15 # no inbound message for this long -> FeedStatus('stale') + reconnect
+  resync_timeout_s: 10 # book resync (get_snapshot) must complete within this
+  backoff_initial_s: 0.5
+  backoff_max_s: 30
+  healthy_reset_s: 30
+  use_yes_price: false # keep NO bids on the NO price scale (normalizer convention)
+  ping_interval_s: 10
+  ping_timeout_s: 10
+
+rate_limits: # conservative defaults, replaced by GET /account/limits at start-up
+  read: { refill_rate: 100, bucket_capacity: 100 }
+  write: { refill_rate: 50, bucket_capacity: 50 }
+
+fees:
+  config: config/fees.yaml
+  balance_precision_dollars: null # override config/fees.yaml, e.g. "0.0001" for direct members
+  apply_fee_waiver: false # zero fees before fee_waiver_expiration_time (unverified; keep false)
+
+history:
+  out_dir: data/external/kalshi

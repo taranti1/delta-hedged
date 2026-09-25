@@ -73,8 +73,8 @@ def reliability_panels(rel: pd.DataFrame, models: list[str], labels: list[str], 
 
 def tail_ratio(tail: pd.DataFrame, models: list[str], labels: list[str], split: str = "all", path: Path | None = None):
     """Realized / predicted tail-event frequency by model tail-probability bucket (log2 axis)."""
-    fig, ax = _fig(6.5, 3.2)
-    order = ["<0.5%", "0.5-1%", "1-2%", "2-5%", "5-10%", "10-20%"]
+    fig, ax = _fig(7.0, 3.2)
+    order = ["<0.2%", "0.2-0.5%", "0.5-1%", "1-2%", "2-5%", "5-10%", "10-20%"]
     x = np.arange(len(order))
     ax.axhline(1.0, color=AXIS, linewidth=1)
     w = 0.22
@@ -86,8 +86,8 @@ def tail_ratio(tail: pd.DataFrame, models: list[str], labels: list[str], split: 
         ax.errorbar(xi[ok], d.ratio_freq_to_p[ok], yerr=yerr[:, ok], fmt=MARKERS[i], color=SERIES[i], markersize=6,
                     markeredgecolor=SURFACE, elinewidth=1.5, capsize=0, label=lab)
     ax.set_yscale("log", base=2)
-    ax.set_yticks([0.25, 0.5, 1, 2, 4])
-    ax.set_yticklabels(["0.25", "0.5", "1", "2", "4"])
+    ax.set_yticks([0.5, 1, 2, 4, 8])
+    ax.set_yticklabels(["0.5", "1", "2", "4", "8"])
     ax.set_xticks(x)
     ax.set_xticklabels(order)
     ax.set_xlabel("model probability of the tail event (bucket)", fontsize=8)

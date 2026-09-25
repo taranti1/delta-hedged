@@ -356,6 +356,11 @@ class Recorder:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def stream_stats(self) -> dict[str, StreamStats]:
+        """Consistent copy of the per-stream counters (records queued so far)."""
+        with self._lock:
+            return {k: StreamStats(v.count, v.bytes, v.first_t, v.last_t) for k, v in self.stats.streams.items()}
+
     def open_segments(self) -> dict[str, Path]:
         return {s: seg.path for s, seg in self._segments.items()}
 

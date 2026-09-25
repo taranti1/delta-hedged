@@ -9,6 +9,7 @@ from scipy import integrate, stats
 from dh.core.market import MarketSpec
 from dh.models import (
     GAUSS,
+    digital_band,
     EmpiricalTail,
     Gauss,
     StudentT,
@@ -332,3 +333,44 @@ def test_digital_vec_matches_scalar():
     assert v.delta[1] == 0.0 and v.delta[2] == 0.0 and v.sd_remaining[2] == 0.0
     with pytest.raises(ValueError):
         digital_vec("greater", spot, sd, GAUSS)
+
+
+def test_nowcast_sd_adds_in_quadrature_and_smooths_the_last_print():
+    spot = 100_000.0
+    ws = ws_(k=59, m=1, tau=0.0, fixed_level=spot)
+    # without nowcast noise the last print is known -> step function; with it -> smooth
+    # average = spot + 0.5/60 = spot + 0.0083 > K = spot + 0.005 (required last print: spot + 0.3)
+    assert digital(spec("greater", spot + 0.005), ws, spot + 0.5, 5.0).p_yes == 1.0
+    d = digital(spec("greater", spot + 0.005), ws, spot + 0.5, 5.0, nowcast_sd=2.0)
+    assert d.z == pytest.approx((0.3 - 0.5) / 2.0)
+    assert 0.5 < d.p_yes < 1.0 and d.delta > 0 and d.sd_remaining == pytest.approx(2.0)
+    # quadrature with the diffusion sd
+    ws2 = ws_(k=0, m=60, tau=100.0)
+    base = digital(spec("greater", spot + 30.0), ws2, spot, 3.0)
+    noisy = digital(spec("greater", spot + 30.0), ws2, spot, 3.0, nowcast_sd=4.0)
+    assert noisy.sd_remaining == pytest.approx(math.hypot(base.sd_remaining, 4.0))
+    v = digital_vec("greater", spot, base.sd_remaining, GAUSS, floor=spot + 30.0, nowcast_sd=4.0)
+    assert v.p_yes[()] == pytest.approx(noisy.p_yes)
+    # all prints fixed: nowcast noise is irrelevant
+    final = WindowState(n_obs=60, k_fixed=60, sum_fixed=60 * spot, m_remaining=0, tau_first_s=0.0, step_s=1.0)
+    assert digital(spec("greater", spot - 1), final, 0.0, 5.0, nowcast_sd=50.0).p_yes == 1.0
+    with pytest.raises(ValueError):
+        digital(spec("greater", spot), ws2, spot, 3.0, nowcast_sd=-1.0)
+
+
+def test_digital_band_brackets_scenarios():
+    spot, sig = 100_000.0, 4.0
+    ws = ws_(k=0, m=60, tau=600.0)
+    sd = sig * math.sqrt(remaining_avg_variance_time(ws))
+    sp = spec("greater", spot + 2.2 * sd)
+    b = digital_band(sp, ws, spot, [sig, 0.8 * sig, 1.25 * sig], [StudentT(4.5), GAUSS], nowcast_sd_values=[0.0, 5.0])
+    ps = [digital(sp, ws, spot, s_, t, nowcast_sd=n).p_yes for s_ in (sig, 0.8 * sig, 1.25 * sig)
+          for t in (StudentT(4.5), GAUSS) for n in (0.0, 5.0)]
+    assert b.p_lo == pytest.approx(min(ps)) and b.p_hi == pytest.approx(max(ps))
+    assert b.p_lo <= b.center.p_yes <= b.p_hi
+    assert b.center.p_yes == pytest.approx(digital(sp, ws, spot, sig, StudentT(4.5)).p_yes)
+    # at the money the band collapses for symmetric models (vol does not move P = 0.5)
+    atm = digital_band(spec("greater", spot), ws, spot, [sig, 2 * sig], [GAUSS, StudentT(3.0)])
+    assert atm.p_lo == pytest.approx(0.5) and atm.p_hi == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        digital_band(sp, ws, spot, [], [GAUSS])

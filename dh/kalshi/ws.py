@@ -22,6 +22,8 @@ Behaviour
     reconnect. (Set None for quiet private-only connections.)
   * Reconnect: exponential backoff with jitter (seeded rng), full resubscribe including
     markets/indices added at runtime. Terminal channel errors (codes 10, 25) also recycle.
+  * ``on_message(msg)`` (optional) receives every parsed exchange message after its events,
+    e.g. for MarketRegistry.apply_metadata_update on 'metadata_updated' bodies.
   * Heartbeat: Kalshi pings every 10 s; the websockets library answers pings with pongs
     automatically and we also ping (``ping_interval``) so a dead link is detected. Keep the
     ``emit`` callback fast: a full receive queue pauses reading (and thus pongs).
@@ -49,6 +51,7 @@ from dh.kalshi.sequencer import (
     normalize_ws_message,
     synthetic_status_frame,
 )
+from dh.kalshi.wire import as_dict
 
 PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 DEMO_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
@@ -59,6 +62,8 @@ TERMINAL_ERROR_CODES = frozenset({10, 25})
 
 RawCallback = Callable[[str, int, bytes], None]
 EventCallback = Callable[[Event], None]
+MessageCallback = Callable[[dict[str, Any]], None]
+MAX_PENDING_COMMANDS = 4096
 
 
 class WSConnection(Protocol):
@@ -166,6 +171,7 @@ class KalshiWS:
         use_yes_price: bool = False,
         ws_path: str = WS_PATH,
         stream: str = STREAM,
+        on_message: MessageCallback | None = None,
     ) -> None:
         self.url = url
         self.signer = signer
@@ -186,6 +192,7 @@ class KalshiWS:
         self.use_yes_price = use_yes_price
         self.ws_path = ws_path
         self.stream = stream
+        self.on_message = on_message  # parsed exchange messages (e.g. metadata_updated bodies)
         self.state = KalshiWsState(use_yes_price=use_yes_price)
         self._emit: EventCallback = on_event or (lambda ev: None)
         self._conn: WSConnection | None = None
@@ -193,6 +200,7 @@ class KalshiWS:
         self._next_id = 0
         self._pending: dict[int, tuple[str, int | None]] = {}  # cmd id -> (cmd, sub index)
         self._sub_sids: dict[int, dict[str, int]] = {}  # sub index -> channel -> sid
+        self._sub_sent: dict[int, tuple[list[str], list[str]]] = {}  # sub index -> (tickers, index_ids) in subscribe
         self._resync_since: dict[tuple[int, str], float] = {}
         self.connects = 0
         self.stats: dict[str, int] = {"frames": 0, "events": 0, "commands": 0}
@@ -227,6 +235,7 @@ class KalshiWS:
             started = self._mono()
             self._pending.clear()
             self._sub_sids.clear()
+            self._sub_sent.clear()
             self._resync_since.clear()
             self._synthetic("connected", self.url)
             reason = "closed"
@@ -328,6 +337,9 @@ class KalshiWS:
         if params is not None:
             payload["params"] = params
         self._pending[cid] = (cmd, sub_index)
+        if len(self._pending) > MAX_PENDING_COMMANDS:  # replies are not always 1:1; keep it bounded
+            for old in sorted(self._pending)[: len(self._pending) - MAX_PENDING_COMMANDS]:
+                del self._pending[old]
         self.stats["commands"] += 1
         await conn.send(orjson.dumps(payload).decode())
         return cid
@@ -346,7 +358,26 @@ class KalshiWS:
         return None
 
     async def _send_subscribe(self, idx: int) -> None:
-        await self.send_command("subscribe", self.subscriptions[idx].params(self.use_yes_price), sub_index=idx)
+        sub = self.subscriptions[idx]
+        self._sub_sent[idx] = (list(sub.market_tickers), list(sub.index_ids))
+        await self.send_command("subscribe", sub.params(self.use_yes_price), sub_index=idx)
+
+    async def _sync_new_sid(self, idx: int, channel: str, sid: int) -> None:
+        """Markets/indices changed between our subscribe and its 'subscribed' reply: send the
+        difference now so the server-side subscription matches ``self.subscriptions``."""
+        sub = self.subscriptions[idx]
+        sent_t, sent_i = self._sub_sent.get(idx, ([], []))
+        if channel in MARKET_CHANNELS:
+            add = [t for t in sub.market_tickers if t not in sent_t]
+            rm = [t for t in sent_t if t not in sub.market_tickers]
+            if add:
+                await self.send_command("update_subscription", {"sid": sid, "market_tickers": add, "action": "add_markets"})
+            if rm:
+                await self.send_command("update_subscription", {"sid": sid, "market_tickers": rm, "action": "delete_markets"})
+        if channel in INDEX_CHANNELS:
+            add = [i for i in sub.index_ids if i not in sent_i]
+            if add:
+                await self.send_command("update_subscription", {"sid": sid, "action": "subscribe_indices", "index_ids": add})
 
     async def _update_markets(self, idx: int, tickers: list[str], action: str) -> None:
         if not self.connected:
@@ -387,20 +418,31 @@ class KalshiWS:
     async def _pump(self, conn: WSConnection) -> None:
         last = self._mono()
         while self._running:
-            timeout = None if self.stale_after_s is None else max(0.0, self.stale_after_s - (self._mono() - last))
+            now = self._mono()
+            limits = []
+            if self.stale_after_s is not None:
+                limits.append(self.stale_after_s - (now - last))
+            if self._resync_since:
+                limits.append(min(self._resync_since.values()) + self.resync_timeout_s - now)
+            timeout = max(0.0, min(limits)) if limits else None
             try:
                 if timeout is None:
                     frame = await conn.recv()
                 else:
                     frame = await asyncio.wait_for(conn.recv(), timeout)
             except asyncio.TimeoutError:
-                self._synthetic("stale", f"no message for {self.stale_after_s}s")
-                raise _Recycle("stale") from None
+                self._check_resync_timeout()  # raises _Recycle when a resync is overdue
+                if self.stale_after_s is not None and self._mono() - last >= self.stale_after_s:
+                    self._synthetic("stale", f"no message for {self.stale_after_s}s")
+                    raise _Recycle("stale") from None
+                continue
             last = self._mono()
             self.stats["frames"] += 1
             raw = frame.encode("utf-8") if isinstance(frame, str) else bytes(frame)
             msg = self._handle_raw(raw)
             if msg is not None:
+                if self.on_message is not None:
+                    self.on_message(msg)
                 await self._control(msg)
             for sid, tickers in self.state.take_resync_requests():
                 await self._send_get_snapshot(sid, list(tickers))
@@ -409,21 +451,21 @@ class KalshiWS:
     async def _control(self, msg: dict[str, Any]) -> None:
         typ = msg.get("type")
         if typ == "subscribed":
-            body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
+            body = as_dict(msg.get("msg"))
             cid = msg.get("id")
             pend = self._pending.get(int(cid)) if cid is not None else None
             if pend is not None and pend[1] is not None and body.get("sid") is not None:
-                self._sub_sids.setdefault(pend[1], {})[str(body.get("channel"))] = int(body["sid"])
+                channel, sid = str(body.get("channel")), int(body["sid"])
+                self._sub_sids.setdefault(pend[1], {})[channel] = sid
+                await self._sync_new_sid(pend[1], channel, sid)
         elif typ == "error":
-            body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
-            try:
-                code = int(body.get("code"))
-            except (TypeError, ValueError):
-                code = -1
+            body = as_dict(msg.get("msg"))
+            raw_code = body.get("code")
+            code = int(raw_code) if isinstance(raw_code, (int, str)) and str(raw_code).lstrip("-").isdigit() else -1
             if code in TERMINAL_ERROR_CODES:
                 raise _Recycle(f"terminal channel error code={code}")
         elif typ == "orderbook_snapshot":
-            body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
+            body = as_dict(msg.get("msg"))
             if msg.get("sid") is not None and body.get("market_ticker"):
                 self._resync_since.pop((int(msg["sid"]), str(body["market_ticker"])), None)
 
@@ -435,7 +477,7 @@ class KalshiWS:
         for (sid, t), since in list(self._resync_since.items()):
             if t not in invalid.get(sid, set()):
                 self._resync_since.pop((sid, t), None)
-            elif now - since > self.resync_timeout_s:
+            elif now - since >= self.resync_timeout_s:
                 raise _Recycle(f"resync timeout sid={sid} ticker={t}")
 
 

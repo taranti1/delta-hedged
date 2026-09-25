@@ -225,3 +225,23 @@ def test_memory_is_bounded():
     assert len(tr._t5) < 5 * (600 + 60) + 4200
     ws = tr.window_state(SPEC, T, T - S)
     assert ws.k_fixed == 59
+
+
+def test_index_mismatch_and_all_skipped_window():
+    tr = SettlementTracker(gap_policy="skip")
+    with pytest.raises(ValueError):
+        tr.window_state(SettlementSpec(index_id="ETHUSD_RTI"), T, T)
+    # only prints after the window: every observation is missing and skipped
+    tr.on_index(tick(T + 5 * S, 1.0))
+    with pytest.raises(ValueError):
+        tr.window_state(SPEC, T, T + 10 * S)
+    assert tr.latest_src_ns == T + 5 * S and tr.latest_value() == 1.0
+
+
+def test_latest_value_prefers_newest_source_time():
+    tr = SettlementTracker()
+    tr.on_index(tick(T - 2 * S, 10.0))
+    tr.on_index(tick(T - 1 * S - 400 * NS_PER_MS, 11.0, feed="5hz"))
+    assert tr.latest_value() == 11.0
+    tr.on_index(tick(T - 1 * S, 12.0))
+    assert tr.latest_value() == 12.0

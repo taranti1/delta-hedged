@@ -36,25 +36,21 @@ def simulate_proxy(lams=(0.05, 0.2, 0.5, 1.0, 3.0), half_spread=(0.0, 0.05), n_p
             trades = rng.random((n_paths, n_steps + 1)) < lam * dt
             noise = hs * rng.choice([-1.0, 1.0], size=(n_paths, n_steps + 1))
             px = W + noise
-            first_min = np.zeros(n_steps + 1, dtype=bool)
-            first_min[: steps_per_min] = True
-            o = np.empty(n_paths)
-            h = np.empty(n_paths)
-            l = np.empty(n_paths)
-            c = np.empty(n_paths)
-            cprev = np.empty(n_paths)
-            ccur_close = np.empty(n_paths)
-            for i in range(n_paths):
-                tp = np.flatnonzero(trades[i, :steps_per_min])
-                cp = px[i, tp[-1]] if tp.size else W[i, 0]
-                ts = np.flatnonzero(trades[i, steps_per_min:n_steps]) + steps_per_min
-                if ts.size:
-                    seg = px[i, ts]
-                    o[i], h[i], l[i], c[i] = seg[0], seg.max(), seg.min(), seg[-1]
-                else:
-                    o[i] = h[i] = l[i] = c[i] = cp
-                cprev[i] = cp
-                ccur_close[i] = c[i]
+            ar = np.arange(n_paths)
+            tp = trades[:, :steps_per_min]
+            hasp = tp.any(axis=1)
+            lastp = steps_per_min - 1 - np.argmax(tp[:, ::-1], axis=1)
+            cprev = np.where(hasp, px[ar, lastp], W[:, 0])
+            seg = px[:, steps_per_min:n_steps]
+            tr = trades[:, steps_per_min:n_steps]
+            has = tr.any(axis=1)
+            fi = np.argmax(tr, axis=1)
+            la = seg.shape[1] - 1 - np.argmax(tr[:, ::-1], axis=1)
+            o = np.where(has, seg[ar, fi], cprev)
+            c = np.where(has, seg[ar, la], cprev)
+            h = np.where(has, np.max(np.where(tr, seg, -np.inf), axis=1), cprev)
+            l = np.where(has, np.min(np.where(tr, seg, np.inf), axis=1), cprev)
+            ccur_close = c
             ohlc4 = (o + h + l + c) / 4
             err = ohlc4 - avg
             var_cc = np.var(ccur_close - cprev)

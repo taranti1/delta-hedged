@@ -160,7 +160,7 @@ def test_feed_config_from_mapping_and_registry():
     with pytest.raises(ValueError):
         build_feed("coinbase", {"stream": "kraken.ws"})
     assert venue_of("deribit.options") == "deribit"
-    fn, st = normalizer_for("deribit.options")
+    _fn, st = normalizer_for("deribit.options")
     assert st.stream == "deribit.options" and st.venue == "deribit"
     with pytest.raises(KeyError):
         feed_class("nope")

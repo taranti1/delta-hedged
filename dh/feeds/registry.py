@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from dh.core.events import Event
@@ -62,10 +63,11 @@ def normalizer_for(stream: str) -> tuple[Normalizer, NormalizerState]:
 
 
 def build_feed(name: str, spec: dict[str, Any], **kw: Any) -> FeedClient:
-    """Instantiate a FeedClient from a config/feeds.yaml entry.
+    """Instantiate a FeedClient from a config/feeds.yaml ``feeds.<name>`` entry.
 
-    ``name`` is the config key; ``spec['venue']`` defaults to the key's prefix before '_' is
-    NOT assumed: set ``venue`` explicitly when the key differs from the venue name.
+    ``spec['venue']`` names the venue class and defaults to the config key ``name`` (set it
+    explicitly for extra connections such as ``deribit_options: {venue: deribit, ...}``).
+    Keys that are not FeedConfig fields become venue ``options``.
     """
     spec = dict(spec)
     venue = spec.pop("venue", name)
@@ -76,3 +78,35 @@ def build_feed(name: str, spec: dict[str, Any], **kw: Any) -> FeedClient:
     if venue_of(cfg.stream) != venue:
         raise ValueError(f"feed {name}: stream {cfg.stream!r} must start with '{venue}.'")
     return cls(cfg, **kw)
+
+
+def load_feeds_config(path: str | Path) -> dict[str, Any]:
+    """Parse config/feeds.yaml (see that file for the schema)."""
+    import yaml
+
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    cfg.setdefault("feeds", {})
+    return cfg
+
+
+def build_feeds(
+    cfg: dict[str, Any], only: list[str] | None = None, include_disabled: bool = False, **kw: Any
+) -> dict[str, FeedClient]:
+    """{config key: FeedClient} for enabled (or ``only``-selected) feeds, in config order.
+
+    ``only`` matches config keys, venue names or stream names.
+    """
+    out: dict[str, FeedClient] = {}
+    for name, spec in (cfg.get("feeds") or {}).items():
+        spec = dict(spec or {})
+        venue = spec.get("venue", name)
+        stream = spec.get("stream") or ""
+        if only is not None:
+            if not ({name, venue, stream} & set(only)):
+                continue
+        elif not include_disabled and not spec.get("enabled", True):
+            continue
+        spec.pop("enabled", None)
+        out[name] = build_feed(name, spec, **kw)
+    return out

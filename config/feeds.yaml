@@ -1,0 +1,149 @@
+# Market-data collector configuration (scripts/record.py; scripts/smoke_feeds.py reads `feeds`).
+#
+# Raw capture layout: <root>/raw/<stream>/<YYYY-MM-DD>/<HH>.jsonl.zst (UTC hour of receive time),
+# one JSON line per frame {"t": recv_ns, "s": stream, "q": seq, "d": raw}; see dh/store/recorder.py.
+#
+# Every venue adapter was written offline from the venue's documented public API (egress to
+# exchanges was blocked in the build environment). Before trusting a venue, run:
+#     python scripts/smoke_feeds.py --venues <name> --seconds 60
+# and check the "ASSUMED WIRE FORMAT" block at the top of dh/feeds/<venue>.py.
+#
+# Per-feed keys: enabled, venue (defaults to the key), stream (<venue>.<suffix>), url, symbols,
+# channels, stale_after_s, dead_after_s, resnapshot_interval_s (0 = never), keepalive_interval_s,
+# max_frame_bytes, backoff_initial_s, backoff_max_s, proxy (true = from env, null = direct);
+# any other key is a venue option (e.g. depth, interval, option_expiries).
+
+root: data
+
+recorder:
+  flush_interval_s: 1.0     # one independent zstd frame per stream per flush: a crash loses <= 1 s
+  fsync_interval_s: 30.0    # also fsync'ed on hourly rotation and on shutdown
+  zstd_level: 3
+  rotation: hourly_utc      # informational: fixed by the on-disk format
+
+clock:
+  sample_interval_s: 60     # chronyc / timedatectl / adjtimex offset -> stream 'clock'
+
+status_interval_s: 60       # status line: msgs/s per stream, last message age, gaps, reconnects
+
+supervisor:
+  restart_backoff_initial_s: 1
+  restart_backoff_max_s: 60
+
+feeds:
+  # ------------------------------------------------------------------ BRTI spot constituents
+  coinbase:
+    enabled: true
+    stream: coinbase.ws
+    url: wss://advanced-trade-ws.coinbase.com
+    symbols: [BTC-USD]
+    channels: [level2, market_trades, heartbeats]
+    resnapshot_interval_s: 3600   # unsubscribe/subscribe level2 hourly (fresh snapshot)
+  kraken:
+    enabled: true
+    stream: kraken.ws
+    url: wss://ws.kraken.com/v2
+    symbols: [BTC/USD]
+    channels: [book, trade]
+    depth: 100                    # CRC32-checked top-10; book truncated to this depth
+    resnapshot_interval_s: 3600
+  bitstamp:
+    enabled: true
+    stream: bitstamp.ws
+    url: wss://ws.bitstamp.net
+    symbols: [btcusd]
+    channels: [diff_order_book, live_trades]
+    resnapshot_interval_s: 3600   # REST order_book snapshot (diff channel has no sequence)
+    snapshot_delay_s: 1.5
+  gemini:
+    enabled: true
+    stream: gemini.ws
+    url: wss://api.gemini.com/v2/marketdata
+    symbols: [BTCUSD]
+    channels: [l2]
+    resnapshot_interval_s: 3600   # by reconnect (see dh/feeds/gemini.py)
+  cryptocom:
+    enabled: true
+    stream: cryptocom.ws
+    url: wss://stream.crypto.com/exchange/v1/market
+    symbols: [BTC_USD]
+    channels: [book, trade]
+    depth: 50
+    resnapshot_interval_s: 3600
+  paxos:                          # itBit/Paxos: EXPERIMENTAL, unverified wire format
+    enabled: false
+    stream: paxos.ws
+  bullish:                        # stub (TODO in dh/feeds/stubs.py)
+    enabled: false
+  lmax:                           # stub (no free public feed known)
+    enabled: false
+
+  # ------------------------------------------------------------------ perps / options
+  deribit:
+    enabled: true
+    stream: deribit.ws
+    url: wss://www.deribit.com/ws/api/v2
+    symbols: [BTC-PERPETUAL]
+    channels: [book, ticker, trades, index, dvol]
+    interval: 100ms
+    index_name: btc_usd
+    resnapshot_interval_s: 3600
+  deribit_options:
+    venue: deribit
+    enabled: true
+    stream: deribit.options
+    url: wss://www.deribit.com/ws/api/v2
+    symbols: []
+    channels: [options]
+    currency: BTC
+    option_expiries: 2            # nearest N expiries
+    option_moneyness: 0.10        # |K/S - 1| <= 10%
+    option_max: 300
+    option_interval: 100ms        # ticker.<instrument>.<interval>; "agg2" for fewer messages
+    rediscover_s: 900
+    resnapshot_interval_s: 0
+    stale_after_s: 30
+  binance_futures:                # GEO-RESTRICTED (HTTP 451 from the US): enable only where allowed
+    enabled: false
+    stream: binance_futures.ws
+    symbols: [BTCUSDT]
+    channels: [bookTicker, aggTrade, markPrice, forceOrder]
+    # url: wss://fstream.binance.com/stream?streams=...   (built from symbols/channels if unset)
+  bybit:
+    enabled: true
+    stream: bybit.ws
+    url: wss://stream.bybit.com/v5/public/linear
+    symbols: [BTCUSDT]
+    channels: [orderbook, publicTrade, tickers, allLiquidation]
+    depth: 50
+    resnapshot_interval_s: 3600
+  okx:
+    enabled: true
+    stream: okx.ws
+    url: wss://ws.okx.com:8443/ws/v5/public
+    symbols: [BTC-USDT-SWAP]
+    channels: [books5, trades, funding-rate, mark-price, open-interest, index-tickers, liquidation-orders]
+  hyperliquid:
+    enabled: true
+    stream: hyperliquid.ws
+    url: wss://api.hyperliquid.xyz/ws
+    symbols: [BTC]
+    channels: [l2Book, trades, activeAssetCtx]
+  kalshi_perp:                    # interface stub: Kalshi Perps specs not yet available
+    enabled: false
+
+# ------------------------------------------------------------------ Kalshi (dh.kalshi adapter)
+kalshi:
+  enabled: true
+  config: null                    # dh.kalshi.config.load_config path; null = config/kalshi.yaml or the example
+  env: null                       # prod | demo (null = from the kalshi config)
+  series: [KXBTCD, KXBTC, KXBTC15M]
+  market_channels: [orderbook_delta, trade, ticker]
+  lifecycle_channels: [market_lifecycle_v2]   # all markets (new-market discovery + settlements)
+  index_channels: [cfbenchmarks_value, cfbenchmarks_value_5hz]
+  index_ids: [BRTI]
+  market_horizon_h: 30            # subscribe to open markets closing within this many hours (0 = all)
+  market_refresh_s: 300           # REST re-discovery of open markets (plus lifecycle-triggered refresh)
+  rest_orderbook_interval_s: 60   # periodic REST order-book snapshots of subscribed markets (0 = off)
+  cf_history_interval_s: 0        # >0: poll the CF Benchmarks REST passthrough (BRTI history)
+  cf_history_timespan: null

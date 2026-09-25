@@ -205,6 +205,7 @@ def digital_vec(
     k_fixed: ArrayLike = 0,
     sum_fixed: ArrayLike = 0.0,
     drift_abs: ArrayLike = 0.0,
+    nowcast_sd: ArrayLike = 0.0,
 ) -> DigitalArrays:
     """Vectorized fair value and greeks (numpy broadcasting over all array arguments).
 
@@ -215,13 +216,15 @@ def digital_vec(
     floor, cap   strike(s) ($) as required by the strike type
     n_obs, k_fixed, sum_fixed   window accounting (m = n_obs - k_fixed)
     drift_abs    expected change of R vs spot ($)
+    nowcast_sd   sd ($) of spot vs the true current benchmark (basis / latency noise); added
+                 in quadrature: sd_total = sqrt(sd^2 + nowcast_sd^2)
     Returns DigitalArrays (p_yes, delta per $, gamma per $^2, sd_remaining $, z, z_cap).
     """
     if strike_type not in SUPPORTED_STRIKE_TYPES:
         raise ValueError(f"unsupported strike_type {strike_type!r}")
     tail = make_tail(tail)
     spot_a = np.asarray(spot, dtype=np.float64)
-    sd_a = np.asarray(sd, dtype=np.float64)
+    sd_a = np.sqrt(np.asarray(sd, dtype=np.float64) ** 2 + np.asarray(nowcast_sd, dtype=np.float64) ** 2)
     n = np.asarray(n_obs, dtype=np.float64)
     k = np.asarray(k_fixed, dtype=np.float64)
     sfix = np.asarray(sum_fixed, dtype=np.float64)
@@ -286,6 +289,7 @@ def digital(
     sigma_abs: float,
     tail: TailModel | str | None = "gauss",
     drift_abs: float = 0.0,
+    nowcast_sd: float = 0.0,
 ) -> Digital:
     """Fair value and greeks of one YES contract of ``spec`` given the window state.
 
@@ -293,6 +297,9 @@ def digital(
     sigma_abs  benchmark volatility in $ per sqrt(second) (= spot * log-vol per sqrt(s))
     tail       TailModel or config string ('gauss', 'student_t(5)', 'vol_mixture(0.5)')
     drift_abs  expected change of the remaining average vs spot ($), usually 0
+    nowcast_sd sd ($) of spot vs the true current benchmark value (venue basis, feed latency);
+               added in quadrature to the sd of R.  Keeps the price and greeks finite in the
+               last seconds, when the diffusion sd of R goes to zero.
     Returns Digital(p_yes, delta [per $], gamma [per $^2], sd_remaining [$], z, z_cap).
     Edge cases: m_remaining == 0 -> exact payoff of the fixed average, delta = gamma = 0;
     sigma_abs == 0 -> deterministic with R = spot + drift_abs.
@@ -300,7 +307,11 @@ def digital(
     if not (sigma_abs >= 0.0):
         raise ValueError("sigma_abs must be >= 0")
     tail_m = make_tail(tail)
+    if not (nowcast_sd >= 0.0):
+        raise ValueError("nowcast_sd must be >= 0")
     sd = remaining_sd(ws, sigma_abs)
+    if ws.m_remaining > 0 and nowcast_sd > 0.0:
+        sd = math.sqrt(sd * sd + nowcast_sd * nowcast_sd)
     if ws.m_remaining == 0 or sd <= 0.0:
         v = ws.sum_fixed / ws.n_obs if ws.m_remaining == 0 else (ws.sum_fixed + ws.m_remaining * (spot + drift_abs)) / ws.n_obs
         yes = spec.yes_wins(v)
@@ -328,6 +339,44 @@ def digital(
     return Digital(float(p), float(d), float(g), sd, float(zf), float(zc))
 
 
+@dataclass(frozen=True, slots=True)
+class DigitalBand:
+    """Range of P(YES) over model-uncertainty scenarios, plus the central Digital."""
+
+    p_lo: float
+    p_hi: float
+    center: Digital
+
+
+def digital_band(
+    spec: MarketSpec,
+    ws: WindowState,
+    spot: float,
+    sigma_abs_values: tuple[float, ...] | list[float],
+    tails: tuple | list = ("gauss",),
+    drift_abs: float = 0.0,
+    nowcast_sd_values: tuple[float, ...] | list[float] = (0.0,),
+) -> DigitalBand:
+    """Fair-value band [p_lo, p_hi] over every combination of the given scenarios.
+
+    sigma_abs_values  e.g. (central, low, high) $ vols per sqrt(second)
+    tails             e.g. (fitted Student-t, Gauss)
+    nowcast_sd_values e.g. (central, stressed) nowcast error sds ($)
+    The first element of each list defines ``center``.  Used for the quoting band of
+    docs/MODELS.md section 1 (bids against p_lo, asks against p_hi).
+    """
+    if not sigma_abs_values or not tails or not nowcast_sd_values:
+        raise ValueError("each scenario list needs at least one element")
+    center = digital(spec, ws, spot, sigma_abs_values[0], tails[0], drift_abs, nowcast_sd=nowcast_sd_values[0])
+    lo = hi = center.p_yes
+    for sa in sigma_abs_values:
+        for t in tails:
+            for ns in nowcast_sd_values:
+                p = digital(spec, ws, spot, sa, t, drift_abs, nowcast_sd=ns).p_yes
+                lo, hi = min(lo, p), max(hi, p)
+    return DigitalBand(p_lo=lo, p_hi=hi, center=center)
+
+
 def hedge_notional_usd(delta: float, spot: float, contracts: float = 1.0) -> float:
     """BTC hedge notional ($) for ``contracts`` YES contracts: |delta| * spot * contracts."""
     return abs(delta) * spot * contracts
@@ -336,6 +385,8 @@ def hedge_notional_usd(delta: float, spot: float, contracts: float = 1.0) -> flo
 __all__ = [
     "Digital",
     "DigitalArrays",
+    "DigitalBand",
+    "digital_band",
     "TailModel",
     "Gauss",
     "StudentT",

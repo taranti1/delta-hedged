@@ -19,6 +19,8 @@ WebSocket message types (asyncapi 2.0.0) and their mapping:
                                'metadata_updated' -> KalshiMarketLifecycle(event_type=
                                'metadata_updated') only: the core event has no strike fields,
                                consumers must refresh the market spec (dh.kalshi.metadata).
+                               Likewise 'created' strikes (additional_metadata) are not
+                               representable: the registry refreshes created markets.
   event_fee_update          -> KalshiFeeUpdate
   order_group_updates       -> FeedStatus(stream='kalshi.order_group:<id>') for 'triggered'
                                (status 'error': group orders canceled, entry blocked) and
@@ -61,9 +63,15 @@ from dh.core.events import (
     KalshiTrade,
     Settlement,
 )
-from dh.core.market import SUPPORTED_STRIKE_TYPES, MarketSpec, PriceRange, SettlementSpec
+from dh.core.market import (
+    SUPPORTED_STRIKE_TYPES,
+    MarketSpec,
+    PriceRange,
+    SettlementSpec,
+)
 from dh.core.units import PX_SCALE, px_from_dollars, qty_from_fp
 from dh.kalshi.wire import (
+    as_dict,
     epoch_to_ns,
     iso_to_ns,
     ms_to_ns,
@@ -121,7 +129,7 @@ def ws_message_to_events(msg: dict, recv_ns: int, *, use_yes_price: bool = False
 
 def ws_error_status(msg: dict, recv_ns: int) -> FeedStatus:
     """WS error response -> FeedStatus('error') with code/message/id/sid in detail."""
-    body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
+    body = as_dict(msg.get("msg"))
     parts = [f"code={body.get('code')}", f"msg={body.get('msg')!s}"]
     for k in ("id", "sid"):
         if msg.get(k) is not None:
@@ -451,7 +459,7 @@ def _cf_1hz(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
     value = to_float(frame.get("value"))
     if value is None:
         value = to_float(m.get("value_usd", m.get("value")))
-    avg = m.get("avg_60s_data") if isinstance(m.get("avg_60s_data"), dict) else {}
+    avg = as_dict(m.get("avg_60s_data"))
     qh = m.get("last_60s_windowed_average_15min")
     qh = qh if isinstance(qh, dict) else None
     src_ns = epoch_to_ns(frame.get("time")) if frame.get("time") not in (None, "") else 0
@@ -779,7 +787,9 @@ def rest_market_to_spec(
     KXBTC* series, else UnsupportedMarket. Raises UnsupportedMarket for unsupported strike
     types, missing strikes or a missing tick grid.
     """
-    from dh.kalshi.fees import resolve_fee_fields  # local import: fees does not import us
+    from dh.kalshi.fees import (
+        resolve_fee_fields,  # local import: fees does not import us
+    )
 
     ticker = str(market["ticker"])
     strike_type = str(market.get("strike_type") or "")

@@ -58,7 +58,7 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Coroutine, Iterable, Sequence
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, ClassVar
@@ -475,6 +475,7 @@ class FeedConfig:
     open_timeout_s: float = 15.0
     resync_min_interval_s: float = 5.0
     online_normalize: bool = True
+    proxy: str | bool | None = True  # websockets proxy: True = from environment, None = direct
 
     @classmethod
     def from_mapping(cls, m: dict[str, Any] | None) -> FeedConfig:
@@ -708,15 +709,18 @@ class FeedClient(ABC):
         while not self._stopping:
             started = time.monotonic()
             reason = "closed"
+            conn_before = self.conn_id
             try:
                 await self._run_connection()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - every failure leads to a reconnect
                 reason = f"{type(exc).__name__}: {exc}"[:300]
-                self.metrics.errors += 1
                 self.metrics.last_error = reason
                 log.warning("%s: connection ended: %s", self.name, reason)
+                if self.conn_id == conn_before and not self._stopping:
+                    # never connected: record the failed attempt so outages are visible in data
+                    self._marker("status", status="error", detail=f"connect failed: {reason}"[:300])
             if self._stopping:
                 break
             if time.monotonic() - started >= self.cfg.stable_after_s:
@@ -737,6 +741,7 @@ class FeedClient(ABC):
             open_timeout=self.cfg.open_timeout_s,
             close_timeout=3,
             max_queue=1024,
+            proxy=self.cfg.proxy,
         )
 
     async def _run_connection(self) -> None:
@@ -784,11 +789,7 @@ class FeedClient(ABC):
             finally:
                 for t in tasks:
                     t.cancel()
-                for t in tasks:
-                    try:
-                        await t
-                    except BaseException:  # noqa: BLE001
-                        pass
+                await asyncio.gather(*tasks, return_exceptions=True)
                 self._ws = None
                 self.metrics.disconnects += 1
                 self._marker("status", status="disconnected", detail=reason)
@@ -870,7 +871,3 @@ class FeedClient(ABC):
 def dumps(obj: Any) -> str:
     """Compact JSON text for outbound commands."""
     return orjson.dumps(obj).decode()
-
-
-def first(seq: Sequence[Any], default: Any = None) -> Any:
-    return seq[0] if seq else default

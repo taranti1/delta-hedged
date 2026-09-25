@@ -37,8 +37,15 @@ from typing import Any
 
 import orjson
 
-from dh.core.events import Event, FeedStatus, KalshiBookDelta, KalshiBookSnapshot, KalshiFill
+from dh.core.events import (
+    Event,
+    FeedStatus,
+    KalshiBookDelta,
+    KalshiBookSnapshot,
+    KalshiFill,
+)
 from dh.kalshi.normalize import WS_STREAM, ws_message_to_events
+from dh.kalshi.wire import as_dict
 
 SYNTHETIC_TYPE = "dh.feed_status"
 SYNTHETIC_STATUSES = ("connected", "disconnected", "stale", "error")
@@ -52,6 +59,8 @@ _CHANNEL_OF_TYPE = {
     "user_order": "user_orders",
     "market_position": "market_positions",
 }
+# Responses that share a sid's sequence but do not identify its channel.
+_CONTROL_TYPES = frozenset({"ok", "error", "unsubscribed", "subscribed", "list_subscriptions"})
 
 
 def synthetic_status_frame(status: str, detail: str = "") -> bytes:
@@ -107,7 +116,7 @@ class KalshiWsState:
     def sid_for_ticker(self, ticker: str) -> int | None:
         """orderbook sid that carries `ticker` (None if unknown)."""
         for sid, st in self.sids.items():
-            if st.channel == "orderbook_delta" and ticker in st.tickers:
+            if ticker in st.tickers:
                 return sid
         return None
 
@@ -126,8 +135,8 @@ class KalshiWsState:
     def _sid(self, sid: int, typ: str) -> SidState:
         st = self.sids.get(sid)
         if st is None:
-            st = self.sids[sid] = SidState(channel=_CHANNEL_OF_TYPE.get(typ, typ))
-        elif not st.channel:
+            st = self.sids[sid] = SidState()
+        if not st.channel and typ not in _CONTROL_TYPES:  # only data messages name the channel
             st.channel = _CHANNEL_OF_TYPE.get(typ, typ)
         return st
 
@@ -164,7 +173,7 @@ def normalize_ws_message(msg: dict[str, Any], recv_ns: int, state: KalshiWsState
     if typ == SYNTHETIC_TYPE:
         return _synthetic(msg, recv_ns, state)
     if typ == "subscribed":
-        body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
+        body = as_dict(msg.get("msg"))
         if body.get("sid") is not None:
             state.sids[int(body["sid"])] = SidState(channel=str(body.get("channel") or ""))
         return []
@@ -245,7 +254,7 @@ def _gap(state: KalshiWsState, st: SidState, sid: int, seq: int, recv_ns: int, o
             detail=f"sid={sid} channel={st.channel} expected={st.last_seq + 1} got={seq} missed={missed}",
         )
     )
-    if st.channel != "orderbook_delta":
+    if st.channel != "orderbook_delta" and not st.tickers:
         return
     newly = sorted(st.tickers - st.invalid)
     st.invalid |= st.tickers
@@ -259,7 +268,7 @@ def _gap(state: KalshiWsState, st: SidState, sid: int, seq: int, recv_ns: int, o
 def _invalidate_from_msg(msg: dict, typ: str, recv_ns: int, state: KalshiWsState, out: list[Event]) -> None:
     if typ not in ("orderbook_snapshot", "orderbook_delta"):
         return
-    body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
+    body = as_dict(msg.get("msg"))
     ticker = body.get("market_ticker")
     if msg.get("sid") is None or not ticker:
         return

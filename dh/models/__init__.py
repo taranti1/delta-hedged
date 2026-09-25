@@ -4,9 +4,11 @@ volatility estimation and forecast calibration metrics.  See docs/MODELS_fairval
 from dh.models.fairvalue import (
     Digital,
     DigitalArrays,
+    DigitalBand,
     avg_variance_time,
     avg_variance_time_general,
     digital,
+    digital_band,
     digital_vec,
     hedge_notional_usd,
     remaining_avg_variance_time,
@@ -18,9 +20,11 @@ from dh.models.tails import GAUSS, EmpiricalTail, Gauss, StudentT, TailModel, Vo
 __all__ = [
     "Digital",
     "DigitalArrays",
+    "DigitalBand",
     "avg_variance_time",
     "avg_variance_time_general",
     "digital",
+    "digital_band",
     "digital_vec",
     "hedge_notional_usd",
     "remaining_avg_variance_time",

@@ -33,7 +33,11 @@ def greeks_table(
     in_window_k=(0, 15, 30, 45, 55, 59),
     zs=(-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0),
 ) -> pd.DataFrame:
-    """Rows: state x z x tail -> p, delta (BTC/contract), notional ($), gamma, delta move per 1 sd."""
+    """Rows: state x z x tail -> p, delta (BTC/contract), notional ($), gamma, delta move per 1 sd.
+
+    'delta_change_per_1sd_btc' = gamma * sd_remaining: the change in hedge quantity (BTC per
+    contract) when spot moves by one standard deviation of the remaining average.
+    """
     tails = tails or {"gauss": GAUSS}
     sigma_abs = spot * sigma_log
     states: list[tuple[str, WindowState]] = []
@@ -52,9 +56,35 @@ def greeks_table(
                 d = digital(_spec(K), ws, spot, sigma_abs, tail)
                 rows.append({
                     "state": name, "k_fixed": ws.k_fixed, "var_time_s": remaining_avg_variance_time(ws),
-                    "sd_avg_usd": sd_A, "z": z, "strike": K, "tail": tname,
+                    "sd_avg_usd": sd_A, "sd_remaining_usd": sd_R, "z": z, "strike": K, "tail_model": tname,
                     "p_yes": d.p_yes, "delta_btc": d.delta, "hedge_notional_usd": d.delta * spot,
-                    "gamma_per_usd": d.gamma, "delta_change_per_1sd_btc": d.gamma * sd_A,
+                    # a spot move of one sd of the remaining average shifts z by one
+                    "gamma_per_usd": d.gamma, "delta_change_per_1sd_btc": d.gamma * sd_R,
                     "hedge_notional_per_100_usd": 100 * d.delta * spot,
                 })
+    return pd.DataFrame(rows)
+
+
+def window_vs_naive(spot: float, sigma_log: float, taus_s=(3600, 1800, 600, 300, 120, 90, 60), zs=(0.5, 1.0, 2.0)) -> pd.DataFrame:
+    """Mispricing from ignoring the 60-print averaging (pricing the print at T instead).
+
+    Exact: variance time tau_first + 19.5 s (tau_first = tau - 59 s).  Naive: tau seconds.
+    Strikes are placed at z exact sds; the table reports both prices (Gauss) in cents and the
+    ATM hedge-notional ratio.  tau = 60 s is the window opening (tau_first = 1 s).
+    """
+    sigma_abs = spot * sigma_log
+    rows = []
+    for tau in taus_s:
+        ws_exact = WindowState(60, 0, 0.0, 60, max(tau - 59.0, 0.0), 1.0)
+        v_exact = remaining_avg_variance_time(ws_exact)
+        sd_exact = sigma_abs * math.sqrt(v_exact)
+        sd_naive = sigma_abs * math.sqrt(float(tau))
+        for z in zs:
+            K = spot + z * sd_exact
+            p_exact = digital(_spec(K), ws_exact, spot, sigma_abs, GAUSS).p_yes
+            p_naive = float(GAUSS.sf(z * sd_exact / sd_naive))
+            rows.append({"tau_s": tau, "z_exact": z, "var_time_exact_s": v_exact, "var_time_naive_s": float(tau),
+                         "sd_ratio_exact_over_naive": sd_exact / sd_naive, "p_exact_cents": 100 * p_exact,
+                         "p_naive_cents": 100 * p_naive, "naive_error_cents": 100 * (p_naive - p_exact),
+                         "atm_delta_ratio_exact_over_naive": sd_naive / sd_exact})
     return pd.DataFrame(rows)

@@ -27,7 +27,7 @@ from dh.core.events import Event, KalshiFeeUpdate, KalshiMarketLifecycle
 from dh.core.market import MarketSpec, PriceRange
 from dh.kalshi.fees import FeeEngine, FeeSchedule, resolve_fee_fields
 from dh.kalshi.normalize import UnsupportedMarket, rest_market_to_spec
-from dh.kalshi.wire import opt_iso_to_ns
+from dh.kalshi.wire import as_dict, opt_iso_to_ns
 
 BTC_SERIES = ("KXBTCD", "KXBTC", "KXBTC15M")
 # Flags that make a market untradable until a human has checked it; others are informational.
@@ -40,7 +40,7 @@ BLOCKING_FLAGS = frozenset(
         "ticker_strike_mismatch",
     }
 )
-_RX_60S = re.compile(r"\b(60|sixty)[\s-]*seconds?\b")
+_RX_60S = re.compile(r"\b(60|sixty)[\s-]*seconds?\b|\b(one|1)[\s-]*minute\b")
 
 
 # ============================================================================ parsing / checks
@@ -271,7 +271,7 @@ class MarketRegistry:
         if m is None:
             self.needs_refresh.add(t)
             return [f"{t}: unknown market -> refresh"]
-        src = body.get("additional_metadata") if isinstance(body.get("additional_metadata"), dict) else body
+        src = as_dict(body.get("additional_metadata")) or body
         changed = []
         for k in ("strike_type", "floor_strike", "cap_strike", "custom_strike", "yes_sub_title", "rules_primary", "rules_secondary"):
             if k in src and m.get(k) != src[k]:

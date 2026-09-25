@@ -46,7 +46,7 @@ def test_fee_rounding_docs_example():
     """docs fee_rounding: buy 1 @ $0.055 taker -> trade 0.003639, rounding 0.001361, net 0.005."""
     s = ENGINE.schedule("quadratic_with_maker_fees", 1)
     assert s.unrounded_fee(550, 100, True) == Decimal("0.00363825")
-    assert s.order_fee_micros(550, 100, True) == FeeBreakdown(3639, 1361, 0, 5000, -60000)
+    assert s.single_fill_fees(550, 100, True) == FeeBreakdown(3639, 1361, 0, 5000, -60000)
 
 
 # Published fee-schedule tables (ceil to the cent). For whole-cent prices a single buy fill
@@ -60,14 +60,14 @@ HUNDRED_CONTRACTS = [("0.01", "0.07"), ("0.50", "1.75"), ("0.99", "0.07")]
 def test_taker_table_one_contract(price, fee):
     s = ENGINE.schedule("quadratic", 1)
     px = int(Decimal(price) * PX_SCALE)
-    assert s.order_fee_micros(px, 100, True).net_micros == micros_from_dollars(fee)
+    assert s.single_fill_fees(px, 100, True).net_micros == micros_from_dollars(fee)
 
 
 @pytest.mark.parametrize("price,fee", HUNDRED_CONTRACTS)
 def test_taker_table_hundred_contracts(price, fee):
     s = ENGINE.schedule("quadratic", 1)
     px = int(Decimal(price) * PX_SCALE)
-    assert s.order_fee_micros(px, 10_000, True).net_micros == micros_from_dollars(fee)
+    assert s.single_fill_fees(px, 10_000, True).net_micros == micros_from_dollars(fee)
 
 
 def test_trade_fee_values_and_roles():
@@ -83,7 +83,7 @@ def test_trade_fee_values_and_roles():
     assert mk.expected_fee_per_contract(5000, False) == pytest.approx(0.004375)
     assert q.expected_fee_per_contract(5000, True) == pytest.approx(0.0175)
     # quadratic maker fill at a whole-cent price: no fee at all (cash already aligned)
-    assert q.order_fee_micros(4500, 300, False) == FeeBreakdown(0, 0, 0, 0, -1_350_000)
+    assert q.single_fill_fees(4500, 300, False) == FeeBreakdown(0, 0, 0, 0, -1_350_000)
 
 
 def test_unsupported_types_never_price_as_zero():
@@ -135,7 +135,7 @@ def test_accumulator_carry_and_rebate():
     assert f2 == FeeBreakdown(17_499, 7_501, 10_000, 15_000, -520_000)
     assert acc.carry_micros == 5_002 and acc.total.net_micros == 40_000
     # one 2-contract fill costs the same in total
-    assert s.order_fee_micros(5050, 200, True).net_micros == 40_000
+    assert s.single_fill_fees(5050, 200, True).net_micros == 40_000
 
 
 def test_accumulator_rebate_never_makes_net_negative():
@@ -148,7 +148,7 @@ def test_accumulator_rebate_never_makes_net_negative():
 
 def test_ask_side_cash_equivalence_and_direct_member_precision():
     s = ENGINE.schedule("quadratic", 1)
-    ask = s.order_fee_micros(4500, 100, True, book_side="ask")
+    ask = s.single_fill_fees(4500, 100, True, book_side="ask")
     assert ask == FeeBreakdown(17_325, 2_675, 0, 20_000, -570_000)  # buys NO at $0.55
     direct = s.order_accumulator("bid", balance_precision_micros=100).apply_fill(2700, 100, True)
     assert direct.trade_micros == 13_797 and direct.net_micros == 13_800  # $0.0138 at $0.0001 precision

@@ -262,7 +262,7 @@ class FeeSchedule:
         """Model-facing expected fee per contract in dollars: M * rate * P * (1-P), unrounded.
 
         Rounding adds < 1 balance-precision unit per order and is mostly rebated on
-        multi-fill orders; use ``order_fee_micros`` for an exact single-fill figure.
+        multi-fill orders; use ``single_fill_fees`` for an exact single-fill figure.
         """
         return float(self._exact_micros(px, 100, is_taker)) / MICROS
 
@@ -272,8 +272,8 @@ class FeeSchedule:
         """Fresh per-order rounding accumulator."""
         return OrderFeeAccumulator(self, book_side, balance_precision_micros)
 
-    def order_fee_micros(self, px: int, qty: int, is_taker: bool, book_side: str = "bid") -> FeeBreakdown:
-        """Exact fees of an order filled in one fill (fresh accumulator)."""
+    def single_fill_fees(self, px: int, qty: int, is_taker: bool, book_side: str = "bid") -> FeeBreakdown:
+        """Exact fee breakdown (micros) of an order filled completely in one fill."""
         return self.order_accumulator(book_side).apply_fill(px, qty, is_taker)
 
 
