@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+# Captured market data and large research inputs stay local (append-only store).
+data/raw/
+data/cache/
+data/external/
+data/sessions/
+# Secrets: API keys, RSA private keys, env files.
+secrets/
+.secrets/
+*.pem
+*.key
+.env
+*.env

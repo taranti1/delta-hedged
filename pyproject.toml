@@ -1,0 +1,43 @@
+[project]
+name = "delta-hedged"
+version = "0.1.0"
+description = "Deterministic Kalshi BTC threshold market-making research and trading system"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.13",
+  "pandas>=2.2",
+  "pyarrow>=16",
+  "polars>=1.0",
+  "orjson>=3.10",
+  "websockets>=13",
+  "aiohttp>=3.9",
+  "cryptography>=42",
+  "pyyaml>=6",
+  "zstandard>=0.22",
+  "duckdb>=1.0",
+  "scikit-learn>=1.5",
+  "lightgbm>=4.3",
+  "statsmodels>=0.14",
+  "matplotlib>=3.8",
+  "sortedcontainers>=2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "hypothesis>=6.100"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dh*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "slow: long-running research/regression tests",
+  "network: requires outbound network access to exchanges (skipped by default)",
+]
+addopts = "-m 'not network'"
