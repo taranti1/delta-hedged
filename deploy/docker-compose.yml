@@ -23,14 +23,17 @@ services:
     # --i-understand-this-sends-real-orders here (docs/RUNBOOK.md)
     command: ["scripts/run_live.py", "--config", "config/m1.yaml", "--live-config", "config/live.docker.yaml",
               "--mode", "paper"]
-    volumes: ["/data:/data", "/secrets:/secrets:ro", "/run/dh:/run/dh"]
+    # /run/chrony: chronyc reaches the host's chronyd, so the runner's clock-offset gate can
+    # measure the offset (it fails closed in live mode when it cannot)
+    volumes: ["/data:/data", "/secrets:/secrets:ro", "/run/dh:/run/dh", "/run/chrony:/run/chrony:ro"]
     <<: *secrets
     restart: "no"          # never auto-restart a trading process: a human decides
     ports: ["127.0.0.1:9108:9108"]   # metrics (the container binds 0.0.0.0, the host only loopback)
   watchdog:
     build: {context: .., dockerfile: deploy/Dockerfile}
+    # --arm-on-start: a watchdog (re)started after the runner died must still cancel its orders
     command: ["scripts/watchdog.py", "--live-config", "config/live.docker.yaml", "--heartbeat",
-              "/run/dh/heartbeat.json", "--max-age-s", "2"]
+              "/run/dh/heartbeat.json", "--max-age-s", "2", "--arm-on-start"]
     volumes: ["/secrets:/secrets:ro", "/run/dh:/run/dh"]
     <<: *secrets
     restart: always

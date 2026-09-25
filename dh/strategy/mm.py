@@ -16,6 +16,7 @@ Nothing here reads the wall clock, the network or the filesystem.
 from __future__ import annotations
 
 import math
+import zlib
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -833,10 +834,11 @@ class MarketMaker:
             else:
                 d_dn += c
             self.last_place[(s.ticker, side)] = now
+            coid = self.ids.next()
             a = PlaceOrder(
-                client_order_id=self.ids.next(), ticker=s.ticker, book_side=side, px=cand.px,
+                client_order_id=coid, ticker=s.ticker, book_side=side, px=cand.px,
                 qty=int(round(n * QTY_SCALE)), post_only=q.post_only,
-                expiration_ts=int(now + q.order_expiry_s * NS_PER_S) if q.order_expiry_s > 0 else 0,
+                expiration_ts=self._expiry_ns(now, coid),
                 order_group_id=self.ORDER_GROUP_ID if self.use_order_group else "",
                 reason=f"score={score:.3g}",
             )
@@ -845,6 +847,16 @@ class MarketMaker:
             out.append(a)
             out.append(Log("quote", cand.as_log()))
         return out
+
+    def _expiry_ns(self, now: int, coid: str) -> int:
+        """Exchange-side expiry (dead-man backstop). Spread over [T, 1.25 T] by a stable hash of
+        the client_order_id, so quotes placed together do not all expire and need re-placing
+        in the same instant; deterministic, so replay reproduces it. 0 = good till canceled."""
+        exp_s = self.cfg.quoting.order_expiry_s
+        if exp_s <= 0:
+            return 0
+        frac = (zlib.crc32(coid.encode()) & 0xFFFF) / 0x10000
+        return int(now + exp_s * (1.0 + 0.25 * frac) * NS_PER_S)
 
     def _hedge(self, now: int, S: float, D: float) -> list[Action]:
         cfg = self.cfg

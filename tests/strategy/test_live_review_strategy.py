@@ -220,3 +220,24 @@ def test_clock_gate_stream_pulls_quotes_and_blocks_quoting():
     assert "clock_offset" in d.mm.risk.health(d.now).reasons
     d.feed(FeedStatus(d.now + 1, 0, "runner.clock", "resumed"))
     assert _places(d.advance(d.now + 3 * NS_PER_S))
+
+
+def test_order_expiry_is_spread_deterministically():
+    """Live review nit: quotes placed together must not all expire in the same instant; the
+    spread is a stable function of the client_order_id, so replay reproduces it."""
+    from dataclasses import replace as dc_replace
+
+    from dh.backtest.kat import default_kat_config
+
+    base = default_kat_config()
+    cfg = dc_replace(base, quoting=dc_replace(base.quoting, order_expiry_s=120.0))
+    d = Driver([spec()], cfg=cfg)
+    _ready(d)
+    ps = _places(d.advance(T0 + 6 * NS_PER_S))
+    assert len(ps) >= 2
+    life = [(p.expiration_ts - d.mm.om.order(p.client_order_id).created_ns) / NS_PER_S for p in ps]
+    assert all(120.0 <= x <= 150.0 for x in life), life
+    assert len({round(x, 3) for x in life}) == len(life)  # spread, not all the same
+    assert d.mm._expiry_ns(T0, "x-1") == d.mm._expiry_ns(T0, "x-1")  # deterministic
+    d0 = Driver([spec()])  # order_expiry_s = 0 -> good till canceled
+    assert d0.mm._expiry_ns(T0, "x-1") == 0
