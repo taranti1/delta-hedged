@@ -1,0 +1,15 @@
+synthetic,policy,family,regime,events,d_mean,d_lo,d_hi
+True,B,tau_bucket,1-5m,2,8.21982,-2.6747e+09,2.43948e+09
+True,B,tau_bucket,10-30m,2,2.45485,-10.0077,14.9174
+True,B,tau_bucket,5-10m,2,-13.7746,-158.544,130.995
+True,B,vol_tercile,high,1,-4.22915,,
+True,B,vol_tercile,low,1,-3.72067,,
+True,B,vol_tercile,mid,2,7.39359,-2.6752e+08,93.84
+True,B,weekday,weekday,2,0.476966,-4.58038e+07,25.2463
+True,C,tau_bucket,1-5m,2,0.0813559,-1.02476e+08,12.1134
+True,C,tau_bucket,10-30m,2,0.328101,-12.009,4.46636e+06
+True,C,tau_bucket,5-10m,2,-4.67391,-66.64,1.11612e+08
+True,C,vol_tercile,high,1,-2.23188,,
+True,C,vol_tercile,low,1,-3.41023,,
+True,C,vol_tercile,mid,2,2.63451,-26.6979,31.9669
+True,C,weekday,weekday,2,-0.673608,-2.14948,0.802263

@@ -1,0 +1,17 @@
+{
+ "experiment": "e2_nowcast",
+ "verdict": "INCONCLUSIVE (RMSE gain ok; P&L gain not established under B and C)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "INCONCLUSIVE (RMSE gain ok; P&L gain not established under B and C)",
+ "guards": [],
+ "decision_events": 2,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept if OOS RMSE improves >= 10% at 0.2-1 s AND the E1/E3 P&L improves in replay; reject if the RMSE gain is < 5% or there is no P&L gain"
+}

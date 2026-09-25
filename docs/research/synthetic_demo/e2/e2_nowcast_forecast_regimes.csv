@@ -1,0 +1,13 @@
+synthetic,horizon,family,regime,n,rmse_gain_pct
+True,0.2s,vol_tercile,high,4497,49.7952
+True,0.2s,vol_tercile,low,5100,49.1081
+True,0.2s,vol_tercile,mid,4800,49.572
+True,0.2s,weekday,weekday,14397,49.4776
+True,0.5s,vol_tercile,high,4495,24.5432
+True,0.5s,vol_tercile,low,5100,25.7852
+True,0.5s,vol_tercile,mid,4800,25.0685
+True,0.5s,weekday,weekday,14395,25.1652
+True,1s,vol_tercile,high,4493,13.8687
+True,1s,vol_tercile,low,5100,14.391
+True,1s,vol_tercile,mid,4800,13.283
+True,1s,weekday,weekday,14393,13.8562

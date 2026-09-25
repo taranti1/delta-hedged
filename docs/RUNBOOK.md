@@ -14,12 +14,16 @@ the first time. Commands run from the repository root with the venv active
 
 Exit codes of `run_live.py`: `0` normal stop or kill file, `2` refused to start (message says
 why), `3` shutdown could not confirm that all orders are cancelled (check the Kalshi UI now; the
-watchdog keeps trying), `4` strategy/consumer error (fail-safe stop).
+watchdog keeps trying), `4` strategy/consumer error or a dead background loop (heartbeat, risk
+state, fills, positions, clock, reconciler...: fail-safe stop with the normal cancel-all).
 
 One runner per `paths.data_root` and per heartbeat file: the runner holds a `flock` on
 `<data_root>/runner.lock` and `<heartbeat>.lock` and refuses to start while another process
-holds them, or while the heartbeat file is fresh from another pid. A restart keeps the day's
-risk state (section 8): a halt stays a halt, the daily-loss budget is not refilled.
+holds them, or while the heartbeat file is fresh from another pid. **One Kalshi (sub)account
+per runner**: those locks are per path, so two runners with different `data_root` /
+heartbeat paths on the same account are NOT prevented, and they would cancel each other's
+orders, sweep them as ghosts and see each other's positions as mismatches. A restart keeps
+the day's risk state (section 8): a halt stays a halt, the daily-loss budget is not refilled.
 
 ---------------------------------------------------------------------------------------------
 ## 1. One-time setup
@@ -36,7 +40,13 @@ risk state (section 8): a halt stays a halt, the daily-loss budget is not refill
 ### 1.2 Kalshi account and API keys
 1. Use a **dedicated account or subaccount** for the bot. Cancel-all, the ghost-order sweep and
    the position reconciliation act on every order/position of that (sub)account: manual
-   trading there will be cancelled and will halt the bot.
+   trading there will be cancelled and will halt the bot. **M1 runs on the PRIMARY account**
+   (`venue.subaccount: null`) of a dedicated Kalshi account. A subaccount deployment first
+   needs a live check (**verify live**) that the WebSocket `fill` and `market_position`
+   payloads carry `subaccount` (the asyncapi marks it optional): a message without it is read
+   as the primary account's and dropped by a subaccount runner (its fills would then only
+   arrive through the REST back-fill). `GET /historical/fills` has no subaccount filter either:
+   for a subaccount, historical rows without a subaccount field refuse the start (section 8).
 2. In the Kalshi web app: account settings, **API keys**, create a new key. Kalshi generates
    an RSA key pair: download the private key file (shown **once**) and copy the **Key ID**.
 3. Create a **second key for the watchdog**, so a revoked/rate-limited runner key does not
@@ -72,16 +82,23 @@ cp config/live.example.yaml   config/live.yaml     # runner: mode, paths, venue,
 * `paths.heartbeat_file` is the LIVE runner's heartbeat (the watchdog reads it); a paper runner
   writes `paths.paper_heartbeat_file` (default: the same name with `.paper` inserted,
   `/run/dh/heartbeat.paper.json`), so it can never be mistaken for the live runner.
-* `paths.risk_state_file` (default `<data_root>/state/risk_state.<mode>.json`): the day's P&L,
-  a carried halt and pause, written every 2 s, on every halt and at shutdown (section 8).
+* `paths.risk_state_file` (default `<data_root>/state/risk_state.<mode>.json`): the day's P&L
+  (realized and mark), a carried halt (reason, scope, the UTC day it was decided) and pause,
+  an operator's loss-budget base; written every 2 s, on every halt (fsync of the file and its
+  directory) and at shutdown (section 8).
+* Clock (live): the runner samples `chronyc` (else `timedatectl`) every `loop.clock_sample_s`
+  (must be > 0 live). A sample from anything else (no chronyd reachable), not synchronised,
+  or with an estimated error above `loop.clock_max_est_error_ms` (default = `clock_block_ms`)
+  blocks new orders like a large offset (section 5.3). Under Docker the strategy container
+  mounts `/run/chrony` for `chronyc`.
 * **External venues stay off in M1** (`feeds.only: []`). This is deliberate: M1 prices and
   detects jumps on BRTI alone, so external books add load on the single strategy consumer
   without protecting against the failure that matters (a lagging or frozen BRTI relay). With
   no external feeds the risk engine's ">= 2 fresh external venues" rule is **off**; staleness
   is judged on BRTI itself, by receive age AND CF source age (quoting stops at 10 s, and at
   3 s for markets within 10 minutes of expiry). If you enable feeds later, use trade/ticker
-  channels, never full order books, and remember that `dh/feeds` readers do not yet yield to
-  the event loop per frame.
+  channels, never full order books: the `dh/feeds` readers yield to the event loop after
+  every frame, but every event is still work for the single strategy consumer.
 
 ---------------------------------------------------------------------------------------------
 ## 2. Pre-flight checks (new host, new key, after upgrades)
@@ -170,8 +187,11 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
 - [ ] Fee check: `verify_fee_schedule.py` shows the KXBTCD fee type is supported and, if the
       account already has fills, every fill matches. (The runner also checks every live fill
       exactly, including Kalshi's per-order rounding, and blocks new orders on a mismatch.)
-- [ ] Watchdog running with its own key; kill drill done (section 6) on the demo env or with
-      the runner in paper mode + watchdog `--cancel-now`.
+- [ ] Watchdog running with its own key (and `--arm-on-start`, section 6); kill drill done
+      (section 6) on the demo env or with the runner in paper mode + watchdog `--cancel-now`.
+- [ ] One runner per Kalshi (sub)account; M1 on the primary account (section 1.2).
+- [ ] `chronyc tracking` works for the runner's user/container and the runner's first minutes
+      show no `gate clock` (section 5.3).
 - [ ] `config/m1.yaml` unchanged since paper (same digest in the logs).
 - [ ] The account/subaccount holds only the capital you accept to risk (M1 limits: daily loss
       halt $25, worst case $20 per event / $50 total, clips and per-market limits as in
@@ -183,8 +203,10 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
    `venue.startup_cancel_all: false` (paper-only debugging settings).
 2. Start the watchdog first, in its own terminal/service:
    ```sh
-   python scripts/watchdog.py --live-config config/live.yaml
+   python scripts/watchdog.py --live-config config/live.yaml --arm-on-start
    ```
+   (`--arm-on-start`: a watchdog restarted while the runner may have died meanwhile still
+   cancels its orders, section 6.)
 3. Start the runner (both the config flag and the command-line flag are required):
    ```sh
    python scripts/run_live.py --config config/m1.yaml --live-config config/live.yaml \
@@ -193,16 +215,23 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
    Use `--duration` for the first sessions and stay at the screen.
 
 Live start-up adds, in this order, before discovery:
+0. a watchdog marker `<heartbeat>.cancel_all` left from before this start is renamed to
+   `<heartbeat>.cancel_all.stale-<unix s>` (logged): it is about an earlier runner;
 1. **clean slate**: `DELETE /portfolio/events/orders?subaccount=<n>`, then the resting-order
    list must come back empty (leftovers are cancelled one by one, 3 rounds; still resting ->
    exit 2);
 2. **positions** are read AFTER that (an order resting while positions are read could fill
    unseen): **events that already hold a position are excluded** for this session (they
-   settle within the hour);
-3. **the day's P&L** from Kalshi: `GET /portfolio/fills` and `GET /portfolio/settlements`
-   since UTC midnight plus the positions, INCLUDING the excluded events (a lower bound: open
-   positions at their worst case), combined with the persisted state -> the risk seed
-   (section 8);
+   settle within the hour); a malformed position row refuses the start;
+3. **the day's P&L** from Kalshi (section 8): `GET /historical/cutoff`, today's fills
+   (`GET /portfolio/fills`, plus `GET /historical/fills` for the part before the cutoff) and
+   settlements, the open positions at exchange prices (`GET /markets`: long at the YES bid,
+   short at the YES ask, a determined market at its payout) and the positions held at 00:00
+   UTC at the last trade before midnight (`GET /markets/trades`), INCLUDING the excluded
+   events; combined with the persisted state -> the risk seed. A malformed or timeless fill /
+   settlement row, or a failed read, refuses the start (exit 2); a missing price falls back
+   to the worst case and is logged (`risk state: ... no exchange price`). If midnight UTC
+   passes meanwhile, it is derived again for the new day;
 4. **new orders are held for `venue.cancel_all_hold_s` (60 s) after that cancel-all**: Kalshi
    documents that a cancel-all may also cancel orders placed during the following minute.
    The strategy is told (`kalshi.reconcile` stale) and does not quote until the hold ends.
@@ -243,7 +272,15 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   positions (the DISCREPANCY must persist 5 s unchanged, i.e. survive a fill in flight, before
   it halts; new fills moving both sides do not reset it), and resting orders vs the strategy
   (unknown resting orders are cancelled; orders the strategy believes live but that no longer
-  rest are looked up). WebSocket position messages go through the same persistence check.
+  rest are looked up). A difference is confirmed only by a positions read that follows a
+  `GET /portfolio/fills` read (no minimum age) started after the difference was first seen:
+  a fill the WebSocket lost silently is back-filled by it instead of halting the bot.
+  WebSocket position messages can raise or clear a suspicion (and trigger that check at
+  once) but never confirm one.
+* Positions of excluded events (held at start-up) are carried at their start-up marks; when
+  such a market is determined, the runner realizes it at once (an updated `RiskStateSeed`
+  right after the settlement event, recorded for replay; `excluded_settlement` log line), so
+  the daily-loss limit and the persisted state see the settlement.
 * **WebSocket reconnect**: fills and order updates sent during an outage are lost and the own
   channels have no sequence numbers, so no gap is ever reported. On every disconnect the
   strategy is told `kalshi.reconcile` stale (it cancels and stops quoting); after the
@@ -259,13 +296,20 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   same exact fee check.
 * **Data lag**: the lag is the larger of the runner-queue lag and the exchange-time lag of
   Kalshi market data (BRTI source time, trade and book-delta `ts_ms`, against a trailing
-  latency baseline), so frames piling up in the WebSocket receive buffer are seen. Above
-  `loop.max_lag_s` new orders are blocked AND the strategy is told (`runner.lag` stale: it
-  cancels its quotes); it resumes once fresh data kept the lag below half of that for
-  `loop.lag_resume_s`. A loop stall (timers far behind) is handled the same way, whether a
-  wake-up or an event comes first. The consumer yields to the event loop after every item
-  that sent orders and every `loop.yield_items` items / `loop.yield_ms`: cancels and the
-  heartbeat never wait for a backlog.
+  latency baseline), so frames piling up in the WebSocket receive buffer are seen. The
+  baseline (each source's smallest age over `loop.lag_window_s`) is capped at
+  `loop.lag_baseline_cap_ms` (default `clock_block_ms` + 100 = 350 ms): a backlog present
+  since start-up, or lasting longer than the window, stays lag instead of becoming "normal
+  latency". A source whose smallest age exceeds the cap logs `lag_baseline_over_cap` and
+  counts `dh_lag_baseline_over_cap_total` (`dh_lag_baseline_seconds{source}` shows each
+  uncapped baseline: if a source's NORMAL latency is above the cap, measure it in paper mode
+  and raise the cap deliberately). Above `loop.max_lag_s` new orders are blocked (before the
+  strategy sees the event that revealed the lag) AND the strategy is told right after it
+  (`runner.lag` stale: it cancels its quotes); it resumes once fresh data kept the lag below
+  half of that for `loop.lag_resume_s`. A loop stall (timers far behind) is handled the same
+  way, whether a wake-up or an event comes first. The consumer yields to the event loop after
+  every item that sent orders and every `loop.yield_items` items / `loop.yield_ms`: cancels
+  and the heartbeat never wait for a backlog.
 * **CancelAll**: with a Halt in the same cycle -> `DELETE /portfolio/events/orders` (and new
   orders held 60 s, moot while halted); without one (lag, disconnect, reconciling, pauses) ->
   the strategy's working orders are cancelled in batches and every other order still resting
@@ -278,7 +322,12 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   strategy Halt (before the orders decided in the same cycle go out), on a fee mismatch, on
   data lag or a loop stall, while reconciling, during a cancel-all hold, while the clock offset
   (chrony offset plus the drift of the session clock from the wall clock) exceeds
-  `loop.clock_block_ms` on `loop.clock_block_samples` samples in a row, and per market after a
+  `loop.clock_block_ms` on `loop.clock_block_samples` checks in a row **or the clock cannot be
+  trusted** (live: no `chronyc`/`timedatectl` answer, not synchronised, estimated error above
+  `loop.clock_max_est_error_ms`, or every market-data source stamped in our future, which
+  proves the local clock behind; `dh_clock_untrusted` = 1, re-sampled every
+  `loop.clock_resample_s` until it recovers; the strategy is told `runner.clock` stale and
+  pulls its quotes), and per market after a
   close-time / tick-grid change of that market or a spec change found by re-discovery. Event
   fee overrides (`event_fee_update`) are re-priced by the strategy itself; the runner's fee
   check follows them (a cleared override restores the market's base fee), and re-discovery
@@ -304,9 +353,20 @@ lock). Both may share the kill file (a kill stops both). Under Docker
    a shutdown hangs longer than the runner's `shutdown_timeout_s` + `watchdog.stopping_grace_s`
    (the runner also stops writing `stopping` after its timeout). It retries every second until
    it succeeds and repeats every 30 s while stale. After each attempt it writes
-   `<heartbeat>.cancel_all`: a runner that is still alive (it was only hung) then holds new
-   orders for 60 s and reconciles. A clean shutdown writes heartbeat state `stopped` only after
-   the cancel-all was confirmed, which disarms it; a new live runner re-arms it.
+   `<heartbeat>.cancel_all` (`{"t", "ok", "watched": [pid, session]}`). A live runner that
+   finds a marker written after its own start **about itself** was alive but unresponsive:
+   it **halts** (Halt(all), reason `watchdog_cancel_all`, persisted and carried across
+   restarts: investigate why the heartbeat went stale, then `--reset-daily-halt`). A marker
+   about another runner (a restart racing a trigger) only holds new orders for 60 s and
+   reconciles. A clean shutdown writes heartbeat state `stopped` only after the cancel-all was
+   confirmed, which disarms it; a new live runner re-arms it.
+   **`--arm-on-start`** (used by `deploy/docker-compose.yml`): on its first poll a restarted
+   watchdog acts on an EXISTING LIVE heartbeat only (mode live, state running/stopping): it
+   locks onto that runner if the heartbeat is fresh, and cancels all at once if it is stale
+   (the runner died while the watchdog was down). A missing file, an unreadable one, or any
+   other heartbeat (paper, `starting`, `stopped`) leaves it DISARMED until a fresh live
+   heartbeat appears; it never locks onto a `starting` runner (its heartbeat is not refreshed
+   during the start-up sequence).
 5. **Kalshi web/mobile app**: portfolio, open orders, cancel them (works when our host is
    down).
 6. **Revoke the API key(s)** in the Kalshi settings (stops new orders; does NOT cancel resting
@@ -346,8 +406,13 @@ positions in the Kalshi UI; write down what happened.
 | `dh_reconciling` | own-activity reconciliation in progress | 1 for > 60 s |
 | `dh_venue_stuck_cancels` | orders still resting after every cancel failed | > 0: Kalshi UI now |
 | `dh_duplicate_fills_dropped_total`, `dh_foreign_subaccount_events_total`, `dh_cancel_resends_total` | reconciliation details | investigate if growing |
-| `dh_day_pnl_dollars` | the UTC day's P&L incl. earlier sessions (persisted) | near -$25 |
-| `dh_watchdog_cancel_alls_seen_total` | the watchdog cancelled everything while this runner lived | > 0 |
+| `dh_day_pnl_dollars` | the UTC day's real P&L incl. earlier sessions (persisted) | near -$25 (minus a reset's base) |
+| `dh_day_realized_dollars`, `dh_day_mark_dollars`, `dh_day_budget_base_dollars` | its realized part, the open positions' mark, an operator reset's base | |
+| `dh_excluded_settlements_total` | markets of excluded events settled during the session | |
+| `dh_watchdog_cancel_alls_seen_total` | the watchdog cancelled everything after this runner started | > 0 (about this runner: it halted) |
+| `dh_lag_baseline_seconds{source}`, `dh_lag_baseline_over_cap_total{source}` | uncapped exchange-time latency baseline per source; times it exceeded the cap | over-cap growing |
+| `dh_clock_untrusted` | the last clock sample cannot vouch for the clock (live) | 1 |
+| `dh_loop_deaths_total{loop}` | a background loop died (the runner stopped with exit 4) | > 0 |
 | `dh_halted{scope}` | strategy Halt seen | 1: see section 8 |
 | `dh_fv_ready` | fair-value model warm | 0 after start-up |
 | `dh_brti_age_seconds` | benchmark tick age | > 3 s |
@@ -384,6 +449,8 @@ jq -c 'select(.k=="feed_status")' $L                 # gaps / disconnects
 | `halt` scope `all`, reason `daily_loss` | the UTC day's P&L (all sessions of the day) <= -$25 | stop for the day; review fills/markouts |
 | `halt` scope `all`, reason `reconciliation:...` | position differs from the exchange for > 5 s | `tools reconcile`; compare `log.fill` with the Kalshi fill history; find the lost/extra fill |
 | `halt` reason `carried_over:...` | a halt of an earlier session (risk state) | as for the original reason; then `--reset-daily-halt` |
+| `halt` reason `carried_over:watchdog_cancel_all` | the watchdog cancelled everything while this runner was alive (its heartbeat went stale: blocked loop, disk, CPU) | find why the heartbeat stopped (`dh_heartbeat_ts`, logs); `tools orders`; then `--reset-daily-halt` |
+| `loop_died` log, exit 4 | a background loop (heartbeat, risk state, fills, positions, clock, reconciler...) raised or returned | read the traceback; fix before restarting |
 | `gate` `fee_mismatch` | a fill's fee differs from the model | `verify_fee_schedule.py`; fix `config/fees.yaml` / precision |
 | `block` `close_date_updated` / `tick_grid_changed` / `spec_changed` | a traded market changed | nothing: that market is out for the session; new markets use new specs |
 | `fee_update` (log) | an event fee override | nothing: the strategy re-prices (unsupported types become untradable) |
@@ -391,22 +458,45 @@ jq -c 'select(.k=="feed_status")' $L                 # gaps / disconnects
 | `gate` `lag` | data lag or a loop stall (quotes cancelled) | check CPU, `dh_queue_depth`, `dh_consumer_lag_seconds`; reduce load |
 | `gate` `reconciling` / `reconcile` log | WS reconnect, cancel-all hold | nothing; > 60 s: check REST (`reconcile_error` lines) |
 | `gate` `cancel_all_hold` | the minute after a global cancel-all | nothing (expires) |
-| `gate` `clock` | clock offset > 250 ms persists | fix chrony; restart the runner (re-anchors its clock) |
+| `gate` `clock` | clock offset > 250 ms persists, or the clock cannot be trusted (`gate` log `why`: unmeasurable / not synchronised / estimated error / behind exchange time) | fix chrony (`chronyc tracking`; Docker: `/run/chrony` mounted); restart the runner (re-anchors its clock) |
 | `venue.cancel_stuck` | an order keeps resting although every cancel fails | Kalshi UI: cancel it by hand; watchdog `--cancel-now` |
 
-**Halts survive restarts.** The runner persists the day's P&L, the halt flag/reason and any
-pause (`paths.risk_state_file`, atomically, every 2 s and immediately on a halt) and, live,
-re-derives the day's P&L from Kalshi's fills and settlements at start-up. The next session
-therefore starts **halted** after a halt, starts with the day's loss already counted (e.g.
--$24.99, then a 1-cent loss halts at -$25 in total), and keeps a settlement-loss pause. A
-daily-loss halt ends with the UTC day; a reconciliation or fee-mismatch halt persists across
-days. After investigating, override explicitly:
+**Halts survive restarts.** The runner persists the day's P&L, the halt (reason, scope, the
+UTC day it was decided) and any pause (`paths.risk_state_file`, atomically, every 2 s and
+immediately on a halt, fsynced) and, live, re-derives the day's P&L from Kalshi at start-up.
+The next session therefore starts **halted** after a halt, starts with the day's loss already
+counted (e.g. -$24.99, then a 1-cent loss halts at -$25 in total), and keeps a
+settlement-loss pause. A daily-loss halt ends with the UTC day **on which it was decided**
+(a halted runner still up after midnight does not carry it into the next day's restart); a
+reconciliation, fee-mismatch or watchdog halt persists across days.
+
+How the day's P&L is counted at a restart (so an ordinary restart with inventory does not
+halt):
+* real P&L = **realized** (today's fills cash minus fees, plus settlements, minus the value of
+  the positions held at 00:00 UTC at the last trade before midnight) + the **open positions
+  at exchange prices** (long at the YES bid, short at the YES ask, a determined market at its
+  payout, a closed one awaiting determination at its last trade);
+* the realized part is the lower of the persisted one and Kalshi's; the open positions are
+  always valued afresh (a pessimistic mark persisted earlier is never locked in);
+* a price that does not exist falls back to the worst case (open long $0, short $1; long
+  held at midnight $1) and is logged: restarting in the minutes between a held market's close
+  and its determination can therefore count it pessimistically (it is corrected when the
+  market settles during the session, but a halt it caused stays): prefer restarting after the
+  determination;
+* settlement rows' `fee_cost` is not added (the spec calls it the total fees paid; the fills
+  already counted them).
+
+After investigating a halt, override explicitly:
 ```sh
-python scripts/run_live.py ... --reset-daily-halt   # forgives the halt, the pause AND the day's loss so far
+python scripts/run_live.py ... --reset-daily-halt   # clears the halt and the pause; fresh loss budget
 ```
-The override is logged (`risk_reset_by_operator`, with the values it forgave) and recorded in
-the session's `meta`. Do not delete the state file instead: the start-up re-derivation from
-Kalshi would still count the day's loss.
+The halt and pause are cleared and the daily-loss limit counts **from the current real day
+P&L** (e.g. real -$26 at the reset: the runner halts again at -$51); the real P&L stays
+recorded (`dh_day_pnl_dollars`, the state file's `budget_base_usd`, both numbers logged at
+start-up), and a later restart the same UTC day keeps that base. The override is logged
+(`risk_reset_by_operator`, with the values it cleared) and recorded in the session's `meta`.
+Do not delete the state file instead: the start-up re-derivation from Kalshi would still count
+the day's loss (and a sticky halt would be lost).
 
 A restart after a crash is safe: start-up cancels leftovers (verified), excludes events with
 positions, counts the day's P&L, holds new orders for the cancel-all minute and creates a
@@ -456,6 +546,11 @@ simulation and attribution before it is believed.
 | `kill file ... is present` | investigate, then `rm /run/dh/KILL` |
 | `another runner holds .../runner.lock` / `heartbeat ... is fresh from pid N` | a runner is still alive (or died < 5 s ago): stop it, or give the second runner its own paths |
 | `risk state file ... is unreadable` | inspect it; restore or remove it deliberately (it carries halts) |
+| `risk state: malformed fill row ...` / `... without created_time` / `settlement row ... payout unknown` | a REST row the day's P&L cannot use: check it in the Kalshi UI / raw `kalshi.rest.portfolio` capture; retry later; never start on a partial view |
+| `risk state: GET /historical/cutoff failed` / `today's P&L could not be derived` | REST/network problem at start-up: `smoke_kalshi.py`; retry |
+| `historical fill ... names no subaccount` | a subaccount runner whose day reaches before the historical cutoff: start on the primary account, or after the cutoff moved past midnight |
+| `malformed position row` | inspect `GET /portfolio/positions`; the runner will not trade with an unknown inventory |
+| `the UTC day kept changing while today's P&L was derived` | start-up took more than a day's rollover twice: retry |
 | `N orders still resting after the start-up cancel-all` | Kalshi UI; `tools orders`; retry |
 | `loop.strategy_error must be 'stop' in live mode` (and the other live refusals) | fix `config/live.yaml` |
 | `no Kalshi API credentials` | section 1.3 |
