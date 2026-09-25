@@ -9,8 +9,10 @@ fees -> Micros int (1e-6 $), all via dh.core.units (exact; malformed values rais
 
 WebSocket message types (asyncapi 2.0.0) and their mapping:
 
-  orderbook_snapshot        -> KalshiBookSnapshot (YES bids, NO bids on the NO price scale)
-  orderbook_delta           -> KalshiBookDelta (signed delta; own client_order_id if ours)
+  orderbook_snapshot        -> KalshiBookSnapshot (YES bids, NO bids on the NO price scale
+                               whichever wire convention; see "Order book price convention")
+  orderbook_delta           -> KalshiBookDelta (signed delta, NO scale for side 'no'; own
+                               client_order_id if ours)
   trade                     -> KalshiTrade (taker_side = taker_outcome_side; book 'bid'=='yes')
   ticker                    -> KalshiTicker
   fill                      -> KalshiFill (book_side/outcome_side; deprecated side/action unused)
@@ -36,9 +38,18 @@ WebSocket message types (asyncapi 2.0.0) and their mapping:
   error                     -> FeedStatus(stream='kalshi.ws', status='error')
   anything else             -> [] (e.g. pyth_value, communications: not used)
 
-Order book price convention: subscriptions must NOT set ``use_yes_price=true`` (dh.kalshi.ws
-sends ``use_yes_price: false`` explicitly). If a recording was made with yes-leg pricing,
-pass ``use_yes_price=True`` so NO-side prices are converted back to the NO scale.
+Order book price convention (events): YES bids on the YES scale, NO bids on the NO scale.
+On the wire the NO levels come in one of two shapes (asyncapi ``use_yes_price``):
+  * no-leg  (``use_yes_price: false``, the legacy default; every recording made before the
+             switch to true, none of which declares its flag): a NO bid at NO price q is q.
+  * yes-leg (``use_yes_price: true``, dh.kalshi.ws's default; Kalshi will make it the default
+             and then the ONLY behaviour): the same bid is reported as 1 - q.
+Which shape a message uses is taken from the message itself where it can be: a two-sided
+snapshot proves it (``no_side_yes_priced``: Kalshi books are never crossed, and only one
+reading of the levels is uncrossed). Otherwise (one-sided or thin books, and every delta) the
+subscription's flag decides: the ``use_yes_price`` argument, which dh.kalshi.sequencer
+supplies per sid (proven by an earlier snapshot > declared by the recorded connection >
+default). REST orderbooks are documented in no-leg pricing and get the same proof check.
 """
 
 from __future__ import annotations
@@ -113,6 +124,8 @@ def ws_message_to_events(msg: dict, recv_ns: int, *, use_yes_price: bool = False
 
     recv_ns: local receive time, int ns. Sequence/gap handling is NOT done here (it needs
     state): see dh.kalshi.sequencer.normalize_ws_frame, which wraps this function.
+    use_yes_price: NO-side price scale of orderbook messages that do not prove their own
+    (deltas, one-sided/thin snapshots); a two-sided snapshot follows its own proof.
     Raises ValueError/UnitError on malformed payloads of known types.
     """
     typ = msg.get("type")
@@ -186,22 +199,57 @@ def book_levels(raw: Any, *, flip: bool = False) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(out.items()))
 
 
+Levels = tuple[tuple[int, int], ...]  # ((px, qty), ...) ascending by px
+
+
+def no_side_yes_priced(yes_bids: Levels, no_levels: Levels) -> bool | None:
+    """Price scale of a book's NO levels when the book itself proves it, else None.
+
+    Kalshi never leaves a book crossed or locked (a YES bid at y and a NO bid at q match as
+    soon as y + q >= $1), so under the TRUE convention best YES bid + best NO bid < $1. With
+    the NO levels' raw prices r (ascending, as ``book_levels`` returns them):
+      no-leg  (r = q):      max(yes) + max(r) < 1
+      yes-leg (r = 1 - q):  max(yes) < min(r)
+    Returns True (yes-leg) / False (no-leg) when exactly one reading is uncrossed; None when a
+    side is empty or both readings are uncrossed (thin books) -- then the flag decides.
+    On the 2026-09-25 capture (all no-leg) no book proves yes-leg: of 4191 WS snapshots 309
+    prove no-leg and 38 are ambiguous (the rest one-sided); REST 11624 / 1862 of 83663.
+    """
+    if not yes_bids or not no_levels:
+        return None
+    best_yes = yes_bids[-1][0]
+    no_leg = best_yes + no_levels[-1][0] < PX_SCALE
+    yes_leg = best_yes < no_levels[0][0]
+    return None if no_leg == yes_leg else yes_leg
+
+
+def book_sides(yes_raw: Any, no_raw: Any, *, use_yes_price: bool = False) -> tuple[Levels, Levels]:
+    """Raw YES / NO level lists -> (yes_bids, no_bids on the NO scale).
+
+    The NO levels' scale is proven by the book when possible (``no_side_yes_priced``),
+    otherwise ``use_yes_price`` (True = NO levels reported in yes-leg pricing) decides.
+    """
+    yes = book_levels(yes_raw)
+    no = book_levels(no_raw)
+    proven = no_side_yes_priced(yes, no)
+    if use_yes_price if proven is None else proven:
+        no = tuple((PX_SCALE - px, q) for px, q in reversed(no))
+    return yes, no
+
+
+def snapshot_no_side_pricing(m: dict) -> bool | None:
+    """``no_side_yes_priced`` of an orderbook_snapshot ``msg`` body (raises on bad levels)."""
+    return no_side_yes_priced(book_levels(m.get("yes_dollars_fp")), book_levels(m.get("no_dollars_fp")))
+
+
 def _ob_snapshot(msg: dict, m: dict, recv_ns: int, yes_priced: bool) -> list[Event]:
     sid, seq = _sid_seq(msg)
-    return [
-        KalshiBookSnapshot(
-            ts=recv_ns,
-            ts_exch=0,
-            ticker=str(m["market_ticker"]),
-            sid=sid,
-            seq=seq,
-            yes_bids=book_levels(m.get("yes_dollars_fp")),
-            no_bids=book_levels(m.get("no_dollars_fp"), flip=yes_priced),
-        )
-    ]
+    yes, no = book_sides(m.get("yes_dollars_fp"), m.get("no_dollars_fp"), use_yes_price=yes_priced)
+    return [KalshiBookSnapshot(ts=recv_ns, ts_exch=0, ticker=str(m["market_ticker"]), sid=sid, seq=seq, yes_bids=yes, no_bids=no)]
 
 
 def _ob_delta(msg: dict, m: dict, recv_ns: int, yes_priced: bool) -> list[Event]:
+    """A delta cannot prove its own scale: a NO-side price is yes-leg iff ``yes_priced``."""
     sid, seq = _sid_seq(msg)
     side = m.get("side")
     if side not in ("yes", "no"):
@@ -634,20 +682,19 @@ def order_group_update(m: dict) -> OrderGroupUpdate:
 
 
 # ============================================================================ REST
-def rest_orderbook_to_snapshot(ticker: str, body: dict, recv_ns: int) -> KalshiBookSnapshot:
-    """GET /markets/{ticker}/orderbook body (or one MarketOrderbookFp) -> snapshot (sid=seq=0)."""
+def rest_orderbook_to_snapshot(ticker: str, body: dict, recv_ns: int, *, use_yes_price: bool = False) -> KalshiBookSnapshot:
+    """GET /markets/{ticker}/orderbook body (or one MarketOrderbookFp) -> snapshot (sid=seq=0).
+
+    REST has no ``use_yes_price`` parameter and documents NO bids at their NO price (no-leg;
+    every recorded REST book agrees). A two-sided book that proves yes-leg pricing is still
+    converted (``no_side_yes_priced``), so a later unification with the WS yes-leg scale
+    cannot silently mirror the NO side; ``use_yes_price`` decides unprovable books.
+    """
     ob = body.get("orderbook_fp")
     if not isinstance(ob, dict):
         raise ValueError("orderbook response without orderbook_fp")
-    return KalshiBookSnapshot(
-        ts=recv_ns,
-        ts_exch=0,
-        ticker=ticker,
-        sid=0,
-        seq=0,
-        yes_bids=book_levels(ob.get("yes_dollars")),
-        no_bids=book_levels(ob.get("no_dollars")),
-    )
+    yes, no = book_sides(ob.get("yes_dollars"), ob.get("no_dollars"), use_yes_price=use_yes_price)
+    return KalshiBookSnapshot(ts=recv_ns, ts_exch=0, ticker=ticker, sid=0, seq=0, yes_bids=yes, no_bids=no)
 
 
 def rest_trade_to_event(row: dict, recv_ns: int) -> KalshiTrade:

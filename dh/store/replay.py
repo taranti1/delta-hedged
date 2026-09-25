@@ -309,8 +309,13 @@ def _kalshi_sequencer() -> Any | None:
 class Normalizers:
     """Per-stream normalizer dispatch with explicit state (one instance per replay).
 
-    ``kalshi_use_yes_price`` must match the live KalshiWS setting used when recording
-    (config/kalshi*.yaml ws.use_yes_price, default false).
+    ``kalshi_use_yes_price``: NO-side price convention of Kalshi order books on connections
+    that do not declare one. The live KalshiWS declares its ws.use_yes_price in each 'connected'
+    record and two-sided snapshots prove the convention themselves (dh.kalshi.sequencer), so
+    this fallback only applies to recordings made before the declaration existed -- all
+    no-leg: False, the default -- and to a replay that starts mid-connection (its 'connected'
+    record outside the window) until a snapshot proves the convention: pass True there for
+    recordings made with use_yes_price=true.
     """
 
     def __init__(self, strict: bool = False, kalshi_use_yes_price: bool = False) -> None:
