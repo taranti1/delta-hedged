@@ -277,7 +277,8 @@ def summarize(res: ScanResult, thresholds_c: Sequence[float] = THRESHOLDS_C, n_b
         row = {"threshold_c": thr, "opportunities": len(o), "opportunities_per_day": len(o) / res.days,
                "attempts": len(t), "filled": len(filled),
                "fill_rate": len(filled) / len(t) if len(t) else math.nan,
-               "contracts": float(filled["contracts"].sum()) if len(filled) else 0.0}
+               "contracts": float(filled["contracts"].sum()) if len(filled) else 0.0,
+               "events": int(filled["event"].nunique()) if len(filled) and "event" in filled else 0}
         for col, name in (("net_5s_c", "net_5s"), ("net_60s_c", "net_60s"), ("net_settle_c", "net_settle")):
             if len(filled) and col not in filled:
                 continue
@@ -357,6 +358,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
         ok_all &= bool(good)
         reasons.append(f"{p}: net {r.net_settle_c:.2f}c [{r.net_settle_lo_c:.2f}, {r.net_settle_hi_c:.2f}], "
                        f"{r.opportunities_per_day:.0f} opp/day")
+    dec = summ[summ.policy.isin(["B", "C"]) & (summ.threshold_c == 0.5)] if len(summ) else summ
+    rep.decision_events = int(dec["events"].min()) if len(dec) and "events" in dec else None
     rep.verdict = ("ACCEPT" if ok_all else "REJECT/INCONCLUSIVE (taking stays disabled)") + " — " + "; ".join(reasons)
     for w in inputs_meta(uni, t0)[1]:
         rep.line(f"WARNING: {w}")

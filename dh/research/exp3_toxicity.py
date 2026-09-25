@@ -51,7 +51,15 @@ from dh.core.events import ExtBBO, ExtBookDelta, ExtBookSnapshot, KalshiFill, Ka
 from dh.core.units import NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.execution.markout import DEFAULT_HORIZONS_S, AsOf, compute_markouts
 from dh.feeds.registry import SPOT_CONSTITUENTS
-from dh.research.exp_common import Report, cluster_mean_ci, fmt_ns, paired_diff_ci, policy_letter, write_csv
+from dh.research.exp_common import (
+    Report,
+    cluster_mean_ci,
+    fmt_ns,
+    n_events,
+    paired_diff_ci,
+    policy_letter,
+    write_csv,
+)
 from dh.research.replay_env import Universe, build_universe, inputs_meta, prime_probe, probe_for_window, run_replay
 from dh.strategy.config import StrategyConfig
 from dh.strategy.mm import MarketMaker
@@ -569,7 +577,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                                 "markout_10s_base_c": base.summary.get("markout_10s_c", math.nan),
                                 "markout_10s_guard_c": guard.summary.get("markout_10s_c", math.nan),
                                 "usd_day_base": base.summary.get("net_usd_per_day", 0.0),
-                                "usd_day_guard": guard.summary.get("net_usd_per_day", 0.0)})
+                                "usd_day_guard": guard.summary.get("net_usd_per_day", 0.0),
+                                "events": n_events(a, b)})
     cancel = pd.DataFrame(cancel_rows)
     met = pd.concat(metrics, ignore_index=True) if metrics else pd.DataFrame()
     unit = pd.concat(uni_tabs, ignore_index=True) if uni_tabs else pd.DataFrame()
@@ -595,6 +604,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                        "rule_threshold": rule.threshold if rule else "n/a (too few training fills)",
                        "rule_train_fills": rule.train_fills if rule else 0,
                        "rule_removed_share_train": rule.removed_share_train if rule else math.nan})
+    rep.decision_events = int(cancel["events"].min()) if len(cancel) else None
     if len(cancel):
         good = all((r.d_net_lo_c > 0) and (r.d_net_c >= 0.1) and (r.fill_loss_pct <= 20.0) for r in cancel.itertuples())
         vanish_c = any(r.policy == "C" and not (r.d_net_lo_c > 0) for r in cancel.itertuples())

@@ -50,7 +50,7 @@ from dh.core.units import NS_PER_MS, NS_PER_S
 from dh.feeds.composite import BrtiParams, brti_replica, nowcast
 from dh.feeds.registry import SPOT_CONSTITUENTS, has_normalizer
 from dh.kalshi.normalize import ws_message_to_events
-from dh.research.exp_common import Report, fmt_ns, paired_diff_ci, policy_letter
+from dh.research.exp_common import Report, fmt_ns, n_events, paired_diff_ci, policy_letter
 from dh.research.replay_env import (
     MD_CACHE_PREFIX,
     Universe,
@@ -436,6 +436,7 @@ def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta:
         # at the fill (to_settle_c = (settle - F_fill) s uses each run's own F, so compare the net)
         for name, df_ in (("base", a), ("nowcast", b)):
             row[f"fees_c_{name}"] = 100.0 * float(df_["fee"].sum() / df_["contracts"].sum()) if len(df_) else math.nan
+        row["events"] = n_events(a, b)
         row["warnings"] = "; ".join(warns)
         rows.append(row)
     return pd.DataFrame(rows)
@@ -474,6 +475,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     gain_ok = bool(len(best)) and bool((best.groupby("horizon")["rmse_gain_pct"].max() >= 10.0).all())
     gain_bad = bool(len(best)) and bool((best.groupby("horizon")["rmse_gain_pct"].max() < 5.0).all())
     pnl_ok = bool(len(hook)) and bool((hook["d_net_lo_c"] > 0).all())
+    rep.decision_events = int(hook["events"].min()) if len(hook) and "events" in hook else None
     if gain_ok and pnl_ok:
         rep.verdict = "ACCEPT (RMSE gain >= 10% at every short horizon and replay P&L improves under B and C)"
     elif gain_bad or (len(hook) and (hook["d_net_hi_c"] < 0).any()):

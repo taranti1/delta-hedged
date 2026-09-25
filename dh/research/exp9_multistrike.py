@@ -82,6 +82,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
             a, b = a.iloc[0], b.iloc[0]
             ok &= bool(b.usd_per_day > a.usd_per_day and b.delta_turnover_per_ct < a.delta_turnover_per_ct)
         verdicts.append(f"{v}: {'IMPROVES' if ok else 'no improvement'}")
+    rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
     rep.verdict = "; ".join(verdicts) + f" (vs {ref})"
     for w in run_warnings(runs):
         rep.line(f"WARNING: {w}")

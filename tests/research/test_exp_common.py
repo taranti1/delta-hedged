@@ -84,3 +84,23 @@ def test_capacity_interpolation_and_scaling():
     assert c5.quoting.clip_contracts == 5 * cfg.quoting.clip_contracts
     assert c5.risk.max_pos_per_market == 5 * cfg.risk.max_pos_per_market
     assert scaled_cfg(cfg, 5, scale_limits=False).risk == cfg.risk
+
+
+def test_verdicts_need_enough_settlement_events(tmp_path):
+    """A decision over fewer than MIN_DECISION_EVENTS settlement events is reported INCONCLUSIVE
+    (event-bootstrap CIs over a handful of clusters are far too narrow); E6/E7 buckets likewise."""
+    from dh.research.exp67_segments import add_recommendation
+    from dh.research.exp_common import MIN_DECISION_EVENTS, n_events
+
+    r = Report("ex", "Example", tmp_path, rule="accept if x")
+    r.verdict = "ACCEPT"
+    r.decision_events = 4
+    assert r.final_verdict().startswith("INCONCLUSIVE") and "Rule outcome on this sample: ACCEPT" in r.final_verdict()
+    assert "settlement events behind the decision | 4" in r.write().read_text()
+    r.decision_events = MIN_DECISION_EVENTS
+    assert r.final_verdict() == "ACCEPT"
+    assert n_events(pd.DataFrame({"event": ["a", "b"]}), pd.DataFrame({"event": ["b", "c"]}), None) == 3
+    t = pd.DataFrame({"tau_bucket": ["x", "x", "y", "y", "z"], "policy": ["B", "C", "B", "C", "B"],
+                      "events": [25, 25, 4, 4, 30], "net_lo_c": [0.1, 0.2, 0.1, 0.2, 0.5], "net_hi_c": [1, 1, 1, 1, 1]})
+    rec = add_recommendation(t, ["tau_bucket"]).groupby("tau_bucket")["recommendation"].first().to_dict()
+    assert rec == {"x": "quote", "y": "insufficient data", "z": "insufficient data"}  # z: C missing

@@ -155,6 +155,10 @@ replay's per-fill ledger is written by `replay` (`ledger_<policy>.csv`).
 
 Data needs are minimums for CIs that can decide (>= 200 settlement events per reported segment
 is the E0 convention); every command also takes `--root/--t0/--t1/--out/--jobs/--warm/--seed`.
+A verdict backed by fewer than 20 settlement events is printed as INCONCLUSIVE (the decision rule's
+outcome on that sample stays in the text; `exp_common.MIN_DECISION_EVENTS`), and E6/E7 buckets need
+>= 20 events under both B and C for a quote/disable recommendation: event-bootstrap CIs over a
+handful of clusters are far too narrow.
 
 | # | module | data needed | command | replays (B,C) | outputs | decision rule (docs/TEST_MATRIX.md) |
 |---|---|---|---|---|---|---|

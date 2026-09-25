@@ -1,3 +1,0 @@
-synthetic,policy,threshold,fills_base,fills_guard,fill_loss_pct,net_c_base,net_c_guard,d_net_c,d_net_lo_c,d_net_hi_c,markout_10s_base_c,markout_10s_guard_c,usd_day_base,usd_day_guard
-True,B,0.533518,77,53,34.9118,5.37846,1.35455,-4.02391,-7.17234,-1.69644,0.847371,0.179452,670.56,109.92
-True,C,0.533518,73,48,34.3478,6.10435,1.31788,-4.78647,-6.80845,-3.04174,0.331982,0.2019,673.92,95.52

@@ -319,6 +319,18 @@ def markdown_table(df: pd.DataFrame, max_rows: int = 60) -> str:
     return "\n".join(lines) + "\n"
 
 
+MIN_DECISION_EVENTS = 20  # settlement events behind an ACCEPT/REJECT (event-clustered CIs need many clusters)
+
+
+def n_events(*dfs: pd.DataFrame | None) -> int:
+    """Distinct settlement events over ledger-like frames (column ``event``)."""
+    evs: set[Any] = set()
+    for d in dfs:
+        if d is not None and len(d) and "event" in d:
+            evs.update(d["event"].dropna().unique().tolist())
+    return len(evs)
+
+
 @dataclass
 class Report:
     """CSV per table + one short markdown file per experiment.
@@ -336,6 +348,18 @@ class Report:
     tables: list[tuple[str, pd.DataFrame, str]] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)
     verdict: str = ""
+    decision_events: int | None = None  # settlement events behind the verdict (None: not event-based)
+    min_events: int = MIN_DECISION_EVENTS
+
+    def final_verdict(self) -> str:
+        """The verdict, downgraded to INCONCLUSIVE when fewer than ``min_events`` settlement events
+        stand behind it (the rule's outcome on the sample is kept in the text)."""
+        v = self.verdict
+        if v and self.decision_events is not None and self.decision_events < self.min_events:
+            v = (f"INCONCLUSIVE — only {self.decision_events} settlement event(s) behind the decision (< "
+                 f"{self.min_events}; event-bootstrap CIs over so few events are unreliable). Rule outcome on this "
+                 f"sample: {self.verdict}")
+        return v
 
     def table(self, key: str, df: pd.DataFrame, note: str = "") -> None:
         self.tables.append((key, df if df is not None else pd.DataFrame(), note))
@@ -354,16 +378,19 @@ class Report:
         md = [f"# {self.title}", ""]
         if self.synthetic:
             md += [SYNTHETIC_NOTE, ""]
-        if self.meta:
+        meta = dict(self.meta)
+        if self.decision_events is not None:
+            meta["settlement events behind the decision"] = self.decision_events
+        if meta:
             md.append("| run | |")
             md.append("|---|---|")
-            for k, v in self.meta.items():
+            for k, v in meta.items():
                 md.append(f"| {k} | {_fmt_cell(v)} |")
             md.append("")
         if self.rule:
             md += [f"**Decision rule (docs/TEST_MATRIX.md):** {self.rule}", ""]
         if self.verdict:
-            v = self.verdict + (" _(synthetic: pipeline check only, not a trading decision)_" if self.synthetic else "")
+            v = self.final_verdict() + (" _(synthetic: pipeline check only, not a trading decision)_" if self.synthetic else "")
             md += [f"**Verdict:** {v}", ""]
         md += [f"- {x}" for x in self.lines]
         if self.lines:

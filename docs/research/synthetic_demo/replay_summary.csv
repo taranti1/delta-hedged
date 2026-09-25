@@ -1,4 +1,0 @@
-synthetic,policy,fills,contracts,net_c_per_contract,net_c_ci95,net_usd,markout_10s_c,quotes_placed,cancels,markets,added_late,fv_warm,wall_s
-True,A,138,461.5,3.72481,"(1.4218750000000002, 6.562077035937137)",17.19,0.919976,1733,1644,36,36,recorded_brti,124.3
-True,B,136,452.68,3.69135,"(1.4201306105525038, 6.586933164514511)",16.71,0.904464,1688,1608,36,36,recorded_brti,125.2
-True,C,129,413.5,2.75937,"(-1.4332425068119885, 6.1724920466595945)",11.41,0.241636,1782,1706,36,36,recorded_brti,128.3

@@ -102,6 +102,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                 (r.get("d_lo_c", math.nan) > 0) and (r.get("d_net_vs_ref_c", math.nan) > 0.05)
                 and (r.get("d_usd_per_day_vs_ref", math.nan) > 0) for _, r in rows.iterrows()):
             winners.append(v)
+    rep.decision_events = int(tab["events"].min()) if len(tab) and "events" in tab else None
     rep.verdict = (f"ACCEPT: {', '.join(winners)} beat re-centering under B and C" if winners else
                    "NO DECISION: no variant beats always-re-centering by > 0.05c/contract with CI > 0 under both B and C")
     for w in run_warnings(runs):

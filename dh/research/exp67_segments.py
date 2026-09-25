@@ -11,8 +11,8 @@ bootstrap CI, gross edge, fees, markouts at 10 s / 60 s (vs the fair value at fi
 (net 10 s markout < 0), $/day.
 
 Decision rule (E6/E7): quote only buckets whose net CI lower bound > 0; disable buckets whose CI
-upper bound < 0 (here required under BOTH B and C to enable, under EITHER to disable);
-everything else 'insufficient data'.
+upper bound < 0 (here required under BOTH B and C to enable, under EITHER to disable), each
+only for buckets with >= 20 settlement events; everything else 'insufficient data'.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from dh.research.exp_common import (
+    MIN_DECISION_EVENTS,
     Report,
     flag_only_A,
     fmt_ns,
@@ -72,17 +73,19 @@ def segment_tables(dfs: dict[str, pd.DataFrame], days: float, n_boot: int = 300)
     return res
 
 
-def add_recommendation(t: pd.DataFrame, keys: Sequence[str]) -> pd.DataFrame:
+def add_recommendation(t: pd.DataFrame, keys: Sequence[str], min_events: int = MIN_DECISION_EVENTS) -> pd.DataFrame:
+    """quote: CI lower bound > 0 under B AND C; disable: CI upper bound < 0 under B or C; each
+    only with >= ``min_events`` settlement events in the bucket (else 'insufficient data')."""
     t = t.copy()
     t["recommendation"] = "insufficient data"
     for _, g in t.groupby(list(keys), observed=True, dropna=False):
         bc = g[g["policy"].isin(["B", "C"])]
-        if not len(bc):
+        if not len(bc) or ("events" in bc and int(bc["events"].min()) < min_events):
             continue
         rec = "insufficient data"
         if (bc["net_hi_c"] < 0).any():
             rec = "disable"
-        elif len(bc) == bc["policy"].nunique() and bc["policy"].nunique() >= 1 and (bc["net_lo_c"] > 0).all():
+        elif set(bc["policy"]) >= {"B", "C"} and (bc["net_lo_c"] > 0).all():
             rec = "quote"
         t.loc[g.index, "recommendation"] = rec
     return t

@@ -1,5 +1,0 @@
-synthetic,tau_bucket,n,expirations,rmse_base_usd,rmse_model_usd,mae_base_usd,mae_model_usd,rmse_gain_pct
-True,0-15s,45,3,2.51403,2.44153,1.75542,1.68081,2.8837
-True,15-30s,45,3,7.49219,7.18709,5.73345,5.76904,4.07226
-True,30-60s,90,3,47.3467,47.0651,38.9071,38.7021,0.594751
-True,60-120s,180,3,122.202,122.009,103.699,103.539,0.158241
