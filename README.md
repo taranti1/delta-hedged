@@ -7,7 +7,8 @@ of recorded data.
 
 **Start with [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md)** (deliverables A-K). Every claim there
 is tagged [VERIFIED] (real data, reproducible), [BUILT] (implemented and tested offline, live
-verification pending) or [ESTIMATE].
+verification pending) or [ESTIMATE]. [`docs/CORE_QUESTIONS.md`](docs/CORE_QUESTIONS.md) answers
+the 12 core research questions one by one, each with its status and the test that settles it.
 
 ## What is established so far
 

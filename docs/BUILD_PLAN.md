@@ -118,7 +118,8 @@ selection comes from fills landing within 10 ms of our cancel (the migration rul
 
 `docs/TEST_MATRIX.md` gives, for every hypothesis: hypothesis, dataset, dependent variable,
 features, benchmark, method, and accept and reject rules. It covers E0-E10 plus fair-value
-calibration, the settlement-convention check and incentives.
+calibration, the settlement-convention check and incentives. `docs/CORE_QUESTIONS.md` maps the
+12 core research questions to their current answers and the tests that settle them.
 
 Results so far:
 - **Fair value:** [VERIFIED], `docs/research/01_*`.
