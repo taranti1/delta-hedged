@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 
 from dh.core.actions import AmendOrder, CancelAll, CancelOrder, Halt, PlaceOrder
@@ -19,6 +20,7 @@ from dh.core.events import (
     KalshiPositionSnapshot,
     OrderAck,
     OrderReject,
+    RiskStateSeed,
     Timer,
 )
 from dh.core.units import NS_PER_MS, NS_PER_S
@@ -33,7 +35,7 @@ from dh.store.recorder import Recorder
 from dh.store.replay import iter_raw
 
 from .fakes import T0, FakeRest, RecordingStrategy, fill_row, order_row, unknown
-from .test_runner import SPEC, TK, OrderingStrategy, cfg, live_runner
+from .test_runner import SPEC, TK, OrderingStrategy, cfg, confirm_read, live_runner
 
 
 def statuses(s, stream):
@@ -353,7 +355,8 @@ async def test_constant_discrepancy_is_confirmed_while_fills_keep_coming():
     clock = {"t": T0}
     r, _, _ = live_runner(s, config=cfg(position_confirm_s=5.0), clock_ns=lambda: clock["t"])
     for k in range(3):  # one fill lost at the start; trading goes on (exchange and ours both move)
-        r.push_side("positions", {TK: 100 * (k + 1)})
+        confirm_read(r, clock["t"])  # the loop's fills read (REST lacks the lost fill too) ...
+        r.push_side("positions", {TK: 100 * (k + 1)})  # ... then positions
         r.process_pending()
         s.om.on_event(KalshiFill(clock["t"] + 1, 0, TK, f"tr-{k}", "o-1", "", "bid", 4500, 100, False, 0, 0, False))
         clock["t"] += 6 * NS_PER_S
@@ -377,25 +380,50 @@ async def test_persistent_clock_offset_blocks_orders():
     assert clk == [("runner.clock", "stale"), ("runner.clock", "resumed")]
 
 
-async def test_watchdog_cancel_all_marker_holds_orders_and_reconciles(tmp_path):
+def _marker(path, t: int, watched) -> None:
+    write_json_atomic(path, {"t": t, "ok": True, "by": "watchdog", "pid": 99, "watched": watched})
+    os.utime(path, ns=(t, t))  # distinct mtimes (the runner reads a marker once per mtime)
+
+
+async def test_watchdog_marker_only_counts_after_start_and_halts_when_it_watched_us(tmp_path):
+    """A marker older than this runner is ignored; one about another runner (a restart racing
+    a trigger) holds orders for the cancel-all tail and reconciles; one about THIS runner
+    means it was alive but unresponsive: Halt(all), persisted at once, the strategy told."""
     s = OrderingStrategy(n=0)
     clock = {"t": T0}
     marker = tmp_path / "hb.json.cancel_all"
-    r, venue, rest = live_runner(s, clock_ns=lambda: clock["t"], cancel_all_marker=marker,
-                                 config=cfg(cancel_all_hold_s=60.0))
-    write_json_atomic(marker, {"t": T0, "ok": True, "by": "watchdog"})
-    r.push(IndexTick(T0 + 1, T0, "BRTI", 84000.0, "5hz"))
-    r.process_pending()
-    r.process_pending()
-    assert {"cancel_all_hold", "reconciling"} <= set(r.gate.reasons)
+    store = RiskStateStore(tmp_path / "risk.json")
+    _marker(marker, T0 - NS_PER_S, [1, "live-before"])  # left by an earlier trigger
+    r, venue, rest = live_runner(s, clock_ns=lambda: clock["t"], cancel_all_marker=marker, session_id="live-me",
+                                 config=cfg(cancel_all_hold_s=60.0), risk_store=store)
+    assert r.started_ns == T0
+
+    def step(t):
+        clock["t"] = t
+        r._next_marker_check = 0  # noqa: SLF001 - the check runs once a second of monotonic time
+        r.push(IndexTick(t, t, "BRTI", 84000.0, "5hz"))
+        r.process_pending()
+        r.process_pending()
+
+    step(T0 + 1)
+    assert not ({"cancel_all_hold", "reconciling", "halt:all"} & set(r.gate.reasons))
+    _marker(marker, T0 + 2 * NS_PER_S, [1, "live-other"])
+    step(T0 + 2 * NS_PER_S + 1)
+    assert {"cancel_all_hold", "reconciling"} <= set(r.gate.reasons) and "halt:all" not in r.gate.reasons
     assert statuses(s, RECONCILE_STREAM) == ["stale"]
     await asyncio.sleep(0.02)
     assert "iter_fills" in rest.names()  # our order view is reconciled too
-    clock["t"] = T0 + 61 * NS_PER_S
-    r.push(IndexTick(clock["t"], clock["t"], "BRTI", 84000.0, "5hz"))
-    r.process_pending()
-    r.process_pending()
-    assert "cancel_all_hold" not in r.gate.reasons and statuses(s, RECONCILE_STREAM) == ["stale", "resynced"]
+    _marker(marker, T0 + 3 * NS_PER_S, [os.getpid(), "live-me"])
+    step(T0 + 3 * NS_PER_S + 1)
+    assert "halt:all" in r.gate.reasons
+    st = store.load()
+    assert st.halted and st.halt_reason == "watchdog_cancel_all" and st.halt_scope == "all" and st.halt_day_ns
+    seeds = [e for e in s.events if isinstance(e, RiskStateSeed)]
+    assert seeds and seeds[-1].halted and seeds[-1].halt_reason == "watchdog_cancel_all"
+    await venue.wait_idle(1.0)
+    assert "cancel_all_orders" in rest.names()  # this strategy has no risk engine: the runner cancelled
+    live = RiskStateStore(tmp_path / "risk.json").load()
+    assert live.halted  # a restart carries it (sticky): the operator investigates first
 
 
 # ============================================================================ C1: persistence

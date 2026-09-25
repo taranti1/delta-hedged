@@ -42,16 +42,29 @@ Safety
     close-time / tick-grid change or a spec change found by re-discovery. Cancels always pass.
   * Data lag: the larger of the runner-queue lag and the exchange-time lag of Kalshi market
     data (BRTI source time, trade / book-delta ts_ms, relative to a trailing latency
-    baseline, so frames piling up in the WebSocket receive buffer are seen). Above
-    ``max_lag_s`` the gate closes and the strategy gets FeedStatus('runner.lag', 'stale')
-    (it cancels its quotes); FeedStatus('runner.lag', 'resumed') once fresh data has kept
-    the lag below max_lag_s/2 for ``lag_resume_s``.
+    baseline capped at ``loop.baseline_cap_ms()``, so frames piling up in the WebSocket
+    receive buffer are seen, even when the backlog was there from the start or outlasts the
+    baseline window). Above ``max_lag_s`` the gate closes (before the strategy sees the event
+    that revealed it) and the strategy gets FeedStatus('runner.lag', 'stale') right after
+    that event (it cancels its quotes); FeedStatus('runner.lag', 'resumed') once fresh data
+    has kept the lag below max_lag_s/2 for ``lag_resume_s``.
   * Own-activity reconciliation (FeedStatus 'kalshi.reconcile' stale ... resynced): after a
     Kalshi WS disconnect (fills and order updates of the outage are lost: the private
     channels carry no sequence numbers) the runner back-fills GET /portfolio/fills since the
     disconnect, checks positions and resting orders, then resumes; also during the hold
-    after a global cancel-all (start-up, watchdog). Fills are also back-filled every
-    ``fills_backfill_interval_s``.
+    after a global cancel-all (start-up). Fills are also back-filled every
+    ``fills_backfill_interval_s``. A position difference is confirmed (-> the strategy
+    halts) only by a REST positions read that follows a REST fills read made after the
+    difference was first seen (a fill the WebSocket lost is back-filled instead); a WS
+    market_position message never confirms on its own.
+  * The watchdog's cancel-all marker, written after this runner started while it watched
+    this runner: the runner was unresponsive long enough for the watchdog to act -> Halt(all)
+    (a sticky halt: the operator investigates and restarts). A marker about another runner
+    (a restart racing a trigger) holds new orders for the cancel-all tail and reconciles.
+  * Clock (live): a sample counts as bad unless chronyc / timedatectl measured it, it is
+    synchronised and its estimated error is small; persistent exchange timestamps from the
+    future prove the local clock behind. Bad samples block new orders like a large offset.
+  * Background loops are supervised: one that dies stops the runner (exit 4).
   * Global CancelAll: with a Halt in the same cycle -> DELETE /portfolio/events/orders (then
     new orders are held ``cancel_all_hold_s``: Kalshi may cancel orders placed during the
     minute after a cancel-all); without one -> the OrderManager's working orders are
@@ -61,8 +74,11 @@ Safety
     (REST) and stop.
   * Heartbeat file every ``heartbeat_interval_s`` while the consumer is alive (watchdog);
     'stopping' only for ``shutdown_timeout_s`` (a hung shutdown goes stale).
-  * Risk state (day P&L, carried halt, pause) persisted every ``risk_state_interval_s``, on
-    every Halt and at shutdown (dh.live.riskstate); the next session's seed reads it.
+  * Risk state (day P&L split into realized and mark, halt with its scope and UTC day, pause,
+    budget base) persisted every ``risk_state_interval_s``, on every Halt (fsync) and at
+    shutdown (dh.live.riskstate); the next session's seed reads it. Positions of events
+    excluded from the session are tracked at their start-up marks (RiskBook); when one of
+    those markets settles, an updated RiskStateSeed tells the strategy at once.
   * Graceful shutdown: gate closed, consumer drained, in-flight requests awaited, cancel-all
     via REST verified with the resting-order list, order group deleted, sources stopped.
 """
@@ -114,13 +130,16 @@ from dh.core.events import (
     KalshiTicker,
     KalshiTrade,
     OrderReject,
+    RiskStateSeed,
+    Settlement,
     Timer,
 )
 from dh.core.market import MarketSpec
-from dh.core.units import NS_PER_S, PX_SCALE
+from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE
 from dh.live.config import LiveConfig
 from dh.live.monitor import JsonLog, KillFile, Metrics, MetricsServer, write_heartbeat
 from dh.live.pump import EventPump, OrderingError
+from dh.live.riskstate import CARRIED, RiskBook, day_start, payout_px
 from dh.live.startup import spec_to_dict
 
 log = logging.getLogger("dh.live.runner")
@@ -139,6 +158,9 @@ MARKET_DATA = (IndexTick, KalshiBookDelta, KalshiBookSnapshot, KalshiTrade, Kals
 LAG_TYPES = (IndexTick, KalshiBookDelta, KalshiTrade, KalshiTicker)
 OWN_TYPES = (KalshiFill, KalshiOrderUpdate, KalshiPositionSnapshot)
 DAY_NS = 86_400 * NS_PER_S
+# LoopCfg().baseline_cap_ms() (clock_block_ms 250 + 100): a LagMeter built without a cap uses it
+DEFAULT_BASELINE_CAP_NS = 350 * NS_PER_MS
+CLOCK_SOURCES = ("chronyc", "timedatectl")  # samples from anything else cannot measure the offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,15 +253,24 @@ class SeenIds:
 class LagMeter:
     """Exchange-time data lag. age = now - ts_exch; the per-source baseline is the smallest
     age seen over a trailing window (network + relay latency + clock offset, bucketed per
-    minute); excess = age - baseline. The lag is the SMALLEST excess over the last
-    ``confirm_ns`` (batched relays deliver some ticks late; a real backlog delays them all)."""
+    minute), CAPPED at ``cap_ns``; excess = age - baseline. The lag is the SMALLEST excess
+    over the last ``confirm_ns`` (batched relays deliver some ticks late; a real backlog
+    delays them all).
 
-    def __init__(self, window_ns: int, confirm_ns: int, bucket_ns: int = 60 * NS_PER_S) -> None:
+    The cap (about clock_block_ms + 100 ms) keeps a backlog that was present when the window
+    started, or that lasts longer than the window, from becoming the baseline: normal latency
+    plus a tolerable clock offset stays below it, anything above is lag. ``raw_base`` keeps
+    each source's uncapped smallest age (alarm and metric when it exceeds the cap)."""
+
+    def __init__(self, window_ns: int, confirm_ns: int, bucket_ns: int = 60 * NS_PER_S,
+                 cap_ns: int | None = DEFAULT_BASELINE_CAP_NS) -> None:
         self.window_ns = max(bucket_ns, int(window_ns))
         self.confirm_ns = max(0, int(confirm_ns))
         self.bucket_ns = bucket_ns
+        self.cap_ns = int(cap_ns) if cap_ns and cap_ns > 0 else None
         self._base: dict[str, deque[list[int]]] = {}
         self._recent: deque[tuple[int, float]] = deque()
+        self.raw_base: dict[str, int] = {}  # source -> smallest age in the window (uncapped), ns
 
     @staticmethod
     def key(ev: Event) -> str:
@@ -252,7 +283,8 @@ class LagMeter:
         if te <= 0:
             return self.current(now)
         age = now - te
-        dq = self._base.setdefault(self.key(ev), deque())
+        k = self.key(ev)
+        dq = self._base.setdefault(k, deque())
         b = now - now % self.bucket_ns
         if dq and dq[-1][0] == b:
             dq[-1][1] = min(dq[-1][1], age)
@@ -260,10 +292,27 @@ class LagMeter:
             dq.append([b, age])
         while dq and dq[0][0] < now - self.window_ns:
             dq.popleft()
-        base = min(x[1] for x in dq)
+        raw = min(x[1] for x in dq)
+        self.raw_base[k] = raw
+        base = raw if self.cap_ns is None else min(raw, self.cap_ns)
         ex = max(0, age - base) / NS_PER_S
         self._recent.append((now, ex))
         return self.current(now)
+
+    def over_cap(self, key: str) -> int | None:
+        """The uncapped baseline of ``key`` when it exceeds the cap, else None."""
+        raw = self.raw_base.get(key)
+        return raw if raw is not None and self.cap_ns is not None and raw > self.cap_ns else None
+
+    def behind_ns(self, now: int) -> int:
+        """Proof that the local clock is BEHIND exchange time (a latency is never negative):
+        when every source seen in the last two buckets has a negative smallest age there, the
+        clock is behind by at least the least negative of them; else 0."""
+        recent = now - now % self.bucket_ns - self.bucket_ns
+        lows = [dq[-1][1] for dq in self._base.values() if dq and dq[-1][0] >= recent]
+        if not lows or max(lows) >= 0:
+            return 0
+        return -max(lows)
 
     def current(self, now: int) -> float:
         r = self._recent
@@ -302,6 +351,9 @@ class LiveRunner:
         session_id: str = "",
         risk_store: Any = None,
         cancel_all_marker: str | Path | None = None,
+        risk_book: RiskBook | None = None,
+        started_ns: int | None = None,
+        clock_sampler: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         if mode not in ("paper", "live"):
             raise ValueError(f"mode {mode!r}")
@@ -332,6 +384,10 @@ class LiveRunner:
         self.series = tuple(series)
         self.session_id = session_id
         self.risk_store = risk_store
+        self.riskbook = risk_book if risk_book is not None else RiskBook()
+        # markers of the watchdog written before this runner started are not about it
+        self.started_ns = int(started_ns) if started_ns is not None else self._clock()
+        self._clock_sampler = clock_sampler
         self.subaccount = int(getattr(self.venue, "sub", 0) or 0) if self.venue is not None else 0
         self.period_ns = int(period_ns)
         self.pump = EventPump(strategy, self.period_ns, sim=self.sim, on_actions=self._on_actions,
@@ -368,9 +424,15 @@ class LiveRunner:
         self.fills_seen = SeenIds()
         self._cancel_sent: dict[str, int] = {}  # coid -> last cancel dispatch ts (bounded)
         self._halt_until: dict[str, int] = {}  # gate reason -> reopen ts (0 = manual)
+        self._halt_info: dict[str, tuple[str, int, str]] = {}  # manual halt key -> (reason, UTC day decided, scope)
+        self._post_feed: list[Event] = []  # derived events injected right after the current event
+        # the latest REST fills read with no minimum age that was processed: (window start, read start) ns
+        self._fills_checked: tuple[int, int] = (0, 0)
         # data lag (M1)
         lc = self.cfg.loop
-        self.lag_meter = LagMeter(int(lc.lag_window_s * NS_PER_S), int(lc.lag_confirm_s * NS_PER_S))
+        self.lag_meter = LagMeter(int(lc.lag_window_s * NS_PER_S), int(lc.lag_confirm_s * NS_PER_S),
+                                  cap_ns=int(lc.baseline_cap_ms() * NS_PER_MS))
+        self._lag_cap_alarm: dict[str, int] = {}  # source -> last over-cap alarm (ns)
         self._lag_ok_since = 0
         # own-activity reconciliation (M3) and cancel-all holds
         self._recon: dict[str, int] = {}  # reason -> since ns
@@ -567,6 +629,11 @@ class LiveRunner:
                 self._lag_stale(self.pump.last_ts + 1, "stall", stall_s=round((ev.ts - nxt) / NS_PER_S, 3))
             if isinstance(ev, LAG_TYPES):
                 lag_after = self._lag_update(ev)
+                if lag_after == "stale":
+                    # closed BEFORE the strategy sees the event that revealed the lag: orders it
+                    # decides on that event are gate-rejected (the FeedStatus follows the event,
+                    # which ends its WebSocket frame, so replay order is unchanged)
+                    self._lag_gate_close(ev.ts, "lag")
         if self.venue is not None:
             self.venue.observe(ev)
         self._pre_event(ev)
@@ -578,9 +645,15 @@ class LiveRunner:
             self.pump.feed(ev)
         # state changes that tell the strategy something come AFTER the event that caused them
         if lag_after == "stale":
-            self._lag_stale(ev.ts, "lag", lag_s=round(self._lag_s, 3))
+            self._lag_announce(ev.ts, "lag", lag_s=round(self._lag_s, 3))
         elif lag_after == "resumed":
             self._lag_resumed(ev.ts)
+        if self._post_feed:
+            post, self._post_feed = self._post_feed, []
+            for x in post:
+                x = dataclasses.replace(x, ts=ev.ts) if x.ts < ev.ts else x
+                self._pre_event(x)
+                self._inject(x)
         if live and isinstance(ev, FeedStatus) and ev.stream == "kalshi.ws":
             self._on_ws_status(ev)
 
@@ -591,6 +664,17 @@ class LiveRunner:
         x = self.lag_meter.observe(ev, now)
         lag = max(q, x)
         self._lag_s = lag
+        k = LagMeter.key(ev)
+        raw = self.lag_meter.over_cap(k)
+        if raw is not None and now - self._lag_cap_alarm.get(k, 0) >= 60 * NS_PER_S:
+            self._lag_cap_alarm[k] = now
+            cap = self.lag_meter.cap_ns or 0
+            self.metrics.inc("dh_lag_baseline_over_cap_total", source=k)
+            log.warning("exchange-time latency of %s has not been below %.0f ms for %.0f s (smallest age %.0f ms): "
+                        "lag counted from the cap (a backlog since start-up / longer than the window, or a clock "
+                        "offset)", k, cap / NS_PER_MS, self.lag_meter.window_ns / NS_PER_S, raw / NS_PER_MS)
+            self.jlog("lag_baseline_over_cap", ev.ts, source=k, raw_ms=round(raw / NS_PER_MS, 3),
+                      cap_ms=round(cap / NS_PER_MS, 3))
         lc = self.cfg.loop
         closed = "lag" in self.gate.reasons
         if lag > lc.max_lag_s:
@@ -607,16 +691,23 @@ class LiveRunner:
             self._lag_ok_since = 0
         return ""
 
-    def _lag_stale(self, inject_ts: int, why: str, **info: Any) -> None:
-        if not self.gate.close("lag", inject_ts):
-            return
+    def _lag_gate_close(self, ts: int, why: str) -> bool:
+        if not self.gate.close("lag", ts):
+            return False
         self._lag_ok_since = 0
         if why == "stall":
             self.metrics.inc("dh_loop_stalls_total")
         self.metrics.inc("dh_lag_episodes_total", why=why)
+        return True
+
+    def _lag_announce(self, inject_ts: int, why: str, **info: Any) -> None:
         log.warning("data lag (%s %s): new orders blocked, quotes cancelled", why, info)
         self.jlog("gate", inject_ts, action="close", reason="lag", why=why, **info)
         self._inject(FeedStatus(inject_ts, 0, LAG_STREAM, "stale", f"{why} {info}"[:200]))
+
+    def _lag_stale(self, inject_ts: int, why: str, **info: Any) -> None:
+        if self._lag_gate_close(inject_ts, why):
+            self._lag_announce(inject_ts, why, **info)
 
     def _lag_resumed(self, ts: int) -> None:
         if not self.gate.open("lag"):
@@ -645,6 +736,26 @@ class LiveRunner:
             self._on_fee_update(ev)
         elif isinstance(ev, KalshiMarketLifecycle):
             self._on_lifecycle(ev)
+        elif isinstance(ev, Settlement):
+            self._on_excluded_settlement(ev.ts, ev.ticker, int(ev.settlement_px), "determined")
+        elif isinstance(ev, RiskStateSeed):
+            self.riskbook.note_seed(ev)
+
+    def _on_excluded_settlement(self, ts: int, ticker: str, payout: int, how: str) -> None:
+        """A market of an event excluded from this session (a position held at start-up) was
+        determined: its start-up mark becomes the realized payout, and the strategy gets an
+        updated RiskStateSeed right after this event (the daily-loss limit sees it at once)."""
+        book = self.riskbook
+        if ticker not in book.excluded:
+            return
+        q, mark = book.settle(ticker, payout, ts) or (0, 0)
+        diff = q * (payout - mark) / 1e6
+        log.info("excluded position %s %+.2f settled at $%.4f (marked $%.4f): %+.2f vs the mark", ticker, q / 100,
+                 payout / PX_SCALE, mark / PX_SCALE, diff)
+        self.metrics.inc("dh_excluded_settlements_total")
+        self.jlog("excluded_settlement", ts, ticker=ticker, qty=q, mark_px=mark, payout_px=payout,
+                  pnl_vs_mark=round(diff, 6), how=how)
+        self._post_feed.append(RiskStateSeed(ts, 0, day_start(ts), book.seed_value(ts), False, "", 0))
 
     def _on_wake(self, ts: int) -> None:
         """Deliver due timers / simulator messages. If the timer grid is far behind the wake
@@ -687,8 +798,13 @@ class LiveRunner:
                 self._prune(max(ts, self.pump.last_ts))
 
     def _check_marker(self, ts: int) -> None:
-        """The watchdog cancelled everything (its marker file): hold new orders for the
-        cancel-all tail and reconcile (our view of the orders is stale)."""
+        """The watchdog cancelled everything (its marker file ``{"t", "watched": [pid, session]}``).
+
+        Only markers written after this runner started count (the app also renames a leftover
+        one at start-up). Watching THIS runner, the watchdog found its heartbeat stale while
+        it is alive: Halt(all), sticky, for the operator to investigate (a halting
+        RiskStateSeed reaches the strategy; recorded for replay). Watching another runner (a
+        restart racing a trigger): hold new orders for the cancel-all tail and reconcile."""
         p = self.cancel_all_marker
         try:
             st = p.stat()
@@ -697,18 +813,50 @@ class LiveRunner:
         if st.st_mtime_ns == self._marker_seen:
             return
         self._marker_seen = st.st_mtime_ns
+        watched: Any = None
         try:
             rec = json.loads(p.read_text())
             t = int(rec.get("t", 0))
+            watched = rec.get("watched")
         except (OSError, ValueError, TypeError, AttributeError):
-            t = st.st_mtime_ns
-        until = t + int(self.cfg.venue.cancel_all_hold_s * NS_PER_S)
-        if until <= ts:
+            t = st.st_mtime_ns  # unreadable: judged by its time, and taken as ours (fail safe)
+        if t <= self.started_ns:
+            self.jlog("watchdog_marker_ignored", ts, marker_t=t, started_ns=self.started_ns,
+                      note="written before this runner started")
             return
-        log.error("the watchdog cancelled every order (%s): holding new orders, reconciling", p)
-        self.jlog("watchdog_cancel_all_seen", ts, marker_t=t, hold_until=until)
         self.metrics.inc("dh_watchdog_cancel_alls_seen_total")
-        self.hold(until, "watchdog_cancel_all")
+        mine = watched is None or (isinstance(watched, (list, tuple)) and len(watched) == 2
+                                   and watched[0] == os.getpid() and str(watched[1]) == self.session_id)
+        if mine:
+            self._watchdog_halt(ts, t)
+            return
+        until = t + int(self.cfg.venue.cancel_all_hold_s * NS_PER_S)
+        log.error("the watchdog cancelled every order while watching another runner (%s): holding new orders, "
+                  "reconciling", watched)
+        self.jlog("watchdog_cancel_all_seen", ts, marker_t=t, hold_until=until, watched=watched, halt=False)
+        if until > ts:
+            self.hold(until, "watchdog_cancel_all")
+        self._reconcile_now(ts, "watchdog_cancel_all")
+
+    def _watchdog_halt(self, ts: int, marker_t: int) -> None:
+        """The watchdog triggered on this live runner: Halt(all) (gate, persisted sticky halt,
+        and a halting RiskStateSeed so the strategy halts and cancels through its own path)."""
+        key = "halt:all"
+        self._halt_until[key] = 0
+        self._halt_info.setdefault(key, ("watchdog_cancel_all", day_start(ts), "all"))
+        if self.gate.close(key, ts):
+            log.critical("the WATCHDOG cancelled every order while this runner was alive (its heartbeat went "
+                         "stale): HALT (investigate, then restart with --reset-daily-halt)")
+            self.metrics.set("dh_halted", 1.0, scope="all")
+            self.meta("halt", ts, scope="all", reason="watchdog_cancel_all")
+        self.jlog("watchdog_cancel_all_seen", ts, marker_t=marker_t, halt=True)
+        self.persist_risk_state(ts, fsync=True, halt_reason="watchdog_cancel_all")
+        st = max(ts, self.pump.last_ts)
+        seed = RiskStateSeed(st, 0, day_start(st), self.riskbook.seed_value(st), True, "watchdog_cancel_all", 0)
+        self._pre_event(seed)
+        self._inject(seed)
+        if not getattr(getattr(self.strategy, "risk", None), "halted_all", False):
+            self._cancel_all_async("watchdog_cancel_all")  # a strategy without a risk engine: cancel here
         self._reconcile_now(ts, "watchdog_cancel_all")
 
     def _schedule_wake(self) -> None:
@@ -833,6 +981,10 @@ class LiveRunner:
             self._halt_until[key] = max(self._halt_until.get(key, 0), a.until_ts)
         else:
             self._halt_until[key] = 0  # manual: never reopens by itself
+            # the UTC day the halt was decided (a carried halt keeps its original day): a
+            # daily-loss halt is carried into a restart on that day only (review N3)
+            carried = a.reason.startswith(CARRIED) and self.riskbook.halt_day_ns
+            self._halt_info.setdefault(key, (a.reason, self.riskbook.halt_day_ns if carried else day_start(ts), a.scope))
         if self.gate.close(key, ts):
             log.error("STRATEGY HALT scope=%s reason=%s", a.scope, a.reason)
             self.jlog("halt", ts, scope=a.scope, reason=a.reason, until_ts=a.until_ts)
@@ -876,6 +1028,7 @@ class LiveRunner:
                       qty=f.qty, taker=f.is_taker, reported=f.fee_micros, expected_net=expected, expected_trade=bd.trade_micros,
                       tolerance=tol)
             if self.cfg.venue.halt_on_fee_mismatch and self.gate.close("fee_mismatch", f.ts):
+                self._halt_info.setdefault("fee_mismatch", ("fee_mismatch", day_start(f.ts), "quoting"))
                 log.error("FEE MISMATCH %s reported=%d expected=%d: new orders blocked", f.ticker, f.fee_micros, expected)
                 self.meta("gate", f.ts, action="close", reason="fee_mismatch")
                 self._cancel_all_async("fee_mismatch")
@@ -920,6 +1073,10 @@ class LiveRunner:
         if ev.event_type == "created" and (not self.series or ev.ticker.split("-", 1)[0] in self.series):
             self._discover_now.set()
             return
+        if ev.event_type == "settled" and ev.ticker in self.riskbook.excluded:  # the 'determined' message was missed
+            px = payout_px(ev.result, ev.settlement_value)
+            if px is not None:
+                self._on_excluded_settlement(ev.ts, ev.ticker, px, "settled")
         spec = self.universe.get(ev.ticker)
         if spec is None:
             return
@@ -972,6 +1129,7 @@ class LiveRunner:
         attempt = 0
         while not self._stopping and gen == self._recon_gen:
             try:
+                t_fetch = self._clock()
                 rows = await v.fetch_fills(since_ns // NS_PER_S - int(vc.fills_backfill_margin_s))
                 pos = await v.fetch_positions()
                 resting = await v.resting_orders()
@@ -988,18 +1146,43 @@ class LiveRunner:
                 return
             self.jlog("reconcile_fetch", self._clock(), since_ns=since_ns, fills=len(rows), positions=len(pos),
                       resting=len(resting))
-            self.push_side("fills", rows)
+            self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": "reconnect",
+                                     "since_ns": since_ns - int(vc.fills_backfill_margin_s) * NS_PER_S})
             self.push_side("positions", pos)
             self.push_side("resting_all", resting)
             self.push_side("reconcile_done", {"gen": gen, "reason": "ws_reconnect", "round": 0})
             return
+
+    def _suspect_fills_since_s(self) -> int:
+        """Start (Unix s) of the fills read that precedes a confirming positions read: the
+        earliest open position difference (or WS disconnect), minus the back-fill margin and
+        one positions interval (the fill happened before the read that first showed it)."""
+        cands = [s[1] for s in self._pos_suspect.values()]
+        if self._ws_down_since:
+            cands.append(self._ws_down_since)
+        t = min(cands) if cands else self._clock()
+        vc = self.cfg.venue
+        return t // NS_PER_S - int(vc.fills_backfill_margin_s + max(0.0, vc.positions_interval_s))
+
+    async def _fills_then_positions(self) -> dict[str, int]:
+        """A CONFIRMING positions read (review N4): GET /portfolio/fills since the earliest
+        suspect (no minimum age) is queued BEFORE the positions, so a fill the WebSocket lost is
+        back-filled before any difference can be confirmed."""
+        v = self.venue
+        t_fetch = self._clock()
+        since_s = self._suspect_fills_since_s()
+        rows = await v.fetch_fills(since_s)
+        pos = await v.fetch_positions()
+        self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "since_ns": since_s * NS_PER_S,
+                                 "why": "position_check"})
+        return pos
 
     async def _confirm_positions(self, gen: int, rnd: int) -> None:
         await asyncio.sleep(max(0.0, self.cfg.venue.position_confirm_s))
         attempt = 0
         while not self._stopping and gen == self._recon_gen:
             try:
-                pos = await self.venue.fetch_positions()
+                pos = await self._fills_then_positions()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1029,7 +1212,7 @@ class LiveRunner:
         elif k == "clock_gate":
             p = item.payload or {}
             self._inject(FeedStatus(item.ts, 0, CLOCK_STREAM, str(p.get("status", "stale")),
-                                    f"clock offset {p.get('offset_ms', '?')} ms"))
+                                    str(p.get("detail") or f"clock offset {p.get('offset_ms', '?')} ms")[:200]))
         elif k == "spec_changed":
             for t, why in sorted((item.payload or {}).items()):
                 self._block([t], f"spec_changed:{why}", item.ts)
@@ -1038,7 +1221,13 @@ class LiveRunner:
         elif k == "positions_ws":
             self._check_positions(item.ts, dict(item.payload or {}), partial=True)
         elif k == "fills":
-            self._backfill_fills(item.ts, list(item.payload or ()))
+            p = item.payload
+            if isinstance(p, dict):  # {"rows", "fetched_ns", "since_ns"}: a read with no minimum age
+                self._backfill_fills(item.ts, list(p.get("rows") or ()))
+                if int(p.get("fetched_ns") or 0) >= self._fills_checked[1]:
+                    self._fills_checked = (int(p.get("since_ns") or 0), int(p.get("fetched_ns") or 0))
+            else:
+                self._backfill_fills(item.ts, list(p or ()))
         elif k == "fills_periodic":
             self._backfill_fills(item.ts, list(item.payload or ()),
                                  min_age_ns=int(self.cfg.venue.fills_backfill_min_age_s * NS_PER_S))
@@ -1120,13 +1309,24 @@ class LiveRunner:
         om = getattr(self.strategy, "om", None)
         return int(om.position(ticker)) if om is not None else 0
 
+    def _fills_cover(self, first_seen: int) -> bool:
+        """A REST fills read (no minimum age) was processed that started after a difference was
+        first seen, over a window reaching back past the fill that can have caused it (one
+        positions interval before it showed)."""
+        since, fetched = self._fills_checked
+        back = int(max(0.0, self.cfg.venue.positions_interval_s) * NS_PER_S)
+        return fetched >= first_seen and since <= first_seen - back
+
     def _check_positions(self, ts: int, exch: dict[str, int], *, partial: bool = False) -> None:
         """Compare exchange positions with the strategy's fill-derived positions for markets
         still trading. A DISCREPANCY (exchange - ours) must persist unchanged for
-        ``position_confirm_s`` (a fill may be in flight on the WebSocket) before a
-        KalshiPositionSnapshot is fed, which makes the strategy's OrderManager flag it
-        (-> Halt(all)); new fills that move both sides keep the clock running. ``partial``:
-        ``exch`` holds only the markets it names (a WS market_position message)."""
+        ``position_confirm_s`` (a fill may be in flight on the WebSocket) AND a REST fills read
+        started after it was first seen must have been processed (a fill the WebSocket lost is
+        back-filled by it) before a KalshiPositionSnapshot is fed, which makes the strategy's
+        OrderManager flag it (-> Halt(all)); new fills that move both sides keep the clock
+        running. ``partial``: ``exch`` holds only the markets it names (a WS market_position
+        message): it can raise or clear a suspicion, never confirm one (the positions loop runs
+        a confirming read at once)."""
         settled = getattr(self.strategy, "settled", {}) or {}
         src = "ws_checked" if partial else "rest"
         ours_nonzero = set() if partial else {t for t in self.universe if self._position_of(t)}
@@ -1146,8 +1346,10 @@ class LiveRunner:
             if s is None or s[0] != d:
                 self._pos_suspect[t] = (d, ts)
                 self.metrics.inc("dh_position_suspects_total")
-                self.jlog("position_suspect", ts, ticker=t, exchange=ex, ours=ours, diff=d)
-                self._positions_now.set()  # confirm soon
+                self.jlog("position_suspect", ts, ticker=t, exchange=ex, ours=ours, diff=d, source=src)
+                self._positions_now.set()  # confirm soon (fills first, then positions)
+            elif ts - s[1] >= confirm_ns and (partial or not self._fills_cover(s[1])):
+                self._positions_now.set()  # old enough, but not yet checked against a fills read
             elif ts - s[1] >= confirm_ns:
                 self._pos_suspect.pop(t, None)
                 self.metrics.inc("dh_position_mismatches_total")
@@ -1335,13 +1537,15 @@ class LiveRunner:
 
         async def fills() -> None:
             try:
+                t_fetch = self._clock()
                 rows = await self.venue.fetch_fills(ts // NS_PER_S - margin)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.jlog("reconcile_error", self._clock(), what="fills", error=f"{type(exc).__name__}: {exc}"[:300])
                 return
-            self.push_side("fills", rows)
+            self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": reason,
+                                     "since_ns": (ts // NS_PER_S - margin) * NS_PER_S})
 
         self._spawn(fills(), "fills")
         self._positions_now.set()
@@ -1354,35 +1558,71 @@ class LiveRunner:
 
     # ================================================================== risk state (C1)
     def risk_snapshot(self, ts: int, *, halt_reason: str = "") -> Any:
-        """Current per-day risk state for persistence (dh.live.riskstate.RiskState)."""
-        from dh.live.riskstate import RiskState, base_reason, day_start
+        """Current per-day risk state for persistence (dh.live.riskstate.RiskState):
 
+          real P&L  = the strategy's P&L of the day (RiskEngine.day_pnl minus the seed it
+                      carries) + the RiskBook's carry (earlier sessions' realized P&L, excluded
+                      positions at their marks)
+          mark      = the strategy's open positions at fair value + the excluded positions
+          realized  = real - mark (the part a restart keeps; it re-values the positions)
+          halt      = reason, scope and the UTC day it was decided (a daily-loss halt still in
+                      force after midnight keeps the day it was decided, review N3)
+
+        (Tolerates minimal runner stand-ins without a RiskBook / halt records.)"""
+        from dh.live.riskstate import RiskState, base_reason
+
+        book = getattr(self, "riskbook", None) or RiskBook()
+        info: dict[str, tuple[str, int, str]] = getattr(self, "_halt_info", {})
+        book.roll(ts)
+        ds = day_start(ts)
+        prev = getattr(self.risk_store, "last", None)
         s = self.strategy
         risk = getattr(s, "risk", None)
-        prev = getattr(self.risk_store, "last", None)
-        pnl = float(getattr(prev, "day_pnl_usd", 0.0)) if prev is not None and prev.day_start_ns == day_start(ts) else 0.0
-        halted = False
-        reason = ""
-        pause = 0
-        if risk is not None:
-            eq = getattr(s, "equity", None)
+        real: float | None = None
+        strat_mark = 0.0
+        if risk is not None and hasattr(risk, "day_pnl"):
             try:
-                if callable(eq) and hasattr(risk, "day_pnl"):
-                    S = s.tracker.latest_value() if hasattr(s, "tracker") else None
-                    pnl = float(risk.day_pnl(ts, float(eq(S))))
+                parts = equity_parts(s)
+                if parts is not None:
+                    real = float(risk.day_pnl(ts, parts[0])) - book.carried_seed(ts) + book.carry_usd()
+                    strat_mark = parts[1]
             except Exception:  # noqa: BLE001 - keep the last known P&L
                 log.exception("day P&L for the risk state failed")
-            halted = bool(getattr(risk, "halted_all", False) or getattr(risk, "halted_quoting", False))
+        if real is None:  # no measurable equity: the last persisted P&L of the day, else the carry
+            same = prev is not None and prev.day_start_ns == ds
+            real = float(prev.day_pnl_usd) if same else book.carry_usd()
+        mark = strat_mark + book.mark_usd()
+        halted, reason, scope, pause = False, "", "", 0
+        if risk is not None:
+            h_all = bool(getattr(risk, "halted_all", False))
+            h_q = bool(getattr(risk, "halted_quoting", False))
+            halted = h_all or h_q
             reason = str(getattr(risk, "halt_reason", "") or "")
+            scope = "all" if h_all else ("quoting" if h_q else "")
             pause = int(getattr(risk, "pause_until_ns", 0) or 0)
-        manual = [k for k, until in self._halt_until.items() if not until]
-        if "fee_mismatch" in self.gate.reasons or manual:
+        keys = [k for k, until in self._halt_until.items() if not until]
+        if "fee_mismatch" in self.gate.reasons:
+            keys.append("fee_mismatch")
+        if keys:
             halted = True
-            reason = reason or halt_reason or ("fee_mismatch" if "fee_mismatch" in self.gate.reasons else manual[0])
+            scope = "all" if "halt:all" in keys else (scope or "quoting")
+            reason = reason or halt_reason or next((info[k][0] for k in keys if k in info), "") or keys[0]
         if halt_reason and not reason:
             reason = halt_reason
-        return RiskState(day_start_ns=day_start(ts), day_pnl_usd=pnl, halted=halted, halt_reason=base_reason(reason),
-                         pause_until_ns=pause, session=self.session_id, mode=self.mode, updated_ns=ts)
+        if reason.startswith(CARRIED) and book.halt_scope:
+            scope = book.halt_scope  # restored as Halt(all) until the seed can carry a scope
+        hday = 0
+        if halted:
+            days = [info[k][1] for k in keys if k in info and info[k][1]]
+            if prev is not None and prev.halted and prev.halt_day_ns:
+                days.append(int(prev.halt_day_ns))  # a persisted halt keeps the day it was decided
+            if book.halt_day_ns:
+                days.append(book.halt_day_ns)
+            hday = min(days) if days else ds
+        return RiskState(day_start_ns=ds, day_pnl_usd=real, halted=halted, halt_reason=base_reason(reason),
+                         pause_until_ns=pause, session=self.session_id, mode=self.mode, updated_ns=ts,
+                         realized_usd=real - mark, mark_usd=mark, budget_base_usd=book.base_usd,
+                         halt_scope=scope if halted else "", halt_day_ns=hday)
 
     def persist_risk_state(self, ts: int, *, fsync: bool = False, halt_reason: str = "") -> None:
         if self.risk_store is None:
@@ -1391,6 +1631,9 @@ class LiveRunner:
             st = self.risk_snapshot(ts, halt_reason=halt_reason)
             self.risk_store.save(st, fsync=fsync)
             self.metrics.set("dh_day_pnl_dollars", st.day_pnl_usd)
+            self.metrics.set("dh_day_realized_dollars", float(st.realized_usd or 0.0))
+            self.metrics.set("dh_day_mark_dollars", st.mark_usd)
+            self.metrics.set("dh_day_budget_base_dollars", st.budget_base_usd)
         except Exception as exc:  # noqa: BLE001
             self.metrics.inc("dh_risk_state_errors_total")
             log.error("risk state persistence failed: %s", exc)
@@ -1541,7 +1784,8 @@ class LiveRunner:
             if self._stopping:
                 return
             try:
-                pos = await v.fetch_positions()
+                # a read that may confirm a difference is preceded by a fills read (review N4)
+                pos = await self._fills_then_positions() if self._pos_suspect else await v.fetch_positions()
                 self.push_side("positions", pos)
                 if self.cfg.venue.ghost_sweep:
                     self.push_side("resting", await v.resting_orders())
@@ -1618,49 +1862,94 @@ class LiveRunner:
         d = drift() / NS_PER_S if callable(drift) else 0.0
         return d + (float(chrony_offset_s) if chrony_offset_s is not None else 0.0)
 
-    def note_clock_offset(self, eff_s: float, ts: int) -> None:
-        """Alarm above clock_alarm_ms; block new orders while |offset| > clock_block_ms on
-        clock_block_samples samples in a row (reopens on the first good sample)."""
+    def note_clock_offset(self, eff_s: float, ts: int, *, problem: str = "") -> None:
+        """Alarm above clock_alarm_ms; block new orders while |offset| > clock_block_ms, or the
+        clock cannot be trusted (``problem``: unmeasurable, unsynchronised, large estimated
+        error, proven behind exchange time), on clock_block_samples checks in a row; reopens on
+        the first good one. The strategy is told through the consumer (FeedStatus runner.clock)."""
         lc = self.cfg.loop
         self.metrics.set("dh_clock_offset_seconds", eff_s)
+        self.metrics.set("dh_clock_untrusted", 1.0 if problem else 0.0)
         ms = abs(eff_s) * 1000
         if ms > lc.clock_alarm_ms:
             self.metrics.inc("dh_clock_alarms_total")
             log.warning("clock offset %.1f ms > %.1f ms", eff_s * 1000, lc.clock_alarm_ms)
-        if ms > lc.clock_block_ms:
+        off_ms = round(eff_s * 1000, 3)
+        if ms > lc.clock_block_ms or problem:
             self._clock_bad += 1
+            why = problem or f"offset {off_ms} ms"
             if self._clock_bad >= max(1, lc.clock_block_samples) and self.gate.close("clock", ts):
-                log.error("clock offset %.1f ms persists: new orders blocked (restart re-anchors the clock)", eff_s * 1000)
-                self.jlog("gate", ts, action="close", reason="clock", offset_ms=round(eff_s * 1000, 3))
-                self.meta("gate", ts, action="close", reason="clock", offset_ms=round(eff_s * 1000, 3))
+                log.error("clock %s: new orders blocked until it recovers (a restart re-anchors the clock)", why)
+                self.jlog("gate", ts, action="close", reason="clock", offset_ms=off_ms, why=why)
+                self.meta("gate", ts, action="close", reason="clock", offset_ms=off_ms, why=why)
                 # the strategy pulls its quotes instead of having new ones gate-rejected
-                self.push_side("clock_gate", {"status": "stale", "offset_ms": round(eff_s * 1000, 3)})
+                self.push_side("clock_gate", {"status": "stale", "offset_ms": off_ms, "detail": f"clock {why}"})
         else:
             self._clock_bad = 0
             if self.gate.open("clock"):
-                self.jlog("gate", ts, action="open", reason="clock", offset_ms=round(eff_s * 1000, 3))
-                self.push_side("clock_gate", {"status": "resumed", "offset_ms": round(eff_s * 1000, 3)})
+                self.jlog("gate", ts, action="open", reason="clock", offset_ms=off_ms)
+                self.push_side("clock_gate", {"status": "resumed", "offset_ms": off_ms})
+
+    def clock_sample_problem(self, rec: dict[str, Any]) -> str:
+        """Why a clock sample cannot vouch for the clock in LIVE mode ('' = it can): it must
+        come from chronyc or timedatectl, say synchronised, carry an offset and an estimated
+        error within loop.max_est_error_ms() (review N5: the gate must not fail open)."""
+        if self.mode != "live":
+            return ""
+        src = str(rec.get("src") or "unknown")
+        if src not in CLOCK_SOURCES:
+            return f"unmeasurable (source {src}: neither chronyc nor timedatectl answered)"
+        if rec.get("synced") is not True:
+            return f"not synchronised ({src})"
+        if not isinstance(rec.get("offset_s"), (int, float)):
+            return f"no offset from {src}"
+        est = rec.get("est_error_s")
+        lim = self.cfg.loop.max_est_error_ms()
+        if isinstance(est, (int, float)) and est * 1000 > lim:
+            return f"estimated error {est * 1000:.1f} ms > {lim:.0f} ms ({src})"
+        return ""
 
     async def _clock_loop(self) -> None:
-        iv = self.cfg.loop.clock_sample_s
+        lc = self.cfg.loop
+        iv = lc.clock_sample_s
         if iv <= 0:
             return
-        from dh.store.recorder import sample_clock
+        if self._clock_sampler is not None:
+            sampler = self._clock_sampler
+        else:
+            from dh.store import recorder as _rec
 
-        step = min(iv, 5.0)
+            sampler = _rec.sample_clock
+        resample = max(0.01, min(iv, lc.clock_resample_s))
+        step = min(iv, 5.0, resample)
         next_sample = 0.0
         last_off: float | None = None
+        problem = ""
         while not self._stopping:
             try:
                 now = self._mono()
                 if now >= next_sample:
-                    next_sample = now + iv
-                    rec = await asyncio.to_thread(sample_clock)
+                    rec = await asyncio.to_thread(sampler)
                     if self.recorder is not None:
                         self.recorder.write("clock", self._clock(), orjson.dumps(rec, default=str))
                     off = rec.get("offset_s")
                     last_off = float(off) if isinstance(off, (int, float)) else None
-                self.note_clock_offset(self.clock_offset_s(last_off), self._clock())
+                    p = self.clock_sample_problem(rec)
+                    if p != problem:
+                        self.jlog("clock_sample", self._clock(), src=rec.get("src"), synced=rec.get("synced"),
+                                  offset_s=last_off, est_error_s=rec.get("est_error_s"), problem=p)
+                        if p:
+                            log.error("clock sample cannot be trusted: %s", p)
+                    problem = p
+                    next_sample = now + (resample if problem else iv)  # re-check soon while it is bad
+                eff = self.clock_offset_s(last_off)
+                p = problem
+                behind = self.lag_meter.behind_ns(self._clock()) if self.mode == "live" else 0
+                if behind > lc.clock_block_ms * NS_PER_MS:
+                    p = p or (f"behind exchange time by >= {behind / NS_PER_MS:.0f} ms (every market-data source "
+                              "shows timestamps from the future)")
+                    eff = max(abs(eff), behind / NS_PER_S)
+                self.note_clock_offset(eff, self._clock(), problem=p)
             except Exception:  # noqa: BLE001
                 log.exception("clock sample failed")
             await asyncio.sleep(step)
@@ -1680,6 +1969,8 @@ class LiveRunner:
             m.set("dh_gate_reason", 1.0 if r in self.gate.reasons else 0.0, reason=r)
         m.set("dh_blocked_markets", float(len(self.gate.tickers)))
         m.set("dh_universe_markets", float(len(self.universe)))
+        for k, raw in sorted(self.lag_meter.raw_base.items()):
+            m.set("dh_lag_baseline_seconds", raw / NS_PER_S, source=k)  # uncapped smallest age in the window
         m.set("dh_brti_age_seconds", (now - self._last_brti_ns) / NS_PER_S if self._last_brti_ns else -1.0)
         s = self.strategy
         fv = getattr(s, "fv", None)
@@ -1736,15 +2027,25 @@ class LiveRunner:
         self._consumer_task = asyncio.create_task(self._consume(), name="runner:consumer")
         self._consumer_task.add_done_callback(self._consumer_done)
         self._tasks.append(self._consumer_task)
-        self._tasks.append(asyncio.create_task(self._heartbeat_loop(), name="runner:heartbeat"))
-        self._tasks.append(asyncio.create_task(self._discovery_loop(), name="runner:discovery"))
-        self._tasks.append(asyncio.create_task(self._clock_loop(), name="runner:clock"))
-        self._tasks.append(asyncio.create_task(self._risk_state_loop(), name="runner:risk_state"))
-        if self.venue is not None:
-            self._tasks.append(asyncio.create_task(self.venue.run_reconciler(), name="venue:reconciler"))
-            self._tasks.append(asyncio.create_task(self._positions_loop(), name="runner:positions"))
-            self._tasks.append(asyncio.create_task(self._queue_positions_loop(), name="runner:queue_positions"))
-            self._tasks.append(asyncio.create_task(self._fills_loop(), name="runner:fills"))
+        # background loops, each only when enabled; one that ends while the runner is not
+        # stopping (an exception, or a return) stops the runner (exit 4, review N6)
+        lc, vc, v = self.cfg.loop, self.cfg.venue, self.venue
+        loops: list[tuple[str, bool, Callable[[], Awaitable[Any]]]] = [
+            ("runner:heartbeat", self.heartbeat_path is not None, self._heartbeat_loop),
+            ("runner:discovery", self._discover is not None, self._discovery_loop),
+            ("runner:clock", lc.clock_sample_s > 0, self._clock_loop),
+            ("runner:risk_state", self.risk_store is not None and lc.risk_state_interval_s > 0, self._risk_state_loop),
+            ("venue:reconciler", v is not None, v.run_reconciler if v is not None else self._noop),
+            ("runner:positions", v is not None and vc.positions_interval_s > 0, self._positions_loop),
+            ("runner:queue_positions", v is not None and vc.queue_positions_interval_s > 0
+             and getattr(self.strategy, "om", None) is not None, self._queue_positions_loop),
+            ("runner:fills", v is not None and vc.fills_backfill_interval_s > 0, self._fills_loop),
+        ]
+        for name, enabled, fn in loops:
+            if enabled:
+                t = asyncio.create_task(fn(), name=name)
+                t.add_done_callback(self._loop_done)
+                self._tasks.append(t)
         for name, factory in self._sources:
             self._tasks.append(asyncio.create_task(self._supervise(name, factory), name=f"source:{name}"))
         if self.cfg.metrics.enabled:
@@ -1774,6 +2075,25 @@ class LiveRunner:
     def _consumer_done(self, t: asyncio.Task[Any]) -> None:
         if not self._stopping and not t.cancelled():
             self.request_stop("consumer exited", code=self.exit_code or 4)
+
+    async def _noop(self) -> None:
+        return None
+
+    def _loop_done(self, t: asyncio.Task[Any]) -> None:
+        """A supervised background loop ended. While the runner is not stopping that is a bug
+        or an unexpected failure (heartbeat, risk state, fills, positions, clock...): its safety
+        net is gone, so stop cleanly (cancel everything) with exit code 4."""
+        if t.cancelled() or self._stopping or (self._stop_evt is not None and self._stop_evt.is_set()):
+            return
+        exc = t.exception()
+        why = f"{type(exc).__name__}: {exc}" if exc is not None else "returned unexpectedly"
+        name = t.get_name()
+        log.critical("background loop %s died (%s): stopping the runner (exit 4)", name, why,
+                     exc_info=(type(exc), exc, exc.__traceback__) if exc is not None else None)
+        self.metrics.inc("dh_loop_deaths_total", loop=name)
+        self.jlog("loop_died", self._clock(), loop=name, error=why[:300])
+        self.meta("loop_died", self._clock(), loop=name, error=why[:300])
+        self.request_stop(f"background loop {name} died: {why}"[:300], code=4)
 
     async def shutdown(self) -> None:
         """Graceful stop (see module docstring). Safe to call twice."""
@@ -1863,6 +2183,23 @@ class LiveRunner:
         self.meta("session_end", end, reason=reason, exit_code=self.exit_code, cancel_ok=cancel_ok,
                   pump=dataclasses.asdict(self.pump.stats), last_ts=self.pump.last_ts)
         self.jlog("session_end", end, reason=reason, exit_code=self.exit_code, cancel_ok=cancel_ok)
+
+
+def equity_parts(strategy: Any) -> tuple[float, float] | None:
+    """(equity, mark of its open positions) of a strategy exposing ``equity(S)`` (the
+    MarketMaker: cash - fees + settlements + open positions at fair value); the mark is the
+    equity minus the OrderManager's cash, fees and settled cash. None without ``equity``."""
+    eq = getattr(strategy, "equity", None)
+    if not callable(eq):
+        return None
+    tracker = getattr(strategy, "tracker", None)
+    S = tracker.latest_value() if tracker is not None and hasattr(tracker, "latest_value") else None
+    e = float(eq(S))
+    om = getattr(strategy, "om", None)
+    if om is None or not hasattr(om, "cash_micros"):
+        return e, 0.0
+    cash = om.cash_micros() / 1e6 - om.fees_micros() / 1e6 + float(getattr(strategy, "settled_cash", 0.0) or 0.0)
+    return e, e - cash
 
 
 def effective_fee(spec: MarketSpec, ev: KalshiFeeUpdate) -> tuple[str, float] | None:

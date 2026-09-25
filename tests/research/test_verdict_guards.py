@@ -133,6 +133,7 @@ def test_e2_hook_needs_b_c_and_no_volume_or_dollar_drop():
     assert exp2_nowcast.hook_decision(_hook())[0]
     assert not exp2_nowcast.hook_decision(_hook(contracts_day_nowcast=40.0))[0]  # c/contract up, volume down
     assert not exp2_nowcast.hook_decision(_hook(usd_day_nowcast=9.0))[0]  # $/day down
+    assert not exp2_nowcast.hook_decision(_hook(profitable_ct_day_base=60.0, profitable_ct_day_nowcast=50.0))[0]
     only_b = _hook().iloc[:1]
     assert not exp2_nowcast.hook_decision(only_b)[0]
 
@@ -153,12 +154,15 @@ def test_e2_null_hook_never_accepts(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ C2 + M1: E3
 def test_e3_cancel_rule_needs_b_and_c_and_dollars_per_day():
-    ok = dict(d_net_lo_c=0.2, d_net_c=0.3, fill_loss_pct=10.0, usd_day_guard=11.0, usd_day_base=10.0)
+    ok = dict(d_net_lo_c=0.2, d_net_c=0.3, fill_loss_pct=10.0, usd_day_guard=11.0, usd_day_base=10.0,
+              profitable_ct_day_base=50.0, profitable_ct_day_guard=50.0)
     rows = pd.DataFrame([dict(ok, policy="B"), dict(ok, policy="C")])
     assert exp3_toxicity.e3_verdict(rows, pd.DataFrame(), None).startswith("ACCEPT")
     assert not exp3_toxicity.e3_verdict(rows.iloc[:1], pd.DataFrame(), None).startswith("ACCEPT")
     worse = rows.assign(usd_day_guard=9.0)
     assert not exp3_toxicity.e3_verdict(worse, pd.DataFrame(), None).startswith("ACCEPT")
+    fewer_good = rows.assign(profitable_ct_day_guard=40.0)  # profitable contracts/day fell (TEST_MATRIX convention)
+    assert not exp3_toxicity.e3_verdict(fewer_good, pd.DataFrame(), None).startswith("ACCEPT")
     lift = pd.DataFrame([{"policy": "B", "model": "logistic", "lift_hi": -0.001}])
     assert exp3_toxicity.e3_verdict(pd.DataFrame(), lift, None).startswith("REJECT")  # no OOS lift
 

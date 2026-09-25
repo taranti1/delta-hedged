@@ -13,15 +13,18 @@ runner's shutdown_timeout_s + watchdog.stopping_grace_s triggers
 ``DELETE /portfolio/events/orders?subaccount=<n>`` (explicit: omitted = ALL subaccounts) with
 the watchdog's own signed session, retried until it succeeds and repeated every
 watchdog.repeat_s while it stays stale; each attempt is announced in <heartbeat>.cancel_all
-(a runner still alive then holds new orders for a minute). A clean runner shutdown (state
-'stopped', written only after a confirmed cancel-all) disarms it; a new live runner re-arms
-it. It never places orders. Credentials: KALSHI_WATCHDOG_KEY_ID /
-KALSHI_WATCHDOG_PRIVATE_KEY_PATH (a separate key is recommended), else the runner's
-KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH.
+(a live runner that finds a marker about itself, written after it started, halts; one about
+another runner holds new orders for a minute). A clean runner shutdown (state 'stopped',
+written only after a confirmed cancel-all) disarms it; a new live runner re-arms it. It never
+places orders. Credentials: KALSHI_WATCHDOG_KEY_ID / KALSHI_WATCHDOG_PRIVATE_KEY_PATH (a
+separate key is recommended), else the runner's KALSHI_KEY_ID / KALSHI_PRIVATE_KEY_PATH.
 
     --once              one check (+ cancel if stale) and exit (cron / manual use)
     --cancel-now        cancel all immediately and exit (manual kill procedure)
-    --arm-on-start      act on a stale live heartbeat found at start-up
+    --arm-on-start      on the first poll, act on an EXISTING LIVE heartbeat (live mode, state
+                        running/stopping): lock onto it if fresh, cancel all at once if stale.
+                        A missing file or any other heartbeat leaves it waiting (DISARMED)
+                        for a fresh live heartbeat.
 """
 
 from __future__ import annotations
@@ -114,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--heartbeat", default="", help="heartbeat file (default: live config paths.heartbeat_file)")
     p.add_argument("--once", action="store_true")
     p.add_argument("--cancel-now", action="store_true")
-    p.add_argument("--arm-on-start", action="store_true")
+    p.add_argument("--arm-on-start", action="store_true",
+                   help="first poll: lock onto an existing live heartbeat (cancel all at once if it is stale); "
+                        "a missing / non-live heartbeat leaves it waiting")
     p.add_argument("--max-age-s", type=float, default=0.0, help="override watchdog.stale_s (seconds)")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)

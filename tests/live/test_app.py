@@ -71,7 +71,7 @@ def _setup(tmp_path, mode: str, *, forbid_writes: bool):
         paths=PathsCfg(data_root=str(tmp_path / "data"), log_dir=str(tmp_path / "logs"), kill_file=str(tmp_path / "run" / "KILL"),
                        heartbeat_file=str(tmp_path / "run" / "hb.json")),
         metrics=MetricsCfg(enabled=False),
-        loop=LoopCfg(heartbeat_interval_s=0.05, clock_sample_s=0.0, shutdown_timeout_s=2.0, max_lag_s=5.0),
+        loop=LoopCfg(heartbeat_interval_s=0.05, clock_sample_s=60.0, shutdown_timeout_s=2.0, max_lag_s=5.0),
         venue=VenueCfg(positions_interval_s=0.0, queue_positions_interval_s=0.0, fills_backfill_interval_s=0.0,
                        cancel_all_hold_s=0.3),
         universe=UniverseCfg(horizon_s=7200.0, discovery_interval_s=3600.0),

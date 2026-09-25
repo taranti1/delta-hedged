@@ -12,11 +12,15 @@ Start-up sequence (live and paper; docs/RUNBOOK.md explains each step to operato
      client_order_id prefix <run_prefix>-<token> (never repeats across restarts)
   4. REST client with the account's rate limits (GET /account/limits, endpoint costs)
   5. exchange status (live refuses to start unless exchange_active and trading_active)
-  6. live only: clean-slate cancel-all of leftover resting orders, VERIFIED with the
-     resting-order list, THEN account positions (events already held are excluded from this
-     session); new orders are held for venue.cancel_all_hold_s after that cancel-all
-  7. risk state: today's P&L re-derived from GET /portfolio/fills + /portfolio/settlements
-     (live) and the persisted state -> RiskStateSeed (dh.live.riskstate), the first event
+  6. live only: a watchdog cancel-all marker left from before this start is renamed (the
+     runner halts only on markers written after it started); clean-slate cancel-all of
+     leftover resting orders, VERIFIED with the resting-order list, THEN account positions
+     (events already held are excluded from this session; a malformed position row refuses
+     the start); new orders are held for venue.cancel_all_hold_s after that cancel-all
+  7. risk state: today's P&L re-derived from Kalshi (live: the historical cutoff, today's
+     fills and settlements, the positions valued at exchange prices; any malformed row or
+     failed read refuses the start) and the persisted state -> RiskStateSeed
+     (dh.live.riskstate), the first event; recomputed if the UTC day changed meanwhile
   8. discover open markets of the configured series expiring within the horizon
      (dh.kalshi.metadata + FeeEngine; unresolved/unsupported fee types stay untradable)
   9. back-fill the benchmark history and warm the FairValueModel (dh.live.startup)
@@ -44,12 +48,20 @@ from typing import Any
 
 import orjson
 
-from dh.core.events import RiskStateSeed
 from dh.core.units import NS_PER_MS, NS_PER_S, QTY_SCALE
 from dh.live.clock import AnchoredClock, session_token
 from dh.live.config import LiveConfig, live_config_problems, load_live_config, resolve_mode
 from dh.live.monitor import JsonLog, KillFile, Metrics, cancel_all_marker_path, git_sha, read_heartbeat, write_heartbeat
-from dh.live.riskstate import RiskState, RiskStateError, RiskStateStore, decide_seed, derive_day_pnl
+from dh.live.riskstate import (
+    RiskBook,
+    RiskStateError,
+    RiskStateStore,
+    day_start,
+    decide_seed,
+    derive_day_pnl,
+    make_seed,
+    state_from_decision,
+)
 from dh.live.runner import META_STREAM, LiveRunner
 from dh.live.startup import (
     backfill_fair_value,
@@ -85,11 +97,30 @@ class Overrides:
     install_signals: bool = True
     recorder: Any = None
     session_token: str | None = None
+    clock_sampler: Callable[[], dict[str, Any]] | None = None  # None = dh.store.recorder.sample_clock
 
 
 def _resolve(path: str) -> Path:
     p = Path(path).expanduser()
     return p if p.is_absolute() else REPO_ROOT / p
+
+
+def quarantine_stale_marker(marker: Path, now_ns: int) -> Path | None:
+    """A watchdog cancel-all marker present before this runner starts is about an earlier
+    runner: rename it (kept for the post-mortem, logged) so it can never halt this one."""
+    if not marker.exists():
+        return None
+    try:
+        content = marker.read_text()[:300]
+    except OSError:
+        content = "?"
+    dest = marker.with_name(f"{marker.name}.stale-{now_ns // NS_PER_S}")
+    try:
+        os.replace(marker, dest)
+    except OSError as exc:
+        raise StartupError(f"cannot move the old watchdog marker {marker} aside ({exc})") from exc
+    log.warning("watchdog cancel-all marker from before this start (%s) moved to %s", content.strip(), dest)
+    return dest
 
 
 def ws_kwargs(ws: dict[str, Any]) -> dict[str, Any]:
@@ -251,6 +282,13 @@ class LiveApp:
                                "requires authentication even for market data")
         paths = lcfg.paths
         self.locks = check_runtime_paths(lcfg, mode, now_ns=self.clock())
+        hb = heartbeat_path(lcfg, mode)
+        marker = cancel_all_marker_path(hb) if mode == "live" else None
+        if marker is not None:
+            moved = quarantine_stale_marker(marker, self.clock())
+            if moved is not None:
+                self.info["stale_watchdog_marker"] = str(moved)
+        started_ns = self.clock()  # the runner honours only watchdog markers written after this
         self.recorder = self.ov.recorder if self.ov.recorder is not None else Recorder(_resolve(paths.data_root))
         sha = git_sha(REPO_ROOT)
         digest = f"{scfg.digest()}/{lcfg.digest()}"
@@ -291,6 +329,7 @@ class LiveApp:
         fee_engine = kc.fee_engine()
         venue: KalshiVenue | None = None
         excluded: set[str] = set()
+        positions: dict[str, int] = {}
         rest_pnl = None
         hold_until = 0
         if mode == "live":
@@ -305,24 +344,38 @@ class LiveApp:
                 raise StartupError(f"{len(left)} orders still resting after the start-up cancel-all: "
                                    f"{[o.get('order_id') for o in left][:10]}")
             hold_until = venue.last_cancel_all_ns + int(lcfg.venue.cancel_all_hold_s * NS_PER_S)
-            positions = await venue.fetch_positions()
+            try:
+                positions = await venue.fetch_positions(strict=True)
+            except ValueError as exc:
+                raise StartupError(f"malformed position row ({exc}): not trading with an unknown inventory") from exc
             excluded = events_with_positions(positions)
             self.info["startup_positions"] = positions
             if positions:
                 log.warning("account holds positions at start-up: %s (events excluded: %s)", positions, sorted(excluded))
-            # 7. today's P&L from Kalshi (fills, settlements, positions incl. excluded events)
-            now = self.clock()
-            rest_pnl = await derive_day_pnl(self.rest, now - now % (86_400 * NS_PER_S), positions, subaccount=venue.sub)
+            # 7. today's P&L from Kalshi (fills, settlements, positions incl. excluded events, at
+            # exchange prices), for the UTC day of the seed (re-derived if midnight passed, N7)
+            rest_pnl, seed_ts = await self._derive_today(positions, venue.sub)
             self.info["day_pnl_rest"] = rest_pnl.summary()
-        seed_ts = self.clock()  # the seed's decision time AND event time (one UTC day, even at midnight)
+            for fb in rest_pnl.fallbacks:
+                log.warning("risk state: %s", fb)
+        else:
+            seed_ts = self.clock()  # the seed's decision time AND event time (one UTC day, even at midnight)
         seed = decide_seed(seed_ts, prev_state, rest_pnl, reset=self.reset_daily_halt)
         self.info["risk_seed"] = {"day_start_ns": seed.day_start_ns, "day_pnl_usd": round(seed.day_pnl_usd, 6),
-                                  "halted": seed.halted, "halt_reason": seed.halt_reason,
-                                  "pause_until_ns": seed.pause_until_ns, "notes": seed.notes,
-                                  "overridden": seed.overridden}
+                                  "real_pnl_usd": round(seed.real_pnl_usd, 6), "realized_usd": round(seed.realized_usd, 6),
+                                  "mark_usd": round(seed.mark_usd, 6), "budget_base_usd": round(seed.budget_base_usd, 6),
+                                  "halted": seed.halted, "halt_reason": seed.halt_reason, "halt_scope": seed.halt_scope,
+                                  "halt_day_ns": seed.halt_day_ns, "pause_until_ns": seed.pause_until_ns,
+                                  "notes": seed.notes, "overridden": seed.overridden}
         for n in seed.notes:
             log.warning("risk state: %s", n) if seed.halted or seed.overridden else log.info("risk state: %s", n)
+        log.info("risk state: real day P&L %+.2f (realized %+.2f, open %+.2f); the daily-loss limit counts %+.2f",
+                 seed.real_pnl_usd, seed.realized_usd, seed.mark_usd, seed.day_pnl_usd)
         if seed.overridden:
+            log.warning("risk state: OPERATOR RESET: real day P&L %+.2f stays recorded; the loss budget starts at %+.2f "
+                        "(was %+.2f counted, halted=%s %s)", seed.real_pnl_usd, seed.budget_base_usd,
+                        seed.overridden.get("day_pnl_usd", 0.0), seed.overridden.get("halted"),
+                        seed.overridden.get("halt_reason") or "")
             self._log("risk_reset_by_operator", **self.info["risk_seed"])
 
         # 6. universe
@@ -364,20 +417,21 @@ class LiveApp:
             return await discover_universe(self.rest, series, fee_engine, self.clock(), lcfg.universe.horizon_s,
                                            exclude_events=excluded, known=known)
 
-        hb = heartbeat_path(lcfg, mode)
+        # what the strategy's equity does not cover: earlier sessions' realized P&L, the excluded
+        # positions at their start-up marks (settled during the session -> updated seed)
+        ex_marks = rest_pnl.open_px if rest_pnl is not None else {}
+        book = RiskBook.from_decision(seed, {t: (q, ex_marks.get(t, 0)) for t, q in positions.items() if q})
         runner = LiveRunner(
             mm, mode=mode, period_ns=int(scfg.timers.quote_period_ms) * NS_PER_MS, cfg=lcfg, venue=venue, sim=sim,
             paper_fees=paper_fees, hedge=hedge, recorder=self.recorder, jsonlog=self.jsonlog, metrics=self.metrics,
             clock_ns=self.clock, kill_file=KillFile(_resolve(paths.kill_file)), heartbeat_path=hb,
             fee_engine=fee_engine, universe=specs, discover=discover, series=series, session_id=self.session_id,
-            risk_store=store, cancel_all_marker=cancel_all_marker_path(hb) if mode == "live" else None)
+            risk_store=store, cancel_all_marker=marker, risk_book=book, started_ns=started_ns,
+            clock_sampler=self.ov.clock_sampler)
         hedge.sink = runner.push_result
         # the first event: the day's risk state (before any Timer; recorded for replay)
-        runner.push_result(RiskStateSeed(seed_ts, 0, seed.day_start_ns, float(seed.day_pnl_usd), bool(seed.halted),
-                                         seed.halt_reason, int(seed.pause_until_ns)))
-        store.save(RiskState(day_start_ns=seed.day_start_ns, day_pnl_usd=seed.day_pnl_usd, halted=seed.halted,
-                             halt_reason=seed.halt_reason, pause_until_ns=seed.pause_until_ns, session=self.session_id,
-                             mode=mode, updated_ns=self.clock()), fsync=True)
+        runner.push_result(make_seed(seed_ts, seed))
+        store.save(state_from_decision(seed, session=self.session_id, mode=mode, now_ns=self.clock()), fsync=True)
         if hold_until:
             runner.hold(hold_until, "startup_cancel_all")
         if venue is not None:
@@ -415,6 +469,22 @@ class LiveApp:
         self._log("startup", universe=[s.ticker for s in specs], skipped=sel.skipped, backfill=bf.summary(), info=self.info)
         self.runner = runner
         return runner
+
+    async def _derive_today(self, positions: dict[str, int], sub: int) -> tuple[Any, int]:
+        """(today's DayPnl from Kalshi, the seed time), both on the same UTC day: when midnight
+        passes during the derivation it is done again for the new day (a restart at 00:00 must
+        not seed the new day with yesterday's P&L). Failures refuse the start."""
+        for _ in range(3):
+            ds = day_start(self.clock())
+            try:
+                pnl = await derive_day_pnl(self.rest, ds, positions, subaccount=sub)
+            except RiskStateError as exc:
+                raise StartupError(f"risk state: {exc}") from exc
+            seed_ts = self.clock()
+            if day_start(seed_ts) == ds:
+                return pnl, seed_ts
+            log.warning("the UTC day changed while today's P&L was derived: deriving it for the new day")
+        raise StartupError("the UTC day kept changing while today's P&L was derived")
 
     def _add_feeds(self, runner: LiveRunner) -> None:
         only = list(self.lcfg.feeds.only)

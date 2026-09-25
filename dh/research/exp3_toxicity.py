@@ -30,7 +30,8 @@ and fill loss.
 Decision rule (docs/TEST_MATRIX.md E3): accept if the toxicity-aware cancel policy raises net
 c/contract by >= 0.1c (CI > 0) at <= 20% fill loss with $/day not lower, under BOTH fill policies
 B and C (audit C2/M1: the contract loss is bounded by the 20 % fill-loss rule of E3 itself, which
-takes precedence over the general "contracts/day not lower" convention); reject on no OOS lift
+takes precedence over a total-contracts rule; PROFITABLE contracts/day, the TEST_MATRIX wording,
+must not fall); reject on no OOS lift
 (walk-forward Brier improvement over the base rate with CI upper bound <= 0) or if the lift
 vanishes under policy C. The rule is trained on policy-B fills only, and only on fills whose 60 s
 label ended before the scored half starts (audit m2). Features are captured at MATCH time (the
@@ -63,6 +64,7 @@ from dh.research.exp_common import (
     cluster_mean_ci,
     day_block_ok,
     flag_only_A,
+    profitable_contracts_per_day,
     fmt_ns,
     n_events,
     paired_diff_ci,
@@ -90,8 +92,8 @@ from dh.strategy.mm import MarketMaker
 
 SEC_YR = 365.0 * 24 * 3600
 RULE_E3 = ("accept if the toxicity-aware cancel policy raises net c/contract by >= 0.1c (CI > 0) at <= 20% fill "
-           "loss with $/day not lower, under both B and C; reject if there is no OOS lift or the lift vanishes under "
-           "policy C")
+           "loss with $/day and profitable contracts/day not lower, under both B and C; reject if there is no OOS lift "
+           "or the lift vanishes under policy C")
 RULE_LABEL_H_S = 60.0  # the cancel rule is scored on the 60 s net markout: its training labels end 60 s later
 FEATURES = ("queue_at_place_ct", "quote_age_s", "adv_ext_0.1s", "adv_ext_0.5s", "adv_ext_1s", "adv_ext_5s",
             "kalshi_imb_side", "venue_imb_adv", "taker_ct_10s", "taker_ct_60s", "takers_against_10s", "log_tau",
@@ -600,6 +602,7 @@ def _cancel_ok(r: Any) -> bool:
     """Acceptance of one policy's cancel-rule replay row (TEST_MATRIX E3 + audit M1)."""
     day = day_block_ok(_DayCI(getattr(r, "d_day_lo_c", math.nan), int(getattr(r, "day_blocks", 0) or 0)))
     return bool(r.d_net_lo_c > 0 and r.d_net_c >= 0.1 and r.fill_loss_pct <= 20.0 and r.usd_day_guard >= r.usd_day_base
+                and getattr(r, "profitable_ct_day_guard", math.inf) >= getattr(r, "profitable_ct_day_base", 0.0)
                 and day is not False)
 
 
@@ -624,8 +627,8 @@ def e3_verdict(cancel: pd.DataFrame, lift: pd.DataFrame, rule: ToxicityRule | No
     if len(cancel):
         rows = {r.policy: r for r in cancel.itertuples()}
         if {"B", "C"} <= set(rows) and all(_cancel_ok(rows[p]) for p in ("B", "C")):
-            return ("ACCEPT (cancel rule: net c/contract +>= 0.1c with CI > 0, <= 20% fill loss and $/day not lower "
-                    "under B and C)")
+            return ("ACCEPT (cancel rule: net c/contract +>= 0.1c with CI > 0, <= 20% fill loss, $/day and profitable "
+                    "contracts/day not lower, under B and C)")
         if "B" in rows and "C" in rows and rows["B"].d_net_lo_c > 0 and not rows["C"].d_net_lo_c > 0:
             return "REJECT (the cancel-rule lift vanishes under policy C)"
         if no_lift:
@@ -703,6 +706,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                    "usd_day_guard": guard.summary.get("net_usd_per_day", 0.0),
                    "contracts_day_base": base.summary.get("contracts_per_day", 0.0),
                    "contracts_day_guard": guard.summary.get("contracts_per_day", 0.0),
+                   "profitable_ct_day_base": profitable_contracts_per_day(a, float(base.summary.get("days", 0) or 0)),
+                   "profitable_ct_day_guard": profitable_contracts_per_day(b, float(guard.summary.get("days", 0) or 0)),
                    "events": n_events(a, b)}
             if d is not None:
                 dd = paired_diff_ci(with_day(a), with_day(b), "net_c_per_ct", cluster="day", n_boot=n_boot)

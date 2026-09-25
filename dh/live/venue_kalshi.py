@@ -1106,8 +1106,10 @@ class KalshiVenue:
         """GET /portfolio/fills since ``min_ts_s`` (Unix seconds), every page."""
         return [f async for f in self.rest.iter_fills(min_ts=int(min_ts_s), subaccount=self.sub)]
 
-    async def fetch_positions(self) -> dict[str, int]:
-        """{ticker: signed YES qty} of every non-zero market position (GET /portfolio/positions)."""
+    async def fetch_positions(self, *, strict: bool = False) -> dict[str, int]:
+        """{ticker: signed YES qty} of every non-zero market position (GET /portfolio/positions).
+        A malformed row raises ValueError when ``strict`` (start-up: the inventory must be
+        known), else it is skipped and counted (the positions check then flags the market)."""
         from dh.kalshi.normalize import market_position
 
         body = await self.rest.get_all_positions(count_filter="position", subaccount=self.sub)
@@ -1115,10 +1117,15 @@ class KalshiVenue:
         for m in body.get("market_positions") or []:
             try:
                 mp = market_position(m)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, TypeError) as exc:
+                if strict:
+                    raise ValueError(f"position row {str(m)[:120]}: {type(exc).__name__}: {exc}") from exc
+                self._log("position_row_malformed", row=str(m)[:200], error=f"{type(exc).__name__}: {exc}"[:200])
                 continue
             if mp.ticker:
                 out[mp.ticker] = mp.position
+            elif strict:
+                raise ValueError(f"position row without a ticker: {str(m)[:120]}")
         return out
 
 

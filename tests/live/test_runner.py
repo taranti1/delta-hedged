@@ -87,6 +87,12 @@ def live_runner(strategy, rest=None, tmp_path=None, **kw):
     return r, venue, rest
 
 
+def confirm_read(r, fetched_ns: int, rows=(), since_ns: int = 0) -> None:
+    """What the positions loop queues before a confirming positions read: a REST fills read
+    (no minimum age) started at ``fetched_ns`` over [since_ns, ...]."""
+    r.push_side("fills", {"rows": list(rows), "fetched_ns": fetched_ns, "since_ns": since_ns})
+
+
 async def _feeder(runner, events_fn, n: int, dt: float):
     for _ in range(n):
         runner.push(events_fn())
@@ -240,11 +246,16 @@ async def test_ws_position_snapshots_are_checked_not_forwarded():
     snaps = [e for e in s.events if isinstance(e, KalshiPositionSnapshot)]
     assert [(x.position, x.source) for x in snaps] == [(200, "ws_checked")]
     assert s.om.stats["position_mismatches"] == 0
-    # a persistent disagreement is confirmed after position_confirm_s
+    # a persistent disagreement: WS messages alone never confirm it (review N4) ...
     clock["t"] = T0 + 10 * NS_PER_S
     r.push(KalshiPositionSnapshot(clock["t"], 0, TK, 500, source="ws"))
     clock["t"] = T0 + 16 * NS_PER_S
     r.push(KalshiPositionSnapshot(clock["t"], 0, TK, 500, source="ws"))
+    r.process_pending()
+    assert s.om.stats["position_mismatches"] == 0 and r._positions_now.is_set()  # noqa: SLF001 - a REST check is due
+    # ... the positions loop's confirming read (fills first, nothing missing, then positions) does
+    confirm_read(r, clock["t"])
+    r.push_side("positions", {TK: 500})
     r.process_pending()
     assert [x.position for x in s.events if isinstance(x, KalshiPositionSnapshot)][-1] == 500
     assert s.om.stats["position_mismatches"] == 1
@@ -310,7 +321,11 @@ async def test_position_reconciliation_two_strike():
     r.process_pending()
     assert not [e for e in s.events if isinstance(e, KalshiPositionSnapshot)]
     clock["t"] += 6 * NS_PER_S
-    r.push_side("positions", {TK: 300})  # still different 6 s later: confirmed
+    r.push_side("positions", {TK: 300})  # still different 6 s later, but no fills read since: not yet
+    r.process_pending()
+    assert not [e for e in s.events if isinstance(e, KalshiPositionSnapshot)]
+    confirm_read(r, clock["t"])  # the confirming read: fills (none missing), then positions
+    r.push_side("positions", {TK: 300})
     r.process_pending()
     snaps = [e for e in s.events if isinstance(e, KalshiPositionSnapshot)]
     assert len(snaps) == 1 and snaps[0].position == 300 and snaps[0].source == "rest"

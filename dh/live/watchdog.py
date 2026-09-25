@@ -18,9 +18,18 @@ State machine (poll every ``poll_s``):
              until one succeeds, then repeat every ``repeat_s`` (orders in flight when the
              runner died can still land) up to ``max_repeats`` while stale; a fresh heartbeat
              of the locked runner, or of a NEW live runner (a restart), re-arms on it
-After every cancel-all attempt the watchdog writes ``<heartbeat>.cancel_all`` (time, result):
-a runner that is still alive holds new orders for the cancel-all tail (Kalshi may cancel
-orders placed during the minute after a cancel-all) and reconciles its view of the orders.
+
+``arm_on_start`` (a watchdog restarted while a runner may have died meanwhile) acts on the
+FIRST poll only, and only on an existing LIVE heartbeat (live mode, state running/stopping):
+it locks onto that runner, and triggers at once when the heartbeat is already stale. A
+missing file, an unreadable one, or any other heartbeat (paper, 'starting', 'stopped') leaves
+it DISARMED, waiting for a fresh live heartbeat as usual.
+
+After every cancel-all attempt the watchdog writes ``<heartbeat>.cancel_all`` ({"t", "ok",
+"watched": [pid, session]}). A live runner that finds a marker written after its own start
+about ITSELF halts (Halt(all): it was alive but unresponsive); one about another runner holds
+new orders for the cancel-all tail and reconciles. A runner renames a marker older than its
+start at start-up.
 """
 
 from __future__ import annotations
@@ -82,8 +91,8 @@ class Watchdog:
         self.cfg = cfg or WatchdogCfg()
         self._clock = clock_ns
         self._sleep = sleep
-        self.st = WatchdogState(state="ARMED" if arm_on_start else "DISARMED")
-        self._arm_on_start = arm_on_start
+        self.st = WatchdogState()
+        self._arm_on_start = arm_on_start  # consumed by the first poll
         self._on_event = on_event
         self.marker = Path(marker_path) if marker_path else cancel_all_marker_path(self.path)
 
@@ -122,10 +131,16 @@ class Watchdog:
         ident = (hb.get("pid"), hb.get("session")) if hb is not None else None
         if hb is not None:
             st.last_mode = mode
-        if st.state == "ARMED" and st.armed is None and self._arm_on_start and hb is not None and self._relevant(mode):
-            st.armed = ident  # --arm-on-start: lock onto whatever live runner the file names
-            st.last_hb_ns = t or 0
-            st.last_state = hstate
+        if self._arm_on_start:
+            self._arm_on_start = False
+            live = (hb is not None and not hb.get("unparsed") and self._relevant(mode)
+                    and hstate in ("running", "stopping"))
+            if live:  # lock onto the live runner the file names; the ARMED branch triggers if stale
+                self._arm(hb, "armed on start: existing live heartbeat" + ("" if fresh else " (STALE)"))  # type: ignore[arg-type]
+            else:
+                why = ("no heartbeat file" if hb is None else "unreadable heartbeat" if hb.get("unparsed")
+                       else f"heartbeat mode={mode} state={hstate}")
+                self._note(f"arm-on-start: {why}: DISARMED until a fresh live heartbeat")
         ours = hb is not None and st.armed is not None and ident == st.armed
         if ours:
             st.last_hb_ns = max(st.last_hb_ns, t or 0)

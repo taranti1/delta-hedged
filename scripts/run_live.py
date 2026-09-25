@@ -14,10 +14,12 @@ order via REST (live), flushes the recorder and exits. Exit codes: 0 ok / kill f
 2 refused to start, 3 could not confirm all orders cancelled at shutdown (check the Kalshi
 UI; the watchdog keeps trying), 4 strategy/consumer error. docs/RUNBOOK.md has the procedures.
 
-A halt (daily loss, position or fee mismatch) and the day's P&L survive a restart (the risk
-state file plus today's fills/settlements from Kalshi): the runner starts halted. After
-investigating, --reset-daily-halt clears the carried halt/pause and forgives the day's loss so
-far (logged loudly, recorded in the session's meta).
+A halt (daily loss, position or fee mismatch, the watchdog's cancel-all) and the day's P&L
+survive a restart (the risk state file plus today's fills, settlements and positions at
+exchange prices from Kalshi): the runner starts halted (a daily-loss halt only on the UTC day
+it was decided). After investigating, --reset-daily-halt clears the carried halt/pause and
+starts a fresh daily-loss budget from the current real P&L; the real P&L stays recorded
+(logged loudly, recorded in the session's meta).
 """
 
 from __future__ import annotations
@@ -45,8 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(LIVE_CONFIRM_FLAG, dest="confirmed", action="store_true",
                    help="required for --mode live: you accept that real orders will be sent")
     p.add_argument("--reset-daily-halt", action="store_true",
-                   help="operator override: start without the carried-over halt / pause and with a fresh daily-loss "
-                        "budget (logged); only after investigating why it halted")
+                   help="operator override: start without the carried-over halt / pause; the daily-loss limit counts "
+                        "from the current real day P&L (a fresh budget; logged); only after investigating why it halted")
     p.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (0 = until signalled)")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args(argv)
@@ -66,7 +68,8 @@ def main(argv: list[str] | None = None) -> int:
         live_cfg = example
     try:
         if args.reset_daily_halt:
-            logging.warning("--reset-daily-halt: the carried-over halt, pause and today's loss so far will be IGNORED")
+            logging.warning("--reset-daily-halt: the carried-over halt and pause are cleared; the daily-loss budget "
+                            "restarts from the current real day P&L")
         return asyncio.run(run_from_paths(args.config, live_cfg, cli_mode=args.mode, confirmed=args.confirmed,
                                           duration_s=args.duration or None, reset_daily_halt=args.reset_daily_halt))
     except ModeError as exc:

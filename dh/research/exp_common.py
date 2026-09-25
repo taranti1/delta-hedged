@@ -421,6 +421,15 @@ def slope_ci(x: Sequence[float], y: Sequence[float], clusters: Sequence[Any], n_
     return CI(b0, lo, hi, k, se_jack)
 
 
+def profitable_contracts_per_day(df: pd.DataFrame | None, days: float) -> float:
+    """Contracts/day of settled fills with a positive realized net (TEST_MATRIX: 'profitable
+    contracts/day does not fall')."""
+    if df is None or not len(df) or not days or days <= 0 or "net" not in df:
+        return 0.0
+    d = df[df["settle"].notna()] if "settle" in df else df
+    return float(d.loc[d["net"] > 0, "contracts"].sum()) / days
+
+
 def net_ci(df: pd.DataFrame, n_boot: int = 500, seed: int = 11) -> CI:
     """Realized net cents per contract of settled fills (ledger DataFrame), event-clustered CI."""
     if df is None or not len(df):
@@ -560,12 +569,15 @@ def segment_rows(df: pd.DataFrame, by: list[str], days: float, n_boot: int = 300
         key = key if isinstance(key, tuple) else (key,)
         cl = settlement_clusters(g["event"])
         ci = cluster_mean_ci(g["net_c_per_ct"], g["contracts"], cl, n_boot, seed)
+        cday = (cluster_mean_ci(g["net_c_per_ct"], g["contracts"], g["ts"].to_numpy(dtype=np.int64) // DAY_NS, n_boot, seed)
+                if "ts" in g else None)
         ct = float(g["contracts"].sum())
         row = {**dict(zip(by, key)), "fills": len(g), "contracts": ct, "events": int(len(set(cl))),
                "fills_per_day": len(g) / days if days > 0 else math.nan,
                "contracts_per_day": ct / days if days > 0 else math.nan,
                "net_c": ci.mean, "net_lo_c": ci.lo, "net_hi_c": ci.hi,
                "p_pos": ci.p_greater(0.0), "p_neg": ci.p_less(0.0),
+               "net_day_lo_c": cday.lo if cday else math.nan, "day_blocks": cday.clusters if cday else 0,
                "gross_edge_c": float(np.average(g["gross_edge_c"], weights=g["contracts"])) if ct > 0 else math.nan,
                "fee_c": 100.0 * float(g["fee"].sum()) / ct if ct > 0 else math.nan,
                "net_usd_per_day": float(g["net"].sum()) / days if days > 0 else math.nan}

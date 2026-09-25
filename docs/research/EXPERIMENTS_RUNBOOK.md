@@ -121,9 +121,11 @@ the replayed strategy.
   experiment lacks results under BOTH B and C, and (ACCEPT only) on a synthetic recording or with
   fitted inputs in sample or of unknown status. The rule's own outcome is a separate field and
   never appears inside the INCONCLUSIVE text.
-* **Economic acceptance.** E2 needs contracts/day and $/day not lower under B and C on top of the
-  net c/contract CI; E3 needs $/day not lower (its own <= 20 % fill-loss rule bounds the contract
-  loss); E4/E9 need $/day up.
+* **Economic acceptance.** E2 needs contracts/day, profitable contracts/day and $/day not lower
+  under B and C on top of the net c/contract CI; E3 needs $/day and PROFITABLE contracts/day (the
+  TEST_MATRIX wording) not lower, since its own <= 20 % fill-loss rule allows fewer total
+  contracts; E4/E9 need $/day up. The day-block second check applies to E2, E3, E4, E8, E9 and the
+  E6/E7 confirmation sample.
 * **Regime splits** (TEST_MATRIX): tau bucket, realized-vol tercile and weekday/weekend tables for
   E2 (forecast gain by vol/weekday; P&L hook by all three), E3, E4, E8, E9 and E10; E1 by
   calendar month (stability).

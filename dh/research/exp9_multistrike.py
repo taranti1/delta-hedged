@@ -28,7 +28,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from dh.research.exp_common import CI, Report, fmt_ns, holm, paired_ratio_ci, sum_diff_ci
+from dh.research.exp_common import CI, Report, day_block_ok, fmt_ns, holm, paired_ratio_ci, sum_diff_ci, with_day
 from dh.research.replay_env import (
     NearestStrikes,
     PortfolioSampler,
@@ -71,17 +71,22 @@ def turnover_blocks(ps: pd.DataFrame | None, fills: pd.DataFrame, block_ns: int 
     return {k: (v[0], v[1]) for k, v in out.items()}
 
 
-def paired_e9(ref: GridRun, var: GridRun, n_boot: int = 400) -> tuple[CI, CI]:
-    """(Delta net $/day over settlement events, Delta delta-turnover per contract over 1 h blocks)."""
+def paired_e9(ref: GridRun, var: GridRun, n_boot: int = 400) -> tuple[CI, CI, CI]:
+    """(Delta net $/day over settlement events, Delta delta-turnover per contract over 1 h blocks,
+    Delta net $/day over UTC days: the day-block second check)."""
     days = float(var.summary.get("days", math.nan))
-    usd = sum_diff_ci(settled(ref.df), settled(var.df), "net", scale=1.0 / days if days > 0 else math.nan, n_boot=n_boot)
+    scale = 1.0 / days if days > 0 else math.nan
+    a, b = settled(ref.df), settled(var.df)
+    usd = sum_diff_ci(a, b, "net", scale=scale, n_boot=n_boot)
+    usd_day = (sum_diff_ci(with_day(a), with_day(b), "net", cluster="day", scale=scale, n_boot=n_boot)
+               if len(a) and len(b) and "ts" in a and "ts" in b else CI(math.nan, math.nan, math.nan, 0))
     ta = turnover_blocks(ref.collectors[0] if ref.collectors else None, ref.df)
     tb = turnover_blocks(var.collectors[0] if var.collectors else None, var.df)
     keys = sorted(set(ta) | set(tb))
     A = np.array([ta.get(k, (0.0, 0.0)) for k in keys], dtype=float).reshape(-1, 2)
     B = np.array([tb.get(k, (0.0, 0.0)) for k in keys], dtype=float).reshape(-1, 2)
     turn = paired_ratio_ci(A[:, 0], A[:, 1], B[:, 0], B[:, 1], n_boot) if len(keys) else CI(math.nan, math.nan, math.nan, 0)
-    return usd, turn
+    return usd, turn, usd_day
 
 
 def portfolio_metrics(ps: pd.DataFrame, contracts: float) -> dict[str, float]:
@@ -123,11 +128,13 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     for r in runs:
         if r.variant == ref or (ref, r.policy) not in by:
             continue
-        usd, turn = paired_e9(by[(ref, r.policy)], r, n_boot)
+        usd, turn, usd_day = paired_e9(by[(ref, r.policy)], r, n_boot)
         p = max(usd.p_greater(0.0), turn.p_less(0.0)) if math.isfinite(usd.mean) and math.isfinite(turn.mean) else math.nan
         prow.append({"variant": r.variant, "policy": r.policy, "d_usd_day": usd.mean, "d_usd_day_lo": usd.lo,
                      "d_usd_day_hi": usd.hi, "events": usd.clusters, "d_turnover_per_ct": turn.mean,
-                     "d_turnover_lo": turn.lo, "d_turnover_hi": turn.hi, "time_blocks": turn.clusters, "p_joint": p})
+                     "d_turnover_lo": turn.lo, "d_turnover_hi": turn.hi, "time_blocks": turn.clusters, "p_joint": p,
+                     "d_usd_day_daylo": usd_day.lo, "day_blocks": usd_day.clusters,
+                     "day_check": day_block_ok(usd_day)})
     paired = pd.DataFrame(prow)
     others = [names[n] for n in counts[1:]]
     improves: dict[str, bool] = {v: True for v in others}  # AND over B and C; starts True, any miss -> False
@@ -136,7 +143,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
         rows = paired[paired.policy == p].set_index("variant") if len(paired) else pd.DataFrame()
         rej = holm(rows["p_joint"].to_numpy(dtype=float)) if len(rows) else []
         passed = {v for v, rj in zip(rows.index, rej) if rj and rows.loc[v, "d_usd_day_lo"] > 0
-                  and rows.loc[v, "d_turnover_hi"] < 0}
+                  and rows.loc[v, "d_turnover_hi"] < 0 and rows.loc[v, "day_check"] is not False}
         for v in others:
             improves[v] = improves[v] and v in passed
             if v in rows.index:

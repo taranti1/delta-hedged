@@ -73,6 +73,23 @@ def order_row(coid: str, oid: str, ticker: str, *, status: str = "resting", side
     return row
 
 
+def market_row(ticker: str, *, bid: str = "0.4400", ask: str = "0.4600", status: str = "active", result: str = "",
+               last: str = "0.4500", settlement_value: str | None = None) -> dict[str, Any]:
+    """openapi Market object (the fields the risk-state valuation reads)."""
+    row = {"ticker": ticker, "event_ticker": ticker.rsplit("-", 1)[0], "status": status, "yes_bid_dollars": bid,
+           "yes_ask_dollars": ask, "last_price_dollars": last, "result": result}
+    if settlement_value is not None:
+        row["settlement_value_dollars"] = settlement_value
+    return row
+
+
+def trade_row(tid: str, ticker: str, *, px: str = "0.4500", created_ns: int, count: str = "1.00") -> dict[str, Any]:
+    """openapi Trade object (GET /markets/trades)."""
+    return {"trade_id": tid, "ticker": ticker, "count_fp": count, "yes_price_dollars": px,
+            "no_price_dollars": f"{1 - float(px):.4f}", "taker_outcome_side": "yes", "taker_book_side": "bid",
+            "created_time": _iso(created_ns), "is_block_trade": False}
+
+
 def fill_row(fid: str, oid: str, ticker: str, *, side: str = "bid", px: str = "0.4500", count: str = "1.00",
              fee: str = "0.000000", taker: bool = False, created_ns: int | None = None, coid: str = "",
              subaccount: int | None = None) -> dict[str, Any]:
@@ -104,7 +121,14 @@ class FakeRest:
         self.queue_positions: dict[str, str] = {}  # oid -> queue_position_fp
         self.groups: list[dict[str, Any]] = []
         self.fills: list[dict[str, Any]] = []  # REST Fill rows
+        self.historical_fills: list[dict[str, Any]] = []  # GET /historical/fills rows
         self.settlements: list[dict[str, Any]] = []  # REST Settlement rows
+        self.cutoff: dict[str, Any] = {"market_settled_ts": "2026-01-01T00:00:00Z", "trades_created_ts": "2026-01-01T00:00:00Z",
+                                       "orders_updated_ts": "2026-01-01T00:00:00Z"}
+        self.markets: dict[str, dict[str, Any]] = {}  # ticker -> Market object (GET /markets)
+        self.historical_markets: dict[str, dict[str, Any]] = {}
+        self.trades: list[dict[str, Any]] = []  # public Trade rows (GET /markets/trades)
+        self.historical_trades: list[dict[str, Any]] = []
         self.clock: Callable[[], int] = time.time_ns  # created_time of orders this fake creates
         self.cf_history: Callable[[str | None, str | None], Any] | None = None
         self.series: dict[str, dict] = {}
@@ -258,6 +282,44 @@ class FakeRest:
 
     async def iter_settlements(self, **filters: Any):  # async generator (like KalshiRest.iter_settlements)
         rows = await self._call("iter_settlements", (), filters, lambda: copy.deepcopy(self.settlements))
+        for r in rows:
+            yield r
+
+    async def iter_historical_fills(self, **filters: Any):
+        rows = await self._call("iter_historical_fills", (), filters, lambda: copy.deepcopy(self.historical_fills))
+        for r in rows:
+            yield r
+
+    async def get_historical_cutoff(self) -> Any:
+        return await self._call("get_historical_cutoff", (), {}, lambda: dict(self.cutoff))
+
+    async def get_markets(self, **kw: Any) -> Any:
+        tickers = kw.get("tickers") or []
+        tickers = tickers.split(",") if isinstance(tickers, str) else list(tickers)
+        return await self._call("get_markets", (), kw, lambda: {
+            "markets": [copy.deepcopy(self.markets[t]) for t in tickers if t in self.markets], "cursor": ""})
+
+    async def get_historical_market(self, ticker: str) -> Any:
+        def look() -> Any:
+            if ticker not in self.historical_markets:
+                raise http_error(404, "not_found", "market not found", "GET", f"/historical/markets/{ticker}")
+            return {"market": copy.deepcopy(self.historical_markets[ticker])}
+        return await self._call("get_historical_market", (ticker,), {}, look)
+
+    async def iter_trades(self, **kw: Any):  # public trades in [min_ts, max_ts] (Unix s, inclusive)
+        src = self.historical_trades if kw.get("historical") else self.trades
+
+        def pick() -> list[dict[str, Any]]:
+            from dh.kalshi.wire import iso_to_ns
+
+            lo, hi = kw.get("min_ts"), kw.get("max_ts")
+            out = []
+            for tr in src:
+                t = iso_to_ns(tr["created_time"]) // NS_PER_S
+                if (kw.get("ticker") in (None, tr["ticker"]) and (lo is None or t >= lo) and (hi is None or t <= hi)):
+                    out.append(copy.deepcopy(tr))
+            return out
+        rows = await self._call("iter_trades", (), kw, pick)
         for r in rows:
             yield r
 

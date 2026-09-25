@@ -155,7 +155,9 @@ def add_recommendation(t: pd.DataFrame, keys: Sequence[str], min_events: int = M
                 rows.append((key, r.iloc[0] if len(r) else None))
             pv = [float(r["p_pos"]) if r is not None and r["events"] >= min_events else np.nan for _, r in rows]
             rej = holm(pv)
-            ok_by_pol[pol] = {key: bool(rj and r is not None and r["net_lo_c"] > 0) for (key, r), rj in zip(rows, rej)}
+            ok_by_pol[pol] = {key: bool(rj and r is not None and r["net_lo_c"] > 0
+                                        and not (int(r.get("day_blocks", 0) or 0) >= 5 and not r.get("net_day_lo_c", 0) > 0))
+                              for (key, r), rj in zip(rows, rej)}
             for key, r in rows:
                 if r is not None:
                     m = np.ones(len(t), dtype=bool)

@@ -58,6 +58,7 @@ from dh.research.exp_common import (
     add_regimes,
     day_block_ok,
     flag_only_A,
+    profitable_contracts_per_day,
     fmt_ns,
     n_events,
     paired_diff_ci,
@@ -453,6 +454,9 @@ def pnl_hook(root: str | Path, t_split: int, t1: int, cfg: StrategyConfig, beta:
                "contracts_day_base": base.summary.get("contracts_per_day", 0.0),
                "contracts_day_nowcast": nc.summary.get("contracts_per_day", 0.0)}
         a, b = _settled(base.df), _settled(nc.df)
+        days = float(base.summary.get("days", 0.0) or 0.0)
+        row["profitable_ct_day_base"] = profitable_contracts_per_day(a, days)
+        row["profitable_ct_day_nowcast"] = profitable_contracts_per_day(b, days)
         d = paired_diff_ci(a, b, "net_c_per_ct", n_boot=n_boot) if len(a) and len(b) else None
         row.update({"d_net_c": d.mean if d else math.nan, "d_net_lo_c": d.lo if d else math.nan,
                     "d_net_hi_c": d.hi if d else math.nan})
@@ -493,7 +497,8 @@ def hook_decision(hook: pd.DataFrame) -> tuple[bool, bool, list[str]]:
     for r in bc.itertuples():
         day = day_block_ok(_DayCI(getattr(r, "d_day_lo_c", math.nan), int(getattr(r, "day_blocks", 0) or 0)))
         ok &= bool(r.d_net_lo_c > 0 and day is not False and r.contracts_day_nowcast >= r.contracts_day_base
-                   and r.usd_day_nowcast >= r.usd_day_base)
+                   and r.usd_day_nowcast >= r.usd_day_base
+                   and getattr(r, "profitable_ct_day_nowcast", math.inf) >= getattr(r, "profitable_ct_day_base", 0.0))
     bad = bool(len(bc)) and bool((bc["d_net_hi_c"] < 0).any())
     return ok, bad, have
 
