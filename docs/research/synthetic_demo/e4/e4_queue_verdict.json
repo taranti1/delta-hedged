@@ -1,0 +1,19 @@
+{
+ "experiment": "e4_queue",
+ "verdict": "INCONCLUSIVE \u2014 only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "REJECT (differences within the CI: no pre-registered keep-priority variant beats always-re-centering by > 0.05c/contract with Holm-adjusted CI > 0 and higher $/day under both B and C)",
+ "guards": [
+  "only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)"
+ ],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept keep-priority if it beats always-re-centering by > 0.05c/contract (paired CI > 0, Holm across the pre-registered keep-priority variants) and in $/day under B and C; differences within the CI -> no decision"
+}

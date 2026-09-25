@@ -399,3 +399,45 @@ async def test_restart_at_midnight_derives_the_new_day():
     assert day_start(seed_ts) == D0 + DAY_NS and pnl.day_start_ns == D0 + DAY_NS
     assert pnl.fills == 0 and pnl.pnl_usd == 0.0  # yesterday's -$5 is not today's
     assert [k["min_ts"] for _, k in rest.of("iter_fills")] == [D0 // NS_PER_S, (D0 + DAY_NS) // NS_PER_S]
+
+
+def test_persisted_mark_is_bounded_by_the_open_positions():
+    """The mark a restart re-values is only what the open positions can be worth ($0..$1 per
+    contract); anything else in the equity stays realized (kept across the restart)."""
+    from types import SimpleNamespace
+
+    from dh.execution.order_manager import OrderManager
+    from dh.live.runner import equity_parts
+
+    om = OrderManager()
+    st = SimpleNamespace(om=om, specs={TK: None}, settled={}, equity=lambda S=None: -24.99, settled_cash=0.0)
+    assert equity_parts(st) == (-24.99, 0.0)  # no position: nothing to re-value
+    om.on_event(KalshiFill(1, 0, TK, "tr-1", "o-1", "", "bid", 4000, 300, False, 0, 0, False))  # 3 long at 40c
+    st.equity = lambda S=None: -1.20 + 3 * 0.55  # cash -1.20, marked at 55c
+    e, mark = equity_parts(st)
+    assert mark == pytest.approx(1.65) and e - mark == pytest.approx(-1.20)
+    st.equity = lambda S=None: 10.0  # more than 3 contracts can be worth: the excess is not a mark
+    assert equity_parts(st)[1] == pytest.approx(3.0)
+    st.settled = {TK: 10_000}
+    assert equity_parts(st)[1] == 0.0
+
+
+async def test_a_carried_quoting_halt_keeps_its_scope_in_the_state(tmp_path):
+    """Review nit: a quoting-scope halt (fee mismatch) is persisted as such and stays 'quoting'
+    across restarts, although the strategy restores every carried halt as Halt(all) until
+    RiskStateSeed can carry a scope."""
+    from dh.live.riskstate import RiskState, make_seed
+
+    prev = RiskState(D0, 0.0, True, "fee_mismatch:x", 0, "s0", "live", D0 + H, realized_usd=0.0, halt_scope="quoting",
+                     halt_day_ns=D0 - DAY_NS)
+    dec = decide_seed(D0 + 2 * H, prev, None)
+    assert dec.halted and dec.halt_scope == "quoting" and dec.halt_day_ns == D0 - DAY_NS
+    s = RiskStrategy()
+    store = RiskStateStore(tmp_path / "risk.json")
+    r, venue, _ = live_runner(s, risk_store=store, risk_book=RiskBook.from_decision(dec), clock_ns=lambda: D0 + 2 * H)
+    r.push_result(make_seed(D0 + 2 * H, dec))
+    r.process_pending()
+    assert s.risk.halted_all and "halt:all" in r.gate.reasons
+    st = store.load()  # persisted at once by the halt
+    assert st.halted and st.halt_reason == "fee_mismatch:x" and st.halt_scope == "quoting" and st.halt_day_ns == D0 - DAY_NS
+    await venue.wait_idle(1.0)

@@ -1,0 +1,17 @@
+{
+ "experiment": "e9_multistrike",
+ "verdict": "INCONCLUSIVE (no variant shows $/day up and turnover down vs nearest_1 with CIs under both B and C)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "INCONCLUSIVE (no variant shows $/day up and turnover down vs nearest_1 with CIs under both B and C)",
+ "guards": [],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept if $/day is up and hedge (delta) turnover per contract is down vs the single best strike (paired CIs under B and C, Holm across variants)"
+}

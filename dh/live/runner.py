@@ -135,7 +135,7 @@ from dh.core.events import (
     Timer,
 )
 from dh.core.market import MarketSpec
-from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE
+from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.live.config import LiveConfig
 from dh.live.monitor import JsonLog, KillFile, Metrics, MetricsServer, write_heartbeat
 from dh.live.pump import EventPump, OrderingError
@@ -2187,8 +2187,11 @@ class LiveRunner:
 
 def equity_parts(strategy: Any) -> tuple[float, float] | None:
     """(equity, mark of its open positions) of a strategy exposing ``equity(S)`` (the
-    MarketMaker: cash - fees + settlements + open positions at fair value); the mark is the
-    equity minus the OrderManager's cash, fees and settled cash. None without ``equity``."""
+    MarketMaker: cash - fees + settlements + open positions at fair value). The mark is the
+    equity minus the OrderManager's cash, fees and settled cash, clamped to what the open
+    positions can be worth ($0..$1 per contract): anything else in the equity (a hedge's cash,
+    say) counts as realized, which a restart keeps, never as a mark it re-values. None without
+    ``equity``."""
     eq = getattr(strategy, "equity", None)
     if not callable(eq):
         return None
@@ -2199,7 +2202,17 @@ def equity_parts(strategy: Any) -> tuple[float, float] | None:
     if om is None or not hasattr(om, "cash_micros"):
         return e, 0.0
     cash = om.cash_micros() / 1e6 - om.fees_micros() / 1e6 + float(getattr(strategy, "settled_cash", 0.0) or 0.0)
-    return e, e - cash
+    settled = getattr(strategy, "settled", {}) or {}
+    lo = hi = 0.0
+    for t in getattr(strategy, "specs", {}) or {}:
+        if t in settled:
+            continue
+        q = om.position(t) / QTY_SCALE
+        if q > 0:
+            hi += q
+        else:
+            lo += q
+    return e, min(max(e - cash, lo), hi)
 
 
 def effective_fee(spec: MarketSpec, ev: KalshiFeeUpdate) -> tuple[str, float] | None:

@@ -1,0 +1,17 @@
+{
+ "experiment": "e8_taker",
+ "verdict": "INCONCLUSIVE (taking stays disabled: B: net 13.16c [-1.09, 32.43], 6024 opp/day; C: net 14.70c [4.69, 28.84], 6024 opp/day)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "INCONCLUSIVE (taking stays disabled: B: net 13.16c [-1.09, 32.43], 6024 opp/day; C: net 14.70c [4.69, 28.84], 6024 opp/day)",
+ "guards": [],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept if taker net > 0.5c/contract after fees with a 95% CI > 0 and >= 20 opportunities/day; otherwise taking stays disabled"
+}

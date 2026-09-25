@@ -1,0 +1,5 @@
+synthetic,variant,policy,d_usd_day,d_usd_day_lo,d_usd_day_hi,events,d_turnover_per_ct,d_turnover_lo,d_turnover_hi,time_blocks,p_joint,d_usd_day_daylo,day_blocks,day_check
+True,nearest_3,B,157.44,-58.1952,396.978,4,-0.00735702,-0.00735702,-0.00735702,2,0.0513742,,1,
+True,nearest_3,C,172.08,-24.4272,368.587,4,-0.008435,-0.008435,-0.008435,2,0.0342993,,1,
+True,all,B,-6.24,-354.809,342.329,4,-0.0266382,-0.0266382,-0.0266382,2,0.520925,,1,
+True,all,C,-13.68,-398.146,324.478,4,-0.0259299,,,2,0.547147,,1,

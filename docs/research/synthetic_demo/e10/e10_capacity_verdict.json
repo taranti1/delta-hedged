@@ -1,0 +1,19 @@
+{
+ "experiment": "e10_capacity",
+ "verdict": "INCONCLUSIVE \u2014 only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "MEASUREMENT \u2014 breakeven clip multiple: B: 50, C: 50",
+ "guards": [
+  "only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)"
+ ],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": [
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "measurement: report capacity at > 1.0, 0.75, 0.5, 0.05 c/contract and breakeven under B and C"
+}

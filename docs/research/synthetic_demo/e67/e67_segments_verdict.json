@@ -1,0 +1,18 @@
+{
+ "experiment": "e67_segments",
+ "verdict": "INCONCLUSIVE (no bucket confirmed on the later window; in-sample candidates: none; buckets selected in-sample on settlement events expiring before 2026-09-24T12:30:00.000Z (Holm within each table), confirmed on settlement events expiring from 2026-09-24T12:30:00.000Z (chronological split))",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "INCONCLUSIVE (no bucket confirmed on the later window; in-sample candidates: none; buckets selected in-sample on settlement events expiring before 2026-09-24T12:30:00.000Z (Holm within each table), confirmed on settlement events expiring from 2026-09-24T12:30:00.000Z (chronological split))",
+ "guards": [],
+ "decision_events": 3,
+ "min_events": 20,
+ "policies": [
+  "A",
+  "B",
+  "C"
+ ],
+ "in_sample": false,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "quote only buckets whose realized net c/contract is > 0 with Holm-controlled significance under B and C in the selection sample AND CI lower bound > 0 under B and C on a disjoint later window; disable buckets significantly < 0 (Holm) under B or C"
+}

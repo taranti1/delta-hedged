@@ -1,0 +1,5 @@
+synthetic,touch_age,takes,contracts,net_60s_c,net_settle_c,net_settle_lo_c,net_settle_hi_c
+True,<0.5s,185,1616,9.20958,12.5569,-17.0847,31.7224
+True,0.5-1s,14,121,7.92582,16.4298,,
+True,1-2s,11,101,3.48022,19.5347,-3.23022e+08,228.712
+True,2-5s,2,11,5.94642,6.45455,,

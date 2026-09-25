@@ -1,0 +1,10 @@
+synthetic,policy,tau_bucket,fills,contracts,events,fills_per_day,contracts_per_day,net_c,net_lo_c,net_hi_c,p_pos,p_neg,net_day_lo_c,day_blocks,gross_edge_c,fee_c,net_usd_per_day,mo_10s_c,mo_60s_c,toxic_share,holds_only_under_A,holm_pos,holm_neg,recommendation,confirm_lo_c
+True,A,1-5m,5,15.5,1,240,744,12.7742,,,,,,1,6.91201,0.483871,95.04,11.2058,1.22724,0,False,False,False,insufficient data,
+True,A,10-30m,24,79,1,1152,3792,-1.77215,,,,,,1,1.99676,0.227848,-67.2,-0.253351,-0.0197127,0,False,False,False,insufficient data,
+True,A,5-10m,4,15,1,192,720,0.8,,,,,,1,2.0809,0.2,5.76,-0.17716,-0.208627,0,False,False,False,insufficient data,
+True,B,1-5m,5,15.49,1,240,743.52,12.7824,,,,,,1,6.91522,0.482892,95.04,11.213,1.228,0,False,False,False,insufficient data,
+True,B,10-30m,23,78.97,1,1104,3790.56,-1.77283,,,,,,1,1.9953,0.227175,-67.2,-0.251237,-0.0177475,0,False,False,False,insufficient data,
+True,B,5-10m,4,15,1,192,720,0.8,,,,,,1,2.0809,0.2,5.76,-0.177166,-0.208626,0,False,False,False,insufficient data,
+True,C,1-5m,2,5.5,1,96,264,-27.2727,,,,,,1,2.00865,0.454545,-72,10.4898,-12.801,0,False,False,False,insufficient data,
+True,C,10-30m,24,77,1,1152,3696,-1.8961,,,,,,1,1.94956,0.233766,-70.08,-0.272484,-0.0548987,0,False,False,False,insufficient data,
+True,C,5-10m,3,15,1,144,720,0.8,,,,,,1,2.08697,0.2,5.76,-0.182933,-0.212933,0,False,False,False,insufficient data,
