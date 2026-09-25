@@ -275,28 +275,60 @@ async def backfill_fair_value(
 
 # ============================================================================ paper simulator
 class PaperFees:
-    """fee_fn for KalshiExchangeSim, which does not pass the ticker: the most expensive of
-    the universe's (supported) fee schedules, i.e. paper P&L is never flattered by fees."""
+    """Fees for the paper simulator.
+
+    ``order_fee`` (KalshiExchangeSim ``order_fee_fn``): the market's own schedule (the sim's
+    order id gives the ticker; event fee overrides via ``set_fee``) through an
+    OrderFeeAccumulator per order, i.e. the net fee including Kalshi's per-order balance
+    rounding and carry, which the strategy prices too. ``__call__`` (the per-fill ``fee_fn``
+    fallback, no ticker available): the most expensive schedule of the universe, so paper
+    P&L is never flattered by fees."""
 
     def __init__(self, fee_engine: Any) -> None:
         self.fee_engine = fee_engine
         self.schedules: dict[tuple[str, float], Any] = {}
+        self.by_ticker: dict[str, tuple[str, float]] = {}
+        self.sim: Any = None
+        self._accs: dict[str, Any] = {}
+
+    def _ensure(self, key: tuple[str, float]) -> Any:
+        if key in self.schedules:
+            return self.schedules[key]
+        try:
+            sched = self.fee_engine.schedule_for_spec(key[0], key[1])
+        except Exception:  # noqa: BLE001 - unsupported: the strategy will not quote it
+            return None
+        if not getattr(sched, "supported", True):
+            return None
+        self.schedules[key] = sched
+        return sched
 
     def add_specs(self, specs: Iterable[MarketSpec]) -> None:
         for s in specs:
-            if not s.fee_type or (s.fee_type, s.fee_multiplier) in self.schedules:
-                continue
-            try:
-                sched = self.fee_engine.schedule_for_spec(s.fee_type, s.fee_multiplier)
-            except Exception:  # noqa: BLE001 - unsupported: the strategy will not quote it
-                continue
-            if getattr(sched, "supported", True):
-                self.schedules[(s.fee_type, s.fee_multiplier)] = sched
+            if s.fee_type:
+                self.by_ticker.setdefault(s.ticker, (s.fee_type, s.fee_multiplier))
+                self._ensure((s.fee_type, s.fee_multiplier))
+
+    def set_fee(self, ticker: str, fee_type: str, multiplier: float) -> None:
+        """Event fee override in force for ``ticker`` (new orders use it)."""
+        self.by_ticker[ticker] = (fee_type, multiplier)
+        self._ensure((fee_type, multiplier))
 
     def __call__(self, px: int, qty: int, is_taker: bool) -> int:
         if not self.schedules:
             return 0
         return max(s.trade_fee_micros(px, qty, is_taker) for s in self.schedules.values())
+
+    def order_fee(self, order_key: str, book_side: str, px: int, qty: int, is_taker: bool) -> int:
+        acc = self._accs.get(order_key)
+        if acc is None:
+            o = self.sim.orders.get(order_key) if self.sim is not None else None
+            key = self.by_ticker.get(o.ticker) if o is not None else None
+            sched = self._ensure(key) if key is not None else None
+            if sched is None:
+                return self(px, qty, is_taker)
+            acc = self._accs[order_key] = sched.order_accumulator(book_side)
+        return int(acc.apply_fill(px, qty, is_taker).net_micros)
 
 
 def build_paper_sim(cfg: PaperCfg, specs: Iterable[MarketSpec], fee_engine: Any) -> tuple[Any, PaperFees]:
@@ -312,8 +344,9 @@ def build_paper_sim(cfg: PaperCfg, specs: Iterable[MarketSpec], fee_engine: Any)
     specs = list(specs)
     fees = PaperFees(fee_engine)
     fees.add_specs(specs)
-    sim = KalshiExchangeSim(lat, cfg.policy, fees, seed=cfg.seed, latency_multiplier=cfg.latency_multiplier,
-                            id_prefix="paper")
+    sim = KalshiExchangeSim(lat, cfg.policy, fees, seed=cfg.seed, order_fee_fn=fees.order_fee,
+                            latency_multiplier=cfg.latency_multiplier, id_prefix="paper")
+    fees.sim = sim
     for s in specs:
         sim.register_market(s)
     return sim, fees

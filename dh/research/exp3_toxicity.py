@@ -52,7 +52,7 @@ from dh.core.units import NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.execution.markout import DEFAULT_HORIZONS_S, AsOf, compute_markouts
 from dh.feeds.registry import SPOT_CONSTITUENTS
 from dh.research.exp_common import Report, cluster_mean_ci, fmt_ns, paired_diff_ci, policy_letter, write_csv
-from dh.research.replay_env import Universe, build_universe, prime_probe, probe_for_window, run_replay
+from dh.research.replay_env import Universe, build_universe, inputs_meta, prime_probe, probe_for_window, run_replay
 from dh.strategy.config import StrategyConfig
 from dh.strategy.mm import MarketMaker
 
@@ -336,7 +336,9 @@ def _X(df: pd.DataFrame, feats: Sequence[str], fill_nan: bool) -> np.ndarray:
 
 def walk_forward_models(df: pd.DataFrame, feats: Sequence[str] = FEATURES, n_folds: int = 5, seed: int = 0,
                         min_train: int = 25) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """OOS classification/regression metrics and predictions (event-ordered folds)."""
+    """OOS classification/regression metrics and predictions (event-ordered folds; each fold is
+    predicted by models trained on earlier events' fills whose 10 s label ended before the fold's
+    first fill: no training label overlaps the test period)."""
     from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
     d = df[df["toxic"].notna()].copy()
@@ -349,8 +351,11 @@ def walk_forward_models(df: pd.DataFrame, feats: Sequence[str] = FEATURES, n_fol
         d[f"pred_{m}"] = np.nan
     d["pred_base_rate"] = np.nan
     d["pred_mean"] = np.nan
+    emb = int(LABEL_H_S * NS_PER_S)
     for k in sorted(set(folds)):
-        tr, te = d["fold"] < k, d["fold"] == k
+        te = d["fold"] == k
+        # earlier events only, and only fills whose label horizon ended before the test fold starts
+        tr = (d["fold"] < k) & (d["ts"] + emb <= d.loc[te, "ts"].min())
         if tr.sum() < min_train or d.loc[tr, "toxic"].nunique() < 2:
             continue
         y = d.loc[tr, "toxic"].to_numpy()
@@ -585,6 +590,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     rep = Report("e3_toxicity", "E3 — Predictability of fill toxicity and a toxicity-aware cancel rule", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E3,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "rule_fit_until": fmt_ns(t_split),
+                       **inputs_meta(uni, t0)[0],
                        "label": f"toxic = fair value moved against the fill within {LABEL_H_S:g}s",
                        "rule_threshold": rule.threshold if rule else "n/a (too few training fills)",
                        "rule_train_fills": rule.train_fills if rule else 0,

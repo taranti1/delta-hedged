@@ -42,7 +42,7 @@ from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.execution.latency import LatencyModel
 from dh.kalshi.fees import FeeEngine
 from dh.research.exp_common import Report, cluster_mean_ci, fmt_ns, policy_letter, write_csv
-from dh.research.replay_env import Universe, build_universe, prime_probe, probe_for_window
+from dh.research.replay_env import Universe, build_universe, inputs_meta, prime_probe, probe_for_window
 from dh.strategy.config import StrategyConfig
 
 RULE_E8 = ("accept if taker net > 0.5c/contract after fees with a 95% CI > 0 and >= 20 opportunities/day; "
@@ -343,7 +343,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     rep = Report("e8_taker", "E8 — Selective taking of stale Kalshi quotes", Path(out), synthetic=uni.synthetic,
                  rule=RULE_E8, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}",
                                      "decision_grid_ms": step_ms, "clip_contracts": clip_contracts,
-                                     "fv_warm": next(iter(res_by.values())).info.get("fv_warm") if res_by else ""})
+                                     "fv_warm": next(iter(res_by.values())).info.get("fv_warm") if res_by else "",
+                                     **inputs_meta(uni, t0)[0]})
     ok_all = True
     reasons = []
     for p in ("B", "C"):
@@ -357,6 +358,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
         reasons.append(f"{p}: net {r.net_settle_c:.2f}c [{r.net_settle_lo_c:.2f}, {r.net_settle_hi_c:.2f}], "
                        f"{r.opportunities_per_day:.0f} opp/day")
     rep.verdict = ("ACCEPT" if ok_all else "REJECT/INCONCLUSIVE (taking stays disabled)") + " — " + "; ".join(reasons)
+    for w in inputs_meta(uni, t0)[1]:
+        rep.line(f"WARNING: {w}")
     if any(not r.info.get("fv_ready_at_t0", True) for r in res_by.values()):
         rep.line("WARNING: fair-value model NOT warm at t0 (no opportunities are evaluated until it is): start t0 "
                  "later, record CF history before t0, or use --warm recorded+gbm / csv:<prices>")

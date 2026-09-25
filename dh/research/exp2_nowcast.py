@@ -55,6 +55,7 @@ from dh.research.replay_env import (
     MD_CACHE_PREFIX,
     Universe,
     build_universe,
+    inputs_meta,
     kalshi_ws_streams,
 )
 from dh.core.market import SettlementSpec
@@ -466,7 +467,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                  synthetic=uni.synthetic, rule=RULE_E2,
                  meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "panel_rows": len(pr.panel),
                        "step_ms": step_ms, "folds": n_folds, "brti_ticks": len(pr.brti),
-                       "hook_beta(g_med, h=%gs)" % hook_horizon_s: beta})
+                       "hook_beta(g_med, h=%gs)" % hook_horizon_s: beta,
+                       **({"P&L hook " + k: v for k, v in inputs_meta(uni, t_split)[0].items()} if pnl else {})})
     short = metrics[metrics["horizon"].isin([f"{h:g}s" for h in horizons_s])]
     best = short[short["model"].isin(["ridge", "lgbm"])]
     gain_ok = bool(len(best)) and bool((best.groupby("horizon")["rmse_gain_pct"].max() >= 10.0).all())

@@ -505,3 +505,22 @@ async def test_loop_stall_blocks_orders_until_fresh_events():
     r.push(IndexTick(clock["t"], clock["t"], "BRTI", 84000.0, "5hz"))  # fresh data: gate reopens
     r.process_pending()
     assert "lag" not in r.gate.reasons
+
+
+async def test_fee_override_is_followed_not_blocked():
+    """After an event fee override to 'quadratic' (no maker fee) a zero maker fee is correct:
+    no block, no mismatch; before it, the same fill would be a mismatch."""
+    from dh.core.events import KalshiFeeUpdate
+    from dh.kalshi.fees import FeeEngine
+
+    s = RecordingStrategy()
+    r, venue, rest = live_runner(s, fee_engine=FeeEngine.from_config())
+    r.push(KalshiFeeUpdate(time.time_ns(), 0, SPEC.event_ticker, "quadratic", None))
+    r.push(KalshiFill(time.time_ns(), 0, TK, "tr-1", "o-1", "c-1", "bid", 4500, 200, False, 0, 200))
+    r.process_pending()
+    await venue.wait_idle(1.0)
+    assert not r.gate.closed and not r.gate.tickers and "cancel_all_orders" not in rest.names()
+    r.push(KalshiFeeUpdate(time.time_ns(), 0, SPEC.event_ticker, None, None))  # override cleared
+    r.push(KalshiFill(time.time_ns(), 0, TK, "tr-2", "o-2", "c-2", "bid", 4500, 200, False, 0, 400))
+    r.process_pending()
+    assert "fee_mismatch" in r.gate.reasons

@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from dh.research.exp_common import Report, fmt_ns
-from dh.research.replay_env import NearestStrikes, PortfolioSampler, Universe, build_universe
+from dh.research.replay_env import NearestStrikes, PortfolioSampler, Universe, build_universe, inputs_meta
 from dh.research.replay_grid import Variant, run_variants, run_warnings, variant_table
 from dh.strategy.config import StrategyConfig
 
@@ -66,7 +66,8 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     tab = tab.merge(pd.DataFrame(extra), on=["variant", "policy"], how="left")
     rep = Report("e9_multistrike", "E9 — Quoting 1 vs 3 vs all strikes: netting and capital efficiency", Path(out),
                  synthetic=uni.synthetic, rule=RULE_E9,
-                 meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "reference": ref})
+                 meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "reference": ref,
+                       **inputs_meta(uni, t0)[0]})
     verdicts = []
     for v in tab["variant"].unique():
         if v == ref:

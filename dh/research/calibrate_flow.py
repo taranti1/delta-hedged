@@ -277,11 +277,13 @@ def flow_metrics(tab: pd.DataFrame) -> dict[str, Any]:
 class FlowSplit:
     """Result of a time-split calibration (see calibrate_split / walk_forward_by_day)."""
 
-    segments: dict[tuple[str, str, str], SegmentFlow]  # fitted on the training period only
+    segments: dict[tuple[str, str, str], SegmentFlow]  # fitted on the training period only (graded OOS)
     metrics: pd.DataFrame  # one row per sample: in_sample / out_of_sample (+ per test day)
     per_segment: pd.DataFrame  # evaluate_flow rows with a 'sample' column
     split_ms: int | None = None
     train_end_ms: int | None = None  # every training datum is before this time
+    segments_all: dict[tuple[str, str, str], SegmentFlow] | None = None  # every market of the sample
+    all_end_ms: int | None = None  # every datum of segments_all is before this time (use for later replays)
     meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -302,13 +304,19 @@ def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFra
     train_m = mk[mk.expiration_ts_ms <= split_ms]
     test_m = mk[mk.expiration_ts_ms > split_ms]
     st_tr = flow_stats(orders, train_m, price_at, vol_ann, grid_s)
-    st_te = flow_stats(orders, test_m, price_at, vol_ann, grid_s, t_min_ms=split_ms if purge else None)
+    st_te_full = flow_stats(orders, test_m, price_at, vol_ann, grid_s)
+    st_te = flow_stats(orders, test_m, price_at, vol_ann, grid_s, t_min_ms=split_ms) if purge else st_te_full
     seg = fit_segments(st_tr, min_orders, prior_s)
     tabs = {"in_sample": evaluate_flow(seg, st_tr), "out_of_sample": evaluate_flow(seg, st_te)}
     rows = [{"sample": k, "fit_on": "train", "eval_on": "train" if k == "in_sample" else "test",
              "markets": st_tr.markets if k == "in_sample" else st_te.markets, **flow_metrics(t)} for k, t in tabs.items()]
     per = pd.concat([t.assign(sample=k) for k, t in tabs.items()], ignore_index=True)
+    st_all = FlowStats()
+    st_all.add(st_tr)
+    st_all.add(st_te_full)
     return FlowSplit(seg, pd.DataFrame(rows), per, split_ms=int(split_ms), train_end_ms=int(split_ms),
+                     segments_all=fit_segments(st_all, min_orders, prior_s),
+                     all_end_ms=int(exp[-1]) if len(exp) else None,
                      meta={"method": "chronological", "train_frac": train_frac, "purge": purge,
                            "train_markets": st_tr.markets, "test_markets": st_te.markets, "btc_bar_ms": btc_bar_ms})
 
@@ -353,8 +361,9 @@ def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.Dat
     rows.append({"sample": "in_sample", "fit_on": "all days", "eval_on": "all days", "markets": cum.markets,
                  **flow_metrics(tab_is)})
     per.append(tab_is.assign(sample="in_sample"))
-    end = int((days[-1] + 1) * day_ms) if days else None
+    end = int(mk.expiration_ts_ms.max()) if len(mk) else None
     return FlowSplit(seg_all, pd.DataFrame(rows), pd.concat(per, ignore_index=True), split_ms=None, train_end_ms=end,
+                     segments_all=seg_all, all_end_ms=end,
                      meta={"method": "walk_forward_day", "min_train_days": min_train_days, "purge": purge,
                            "days": len(days), "btc_bar_ms": btc_bar_ms})
 
@@ -382,22 +391,28 @@ def load_segments(path: str | Path) -> tuple[dict[tuple[str, str, str], SegmentF
 
 def write_split_report(res: FlowSplit, out: str | Path, *, title: str = "Flow calibration (time split)",
                        note: str = "", synthetic: bool = False) -> Path:
-    """flow_metrics.csv, flow_segments_eval.csv, flow_segments.json (fit on the training period)
-    and flow_calibration.md with in-sample vs out-of-sample rows."""
+    """flow_metrics.csv, flow_segments_eval.csv, flow_calibration.md (in-sample vs out-of-sample
+    rows), flow_segments.json (fit on the WHOLE sample: for replays that start after
+    ``all_end_ms``) and flow_segments_train.json (the graded training fit, ``train_end_ms``)."""
     from dh.research.exp_common import SYNTHETIC_BANNER, markdown_table, write_csv
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(res.metrics, out / "flow_metrics.csv", synthetic)
     write_csv(res.per_segment, out / "flow_segments_eval.csv", synthetic)
-    save_segments(res.segments, out / "flow_segments.json",
-                  meta={**res.meta, "fit_end_ms": res.train_end_ms, "split_ms": res.split_ms, "synthetic": synthetic})
+    save_segments(res.segments_all if res.segments_all is not None else res.segments, out / "flow_segments.json",
+                  meta={**res.meta, "fit_end_ms": res.all_end_ms if res.segments_all is not None else res.train_end_ms,
+                        "fit_on": "whole sample", "synthetic": synthetic})
+    save_segments(res.segments, out / "flow_segments_train.json",
+                  meta={**res.meta, "fit_end_ms": res.train_end_ms, "split_ms": res.split_ms, "fit_on": "training period",
+                        "synthetic": synthetic})
     lines = [f"# {title}", ""]
     if synthetic:
         lines += [f"**{SYNTHETIC_BANNER}**", ""]
     if note:
         lines += [note, ""]
-    lines += [f"Method: {res.meta.get('method')}; training data end (UTC ms): {res.train_end_ms}. Rows `in_sample` grade "
+    lines += [f"Method: {res.meta.get('method')}; training data end (UTC ms): {res.train_end_ms}; whole-sample fit "
+              f"(flow_segments.json) data end: {res.all_end_ms} -- use it only for replays that start later. Rows `in_sample` grade "
               "the fit on its own training data; `out_of_sample` rows grade it on later data only. ratio_ct = predicted / "
               "realized taker contracts; wape_ct = sum |pred - realized| / realized over segments; dev_explained = 1 - "
               "Poisson deviance(model) / deviance(pooled per-side rate) of order counts.", "",

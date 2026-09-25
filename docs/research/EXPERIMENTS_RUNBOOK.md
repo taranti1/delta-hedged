@@ -10,7 +10,8 @@ numbers validate code paths and injected known answers, never edge.
 
 ```
 python scripts/run_experiment.py <name> --root data --t0 2026-10-01 --t1 2026-10-08 [--out DIR] [--jobs 4]
-    names: universe | replay | e1 | e2 | e3 | e4 | e67 | e8 | e9 | e10 | all | synth | demo
+    names: universe | replay | flow | e1 | e2 | e3 | e4 | e67 | e8 | e9 | e10 | all | synth | demo
+    fitted inputs (checked for look-ahead against t0, section 2a): [--fv-config FV.json] [--flow-segments FLOW.json]
 ```
 
 Defaults: strategy `config/m1.yaml`, fill policies `B,C` (`--policies A,B,C` adds A as a
@@ -87,6 +88,50 @@ the replayed strategy.
 * **Inference.** Event-clustered bootstrap CIs everywhere (`dh.research.exp_common`); paired
   comparisons resample settlement events jointly across the two arms of the same recording.
 
+## 2a. Look-ahead guards (fitted inputs, causal joins)
+
+* **Fair-value parameters (in-sample FV).** The committed `dh/models/data/fv_recommended.json` was
+  fitted on Bitstamp 1-minute history through `data_end_utc` = 1790301480 (2026-09-25T00:38Z).
+  A replay whose t0 is before the end of the FV fitting data uses look-ahead parameters: every
+  replay summary carries `fv_params` (`... IN-SAMPLE (fitted on data through ...)` /
+  `out-of-sample` / `n/a (synthetic recording)`) and `fv_params_in_sample`, the CLI and every report
+  print a `WARNING: in-sample FV ...` line, and each report's run table has an `FV parameters` row.
+  Recordings made from 2026-09-25 on are out-of-sample for the committed config. If the config is
+  later refitted on data that covers a recording (e.g. on captured BRTI), replays of that recording
+  become in-sample: refit walk-forward on data strictly before t0 (`dh/research/fv_study`; a config
+  with `data_end_utc` <= t0) and pass it with `--fv-config FV.json`, or report the result as
+  in-sample FV. A config without `data_end_utc` is treated as in-sample. Affected: every replay
+  (E2 P&L hook, E3, E4, E6/E7, E9, E10) and E8/E3-live (fair-value probe). E1 does not use these
+  parameters (Gaussian research fair value with the benchmark vol realized over the 6 h BEFORE t0).
+* **Taker-flow segments.** By default the strategy's fill model uses the config's flow parameters
+  (not fitted on the recording). `run_experiment.py flow --t0 A --t1 B` calibrates
+  `dh.research.calibrate_flow` on the recorded public tape (our own taker prints removed; BRTI ticks
+  as the point-in-time reference, available at receive time) with a **time split**: a chronological
+  70/30 split by market expiration (`--flow-split`) or walk-forward by day (`--walk-forward-days N`),
+  both market-disjoint and purged (test markets' data before the split are dropped). It writes
+  `flow_metrics.csv` / `flow_calibration.md` with **in-sample and out-of-sample** rows (predicted /
+  realized taker contracts, WAPE over segments, Poisson deviance of order counts vs a pooled
+  per-side null), `flow_segments_train.json` (the graded training fit) and `flow_segments.json`
+  (fit on the whole window; `meta.fit_end_ms` = last expiration). Use the latter only for replays
+  that start later: `e4 --t0 B --t1 C --flow-segments <out>/flow_segments.json`. Replays check
+  `fit_end_ms` against t0 (`flow_in_sample` + `WARNING: in-sample flow ...`). The same split runs
+  on downloaded history: `python -m dh.research.calibrate_flow --trades T --markets M --btc B --out D
+  [--split 0.7 | --walk-forward-days 1]`.
+* **BTC reference joins (E0, calibrate_flow).** Bitstamp/Kraken OHLC exports stamp a bar at its
+  OPEN and its price is the bar CLOSE; `dh.research.kalshi_data.btc_price_asof` uses the last bar
+  whose close time (`close_ts_ms`, else `ts_ms + --btc-bar-ms`, default 60 000) is <= the trade
+  time, so a trade 1 s after a bar opens sees the previous bar (`tests/research/test_leakage_guards.py`).
+  Point-in-time prices (index ticks) use `--btc-bar-ms 0`.
+* **Walk-forward models.** E2: time folds, never shuffled, embargo max(h) + 5 s; the hook's beta is
+  fitted on the first part and replayed on the rest. E3: folds of consecutive settlement events;
+  each fold is predicted by models trained on earlier events' fills whose 10 s label ended before
+  the fold's first fill; the cancel rule is fitted on replays of `[t0, split)` and scored on
+  `[split, t1)`.
+* **Settlement prints.** Only `dh.settlement` maps benchmark ticks to window prints
+  (`SettlementTracker`: a 1 Hz tick with source time u is the print for second ceil(u), the later
+  of two ticks in one second is kept; window (close - 60 s, close]). The replay, E2's window-average
+  table and the synthetic recording (whole-second source stamps) do not re-derive it.
+
 ## 3. Runtime and memory
 
 Measured on the synthetic demo (4 cores, one replay per core): one replay of one recorded hour
@@ -123,9 +168,10 @@ is the E0 convention); every command also takes `--root/--t0/--t1/--out/--jobs/-
 | E10 | `exp10_capacity` | >= 7 days | `run_experiment.py e10 [--multipliers 1,2,5,10,20,50] [--no-scale-limits]` | 12 | `e10_capacity_by_size.csv` (net c/ct CI, fills/day, contracts/day, flow share, inventory sd), `_capacity.csv` (largest clip multiple above 1.0 / 0.75 / 0.5 / 0.05 c and breakeven, point and CI-lower-bound) | measurement: report capacity (no market impact modeled: upper bound) |
 
 E0 is `dh.research.exp0_maker_pnl` (public trades vs settlement: `scripts/download_kalshi_history.py`
-tables, no recording needed). E1 runs the existing lead-lag estimator of
-`dh.research.exp1_staleness` on the own-footprint-filtered `ReplayStream` with the universe's specs
-and the benchmark's realized vol. E5 is `dh.research.hedge_study` (real BTC paths); its fill-based
+tables, no recording needed; the BTC reference is joined causally, `--btc-bar-ms`, section 2a).
+E1 runs the existing lead-lag estimator of `dh.research.exp1_staleness` on the
+own-footprint-filtered `ReplayStream` with the universe's specs and the benchmark's vol realized
+over the 6 h before t0. E5 is `dh.research.hedge_study` (real BTC paths); its fill-based
 rerun uses the E4/E10 replay machinery with `hedge.enabled` in the config once hedge-venue data are
 recorded.
 
@@ -136,7 +182,9 @@ Per-experiment method notes:
   realized 60-print average. The P&L hook fits `beta` (share of the venue-vs-BRTI gap closed
   within 0.5 s) on the first part and replays `NowcastMarketMaker` (nowcast =
   brti_last + beta x (median venue mid - brti_last)) against the baseline on the rest.
-* **E3.** Label: net markout vs fill price at 10 s < 0 (fair value = the strategy's logged F).
+* **E3.** Label: toxic = the fair value moved against the fill within 10 s (the strategy's logged F
+  for replayed fills; the probe's fair value for live fills); the P&L target is the net 10 s markout
+  vs the fill price after fees.
   Features are computed by one function at fill time and at decision time (queue at placement,
   quote age, adverse venue move 0.1–5 s sign-adjusted for the market's delta, touch imbalance,
   venue imbalance, taker volume 10/60 s, tau, \|z\|, price, spread, sigma, fair-value edge). The
@@ -190,7 +238,11 @@ with informed flow on the same price path. E1 on the recording path recovers the
   its print is corrected when the print arrives); the counterfactual assumes the takers who hit
   our orders would still have traded the same total (their other prints are kept).
 * **Fair-value markouts** use the strategy's logged fair value (logged every <= 1 s or on a
-  0.2c change): markouts at 0.1–0.5 s partly reflect logging granularity.
+  0.2c change): markouts at 0.1–0.5 s partly reflect logging granularity. They are only as
+  out-of-sample as the FV parameters (section 2a).
+* **Flow calibration from recordings** counts recorder downtime inside the window as exposure
+  without trades (rates biased low); fit across outages only after checking the session records.
+  |z| segments use a fixed 40 % vol (calibrate_flow convention), not the strategy's live sigma.
 * **E2 perp basis** needs recorded perps; the synthetic demo has none. The BRTI replica is costly
   on deep books (`--no-replica`).
 * **Chunked windows** (separate runs per day) reset strategy state (positions, limits) at chunk

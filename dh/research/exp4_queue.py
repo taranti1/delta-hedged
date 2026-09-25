@@ -33,7 +33,7 @@ import pandas as pd
 import yaml
 
 from dh.research.exp_common import Report, flag_only_A, fmt_ns
-from dh.research.replay_env import Universe, build_universe
+from dh.research.replay_env import Universe, build_universe, inputs_meta
 from dh.research.replay_grid import Variant, apply_overrides, run_variants, run_warnings, settled, variant_table
 from dh.strategy.config import StrategyConfig
 
@@ -90,7 +90,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
     tab = flag_only_A(variant_table(runs, ref=REF), ["variant"])
     mix = position_mix(runs)
     rep = Report("e4_queue", "E4 — Queue priority vs continuous repricing", Path(out), synthetic=uni.synthetic,
-                 rule=RULE_E4, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}",
+                 rule=RULE_E4, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
                                      "variants": len(variants), "policies": ",".join(policies)})
     winners = []
     need = [p for p in policies if p in ("B", "C")]

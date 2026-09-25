@@ -241,7 +241,9 @@ def run(root, t0: int, t1: int, out, *, cfg=None, step_ms: int = 100, nowcast: s
     """E1 on a recording: the ReplayStream (own-footprint filtered) -> build_panel -> lead_lag.
 
     Uses the market universe's specs (enabled series of ``cfg``) and the realized vol of the
-    recorded benchmark unless ``vol_ann`` is given. Writes CSV + markdown to ``out``."""
+    recorded benchmark over the 6 h BEFORE t0 (causal: no test-window data) unless ``vol_ann`` is
+    given. E1's research fair value is Gaussian with that vol; it does not use the fitted FV
+    parameters (dh/models/data/fv_recommended.json). Writes CSV + markdown to ``out``."""
     from pathlib import Path
 
     from dh.research.exp_common import Report, fmt_ns
@@ -252,7 +254,8 @@ def run(root, t0: int, t1: int, out, *, cfg=None, step_ms: int = 100, nowcast: s
     Path(out).mkdir(parents=True, exist_ok=True)
     uni = universe or build_universe(root, t0, t1)
     specs = {s.ticker: s for s in uni.specs(cfg.quoting.enabled_series)}
-    vol = vol_ann if vol_ann is not None else realized_vol_ann(root, t0 - 6 * 3600 * NS_PER_S, t1)
+    vol = vol_ann if vol_ann is not None else realized_vol_ann(root, t0 - 6 * 3600 * NS_PER_S, t0)
+    vol_src = "given" if vol_ann is not None else "realized, 6 h before t0 (0.35 if < 2 h of 1 Hz data)"
     stream = ReplayStream(root, t0, t1, own_fills=uni.own_fills)
     panel = build_panel((e for e in stream if e.ts < t1), specs, step_ms=step_ms, vol_ann=vol, nowcast=nowcast,
                         micro=micro)
@@ -264,7 +267,8 @@ def run(root, t0: int, t1: int, out, *, cfg=None, step_ms: int = 100, nowcast: s
     hl = half_life(res) if res else math.inf
     rep = Report("e1_staleness", "E1 — Is Kalshi stale relative to external BTC?", Path(out), synthetic=uni.synthetic,
                  rule=RULE_E1, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "markets": len(specs),
-                                     "panel_rows": len(panel), "nowcast": nowcast, "vol_ann": vol,
+                                     "panel_rows": len(panel), "nowcast": nowcast, "vol_ann": vol, "vol_source": vol_src,
+                                     "FV parameters": "not used (research Gaussian fair value)",
                                      "gap-closure half-life (s)": hl, **{k: v for k, v in econ.items()}})
     big = econ.get("gap_ticks_after_move", math.nan)
     b1 = tab.loc[tab.horizon_s == 1.0, "b_gap_lo"]

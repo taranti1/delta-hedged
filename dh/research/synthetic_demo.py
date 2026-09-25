@@ -7,7 +7,8 @@
    injected effects: background-maker lag, informed (latency) takers, a delayed benchmark;
 2. rebuilds its market universe from the recorded REST/lifecycle records;
 3. runs every experiment (E1, E2, E3, E4, E6/E7, E8, E9, E10) through the same CLI code paths as for
-   real recordings, under fill policies B and C (A where the experiment reports it);
+   real recordings, under fill policies B and C (A where the experiment reports it), and the
+   taker-flow calibration with its in-sample / out-of-sample split;
 4. writes the small CSV/markdown outputs plus README.md (index, known-answer checks, runtimes).
 The recording itself (tens of MB) goes to a scratch data root and is not committed; it is
 regenerated bit-for-bit from the seed.
@@ -35,7 +36,8 @@ from dh.research import (
     exp67_segments,
 )
 from dh.research.exp_common import SYNTHETIC_BANNER, SYNTHETIC_NOTE, fmt_ns, git_commit
-from dh.research.replay_env import build_universe, run_replay
+from dh.research.flow_recording import fit_flow
+from dh.research.replay_env import build_universe, inputs_meta, run_replay
 from dh.research.synth_recording import SynthRecordingConfig, synth_strategy_config, write_synthetic_recording
 from dh.sim.synthetic import SynthConfig
 
@@ -82,6 +84,7 @@ def run_demo(out_dir: str | Path = "docs/research/synthetic_demo", data_root: st
         return df
 
     stage("replay", base_replays)
+    stage("flow", lambda: fit_flow(root, t0, t1, out / "flow", universe=uni, train_frac=0.7))
     stage("e1", lambda: exp1_staleness.run(root, t0, t1, out / "e1", cfg=cfg, universe=uni))
     stage("e2", lambda: exp2_nowcast.run(root, t0, t1, out / "e2", cfg=cfg, universe=uni, n_jobs=n_jobs))
     stage("e3", lambda: exp3_toxicity.run(root, t0, t1, out / "e3", cfg=cfg, universe=uni, n_jobs=n_jobs))
@@ -118,6 +121,8 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
     e10c = r["e10"]["capacity"]
     bk = e10c[(e10c.level_c == 0.0) & (e10c.basis == "point")] if len(e10c) else e10c
     rep = r["replay"]
+    fm = r["flow"].metrics.set_index("sample")
+    imeta, _ = inputs_meta(uni, info.t0)
     lines = [
         f"# Synthetic demo — {SYNTHETIC_BANNER}", "",
         SYNTHETIC_NOTE, "",
@@ -137,7 +142,9 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         f"* universe rebuilt from the recording: {len(uni.specs())} specs, {len(uni.rejected())} rejected, fee table "
         + "; ".join(f"{x.series} {x.fee_type} x{x.fee_multiplier:g}" for x in uni.fee_table().itertuples()),
         f"* strategy config: `dh.research.synth_recording.synth_strategy_config` (quote cycle "
-        f"{cfg.timers.quote_period_ms} ms, clip {cfg.quoting.clip_contracts:g}, research-only)", "",
+        f"{cfg.timers.quote_period_ms} ms, clip {cfg.quoting.clip_contracts:g}, research-only)",
+        f"* fitted inputs (look-ahead guards, runbook section 2a): FV parameters: {imeta['FV parameters']}; "
+        f"taker flow in the replays: {imeta['taker flow']}", "",
         "## Known-answer checks (asserted in tests/research/)", "",
         f"* **E2** benchmark published {info.config['injected']['brti_delay_ms']} ms after the venues move -> the "
         "walk-forward nowcast must beat the last print: ridge RMSE gain "
@@ -152,6 +159,10 @@ def _write_readme(out: Path, info, uni, results: dict[str, Any], timings: dict[s
         "| experiment | output | headline (SYNTHETIC) | runtime |", "|---|---|---|---|",
         f"| replay | `replay_summary.csv` | fills A/B/C = {', '.join(str(x) for x in rep['fills'])}; net c/ct B "
         f"{_fmt(rep.loc[rep.policy == 'B', 'net_c_per_contract'].iloc[0])} | {timings['replay']:.0f} s |",
+        f"| flow calibration | `flow/flow_calibration.md` | predicted/realized taker contracts in sample "
+        f"{_fmt(fm.loc['in_sample', 'ratio_ct'])} (WAPE {_fmt(fm.loc['in_sample', 'wape_ct'])}), out of sample "
+        f"{_fmt(fm.loc['out_of_sample', 'ratio_ct'])} (WAPE {_fmt(fm.loc['out_of_sample', 'wape_ct'])}) | "
+        f"{timings['flow']:.0f} s |",
         f"| E1 staleness | `e1/e1_staleness.md` | gap-closure half-life {_fmt(r['e1']['half_life_s'])} s "
         f"(injected maker lag {info.config['injected']['mm_lag_s']} s) | {timings['e1']:.0f} s |",
         f"| E2 nowcast | `e2/e2_nowcast.md` | ridge RMSE gain {', '.join(f'{h}: {_fmt(v, 1)}%' for h, v in e2s.items())} | {timings['e2']:.0f} s |",

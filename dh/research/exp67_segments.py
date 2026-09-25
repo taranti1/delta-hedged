@@ -34,7 +34,7 @@ from dh.research.exp_common import (
     z_bucket,
 )
 from dh.research.replay_grid import Variant, run_variants, run_warnings, settled
-from dh.research.replay_env import Universe, build_universe
+from dh.research.replay_env import Universe, build_universe, inputs_meta
 from dh.strategy.config import StrategyConfig
 
 RULE_E67 = ("quote only buckets whose realized net c/contract CI lower bound > 0 (under B and C); disable buckets "
@@ -104,6 +104,7 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
     cfg = cfg or StrategyConfig()
     synthetic = False
     warns: list[str] = []
+    imeta: dict[str, Any] = {"FV parameters": "as recorded in the given ledgers"}
     if ledgers:
         dfs = load_ledgers(ledgers)
         days = max((t1 - t0) / 86_400e9, 1e-9)
@@ -114,12 +115,13 @@ def run(root: str | Path | None, t0: int, t1: int, out: str | Path, *, cfg: Stra
                             n_jobs=n_jobs, progress=progress)
         dfs = {r.policy: r.df for r in runs}
         warns = run_warnings(runs)
+        imeta = inputs_meta(uni, t0)[0]
         days = runs[0].summary["days"] if runs else 1.0
     tabs = segment_tables(dfs, days)
     rep = Report("e67_segments", "E6/E7 — Net edge by time to expiry, |z| and YES price", Path(out),
                  synthetic=synthetic, rule=RULE_E67,
                  meta={"source": ", ".join(ledgers) if ledgers else str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}",
-                       "policies": ",".join(dfs), "days": days})
+                       "policies": ",".join(dfs), "days": days, **imeta})
     tau = tabs.get("tau", pd.DataFrame())
     if len(tau):
         q = sorted(set(tau.loc[tau.recommendation == "quote", "tau_bucket"].astype(str)))

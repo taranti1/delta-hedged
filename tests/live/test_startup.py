@@ -199,8 +199,23 @@ def test_paper_sim_and_conservative_fees():
     assert sim.policy == "conservative" and set(sim.markets) == {s.ticker for s in specs}
     assert sim.orders == {} and sim.id_prefix == "paper"
     maker = fe.schedule_for_spec("quadratic_with_maker_fees", 1.0).trade_fee_micros(5000, 100, False)
-    assert fees(5000, 100, False) == maker > 0  # the most expensive schedule
+    assert fees(5000, 100, False) == maker > 0  # per-fill fallback: the most expensive schedule
     assert PaperFees(fe)(5000, 100, False) == 0
+    # order-aware fees: each market's own schedule, with Kalshi's per-order balance rounding
+    from dh.core.actions import PlaceOrder
+
+    sim.submit(PlaceOrder("a", specs[0].ticker, "bid", 5000, 100), 0)
+    sim.submit(PlaceOrder("b", specs[1].ticker, "bid", 5000, 100), 0)
+    sim.pop_due(10**18)
+    oid_a, oid_b = sim._coid["a"].order_id, sim._coid["b"].order_id  # noqa: SLF001
+    assert fees.order_fee(oid_a, "bid", 5000, 100, False) == 0  # 'quadratic': no maker fee
+    net_b = fees.order_fee(oid_b, "bid", 5000, 100, False)
+    assert net_b == fe.schedule_for_spec("quadratic_with_maker_fees", 1.0).single_fill_fees(5000, 100, False).net_micros
+    assert net_b >= maker  # rounding to the balance precision on top of the trade fee
+    fees.set_fee(specs[0].ticker, "quadratic_with_maker_fees", 1.0)  # an event override
+    sim.submit(PlaceOrder("c", specs[0].ticker, "bid", 5000, 100), 0)
+    sim.pop_due(10**18)
+    assert fees.order_fee(sim._coid["c"].order_id, "bid", 5000, 100, False) == net_b  # noqa: SLF001
 
 
 def test_live_example_config_loads_and_is_paper():

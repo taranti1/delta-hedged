@@ -51,6 +51,17 @@ ticks in [t0 - fv_warm_s, t0) (WS 1 Hz/5 Hz and CF-history REST records), or fro
 price file, or (flagged, synthetic) a seeded GBM path: ``warm='recorded'|'recorded+gbm'|'gbm'|
 'csv:<path>'|'none'``. Missing settlements are filled from recorded REST market results.
 
+Fitted inputs and look-ahead: the fair-value parameters (default dh/models/data/fv_recommended.json,
+fitted on history through its ``data_end_utc``) and optional taker-flow segments
+(dh.research.calibrate_flow / flow_recording JSON, ``meta.fit_end_ms``) are checked against the
+replay's t0. A replay that starts before the end of their fitting data is IN-SAMPLE: the summary
+says so (``fv_params``, ``fv_params_in_sample``, ``flow_segments``, ``flow_in_sample``) and a warning
+is raised; bind walk-forward inputs with ``bind_replay_inputs(universe, fv_config=..,
+flow_segments=..)`` (CLI --fv-config / --flow-segments) or pass them to run_replay. Recordings made
+after the FV fit (every recording from 2026-09-25 on, for the committed config) are
+out-of-sample. Settlement prints are mapped only by dh.settlement (SettlementTracker: 1 Hz tick
+with source time u = print for second ceil(u), later of two kept); nothing here re-derives it.
+
 Determinism: identical inputs and seeds -> identical results (no clock, seeded latency).
 """
 
@@ -191,6 +202,12 @@ class Universe:
     meta: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     cache: dict[Any, Any] = field(default_factory=dict, repr=False)  # e.g. BRTI tick scans (see brti_ticks)
+    # fitted replay inputs bound to this window (bind_replay_inputs; CLI --fv-config / --flow-segments)
+    fv_config: dict[str, Any] | None = None  # FairValueModel config; None = dh/models/data/fv_recommended.json
+    fv_config_source: str = ""
+    flow_segments: dict[tuple[str, str, str], Any] | None = None  # taker-flow segments; None = cfg.fill defaults
+    flow_meta: dict[str, Any] = field(default_factory=dict)
+    flow_source: str = ""
 
     # ------------------------------------------------------------------ fee resolution
     def series_at(self, series_ticker: str, t: int) -> dict[str, Any] | None:
@@ -895,6 +912,95 @@ def open_recording(root: str | Path, t0: int, t1: int, *, series: Iterable[str] 
     return Recording(u, u.specs(series), u.fee_schedules(fee_engine), dict(stream_kw))
 
 
+# ============================================================================ fitted inputs (look-ahead checks)
+def resolve_fv_config(fv_config: str | Path | Mapping[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+    """(config dict, source label) of the fair-value parameters (None = committed recommended config)."""
+    if fv_config is None:
+        return load_recommended_config(), "fv_recommended.json"
+    if isinstance(fv_config, Mapping):
+        return dict(fv_config), str(fv_config.get("source") or "given config")
+    return load_recommended_config(fv_config), Path(fv_config).name
+
+
+def _iso_ns(t: int | None) -> str:
+    from dh.research.exp_common import fmt_ns
+
+    return fmt_ns(t) if t is not None else "?"
+
+
+def fv_params_status(cfg: Mapping[str, Any], source: str, t0: int, synthetic: bool) -> tuple[dict[str, Any], str | None]:
+    """Is the replay window out of the FV parameters' fitting sample? -> (summary fields, warning).
+    In sample = the fit used data at or after t0 (``data_end_utc`` > t0): look-ahead parameters."""
+    end = cfg.get("data_end_utc")
+    end_ns = int(end) * NS_PER_S if end is not None else None
+    if synthetic:
+        status, ins = "n/a (synthetic recording)", None
+    elif end_ns is None:
+        status, ins = "UNKNOWN fit window (no data_end_utc): treat as in-sample", True
+    elif t0 < end_ns:
+        status, ins = f"IN-SAMPLE (fitted on data through {_iso_ns(end_ns)}, after t0)", True
+    else:
+        status, ins = f"out-of-sample (fitted on data through {_iso_ns(end_ns)}, before t0)", False
+    info = {"fv_config": source, "fv_params_data_end": _iso_ns(end_ns) if end_ns else None,
+            "fv_params_in_sample": ins, "fv_params": f"{source}: {status}"}
+    warn = None
+    if ins:
+        warn = (f"in-sample FV: the fair-value parameters ({source}) were fitted on data through {_iso_ns(end_ns)}, "
+                f"not before this replay's t0 {_iso_ns(t0)}; fair values, markouts and P&L use look-ahead parameters. "
+                "Refit walk-forward on data strictly before t0 (dh/research/fv_study) and pass --fv-config, or "
+                "report the result as in-sample FV")
+    return info, warn
+
+
+def flow_status(seg: Mapping[Any, Any] | None, meta: Mapping[str, Any], source: str, t0: int,
+                synthetic: bool = False) -> tuple[dict[str, Any], str | None]:
+    """Same check for taker-flow segments (``meta.fit_end_ms``: every training datum precedes it)."""
+    if not seg:
+        return {"flow_segments": "config defaults (cfg.fill)", "flow_in_sample": None}, None
+    end_ms = meta.get("fit_end_ms")
+    end_ns = int(end_ms) * 1_000_000 if end_ms is not None else None
+    ins = True if end_ns is None else t0 < end_ns
+    info = {"flow_segments": f"{source or 'given'} ({len(seg)} segments, fit through {_iso_ns(end_ns)})",
+            "flow_in_sample": ins}
+    warn = None
+    if ins:
+        warn = (f"in-sample flow: the taker-flow segments ({source or 'given'}) were fitted on data through "
+                f"{_iso_ns(end_ns)}, not before this replay's t0 {_iso_ns(t0)}; fit them strictly before t0 "
+                "(run_experiment.py flow --t1 <replay t0>)")
+    return info, warn
+
+
+def fv_label_for(uni: Universe, t0: int) -> tuple[dict[str, Any], str | None]:
+    """fv_params_status of the FV parameters bound to ``uni`` (default: the committed config)."""
+    cfg, src = (uni.fv_config, uni.fv_config_source) if uni.fv_config else resolve_fv_config(None)
+    return fv_params_status(cfg, src, t0, uni.synthetic)
+
+
+def inputs_meta(uni: Universe, t0: int) -> tuple[dict[str, Any], list[str]]:
+    """Report metadata + warnings for the fitted inputs of a window's replays (FV parameters and
+    taker-flow segments; in-sample = fitted on data not strictly before t0)."""
+    fv_info, fv_warn = fv_label_for(uni, t0)
+    fl_info, fl_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0, uni.synthetic)
+    return ({"FV parameters": fv_info["fv_params"], "taker flow": fl_info["flow_segments"]},
+            [w for w in (fv_warn, fl_warn) if w])
+
+
+def bind_replay_inputs(uni: Universe, *, fv_config: str | Path | Mapping[str, Any] | None = None,
+                       flow_segments: str | Path | Mapping[Any, Any] | None = None) -> Universe:
+    """Attach fitted replay inputs to a universe (every replay/probe of that universe uses them)."""
+    if fv_config is not None:
+        uni.fv_config, uni.fv_config_source = resolve_fv_config(fv_config)
+    if flow_segments is not None:
+        if isinstance(flow_segments, Mapping):
+            uni.flow_segments, uni.flow_meta, uni.flow_source = dict(flow_segments), {}, "given"
+        else:
+            from dh.research.calibrate_flow import load_segments
+
+            seg, meta = load_segments(flow_segments)
+            uni.flow_segments, uni.flow_meta, uni.flow_source = seg, meta, Path(flow_segments).name
+    return uni
+
+
 # ============================================================================ fair-value warm-up
 def brti_ticks(root: str | Path, t0: int, t1: int, *, include_rest: bool = True,
                cache: dict[Any, Any] | None = None) -> list[IndexTick]:
@@ -998,7 +1104,7 @@ def parse_warm(warm: str | None) -> list[str]:
 
 def warm_fair_value(fv: FairValueModel, root: str | Path, t0: int, warm: str = "recorded", *,
                     fv_warm_s: float = 1.5 * DAY_S, gbm_vol_ann: float = 0.35, seed: int = 0,
-                    cache: dict[Any, Any] | None = None) -> WarmInfo:
+                    cache: dict[Any, Any] | None = None, fv_config: Mapping[str, Any] | None = None) -> WarmInfo:
     """Warm the vol EWMAs with prices received strictly before t0.
 
     Tokens (comma/plus separated): 'recorded' = BRTI ticks in [t0 - fv_warm_s, t0) (WS 1 Hz/5 Hz
@@ -1033,7 +1139,7 @@ def warm_fair_value(fv: FairValueModel, root: str | Path, t0: int, warm: str = "
             nxt = brti_ticks(root, t0, t0 + _ns(900))
             S_end = nxt[0].value if nxt else None
         if S_end is not None:
-            fv.vol = FairValueModel.from_config(load_recommended_config()).vol  # fresh EWMAs
+            fv.vol = FairValueModel.from_config(dict(fv_config) if fv_config else load_recommended_config()).vol  # fresh
             warm_fv_model(fv, end_ns, S_end, gbm_vol_ann, seed=seed)
             for ts, v in prices:
                 fv.update(ts, v)
@@ -1327,7 +1433,9 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
                state_warm_s: float = 900.0, tail_s: float = 300.0, own_filter: bool = True,
                fv_warm_s: float = 1.5 * DAY_S, gbm_vol_ann: float = 0.35, add_horizon_s: float | None = None,
                keep_objects: bool = False, fee_engine: FeeEngine | None = None, n_boot: int = 500,
-               postprocess: Callable[[ReplayResult], None] | None = None) -> ReplayResult:
+               postprocess: Callable[[ReplayResult], None] | None = None,
+               fv_config: str | Path | Mapping[str, Any] | None = None,
+               flow_segments: str | Path | Mapping[Any, Any] | None = None) -> ReplayResult:
     """Replay MarketMaker + KalshiExchangeSim (+ Ledger) over the recording in [t0, t1).
 
     policy: fill policy A/B/C (optimistic/realistic/conservative); latency: LatencyModel
@@ -1338,6 +1446,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     their ``result()`` values are returned in ``extras['collectors']``.
     postprocess(result) runs while result.mm/sim/ledger are still attached (use it to derive
     columns from the ledger inside a worker process); they are detached unless keep_objects.
+    fv_config / flow_segments override the inputs bound to the universe (bind_replay_inputs);
+    both are checked for look-ahead against t0 (summary fv_params / flow_segments + warnings).
     Returns ReplayResult(df, summary, ...) (see class doc).
     """
     cfg = cfg or StrategyConfig()
@@ -1350,9 +1460,16 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     if spec_filter is not None:
         specs = list(spec_filter(specs, uni))
     fee_engine = fee_engine or FeeEngine.from_config()
-    fv = FairValueModel.from_config(load_recommended_config())
+    if fv_config is not None or flow_segments is not None:
+        uni = bind_replay_inputs(dataclasses.replace(uni), fv_config=fv_config, flow_segments=flow_segments)
+    fv_cfg = uni.fv_config or resolve_fv_config(None)[0]
+    fv_info, fv_warn = fv_label_for(uni, t0)
+    flow_info, flow_warn = flow_status(uni.flow_segments, uni.flow_meta, uni.flow_source, t0, uni.synthetic)
+    fv = FairValueModel.from_config(fv_cfg)
     winfo = warm_fair_value(fv, root, t0, warm, fv_warm_s=fv_warm_s, gbm_vol_ann=gbm_vol_ann, seed=seed,
-                            cache=uni.cache)
+                            cache=uni.cache, fv_config=fv_cfg)
+    if uni.flow_segments:
+        factory_kwargs = {"flow_segments": dict(uni.flow_segments), **(factory_kwargs or {})}
     stream = ReplayStream(root, t0, t1, streams=streams, state_warm_s=state_warm_s, tail_s=tail_s,
                           own_fills=uni.own_fills, own_filter=own_filter)
     horizon = add_horizon_s if add_horizon_s is not None else cfg.quoting.max_tau_s + 300.0
@@ -1464,6 +1581,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         "public_contracts_quoted": sum(q for t, q in cap.public_qty.items() if t in {s.ticker for s in specs}) / QTY_SCALE,
         "wall_s": wall, "drive_counts": dict(counts), "universe_notes": list(uni.notes),
         "quote_hours": quote_hours(sim, t1 + _ns(tail_s)), "orders": len(sim.orders),
+        **fv_info, **flow_info,
     })
     summary["net_usd_per_quote_hour"] = (float(done["net"].sum()) / summary["quote_hours"]
                                          if len(df) and summary["quote_hours"] > 0 else 0.0)
@@ -1475,6 +1593,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         warns.append("fair-value warm-up used a SYNTHETIC GBM history (vol %g)" % gbm_vol_ann)
     if not specs:
         warns.append("no tradable market specs in the window (check series/enabled_series/fees)")
+    warns += [w for w in (fv_warn, flow_warn) if w]
     summary["warnings"] = warns
     extras: dict[str, Any] = {"collectors": [c.result() if hasattr(c, "result") else c for c in extra]}
     res = ReplayResult(df, summary, uni, extras, mm, sim, ledger)
@@ -1581,8 +1700,9 @@ def probe_for_window(root: str | Path, t0: int, t1: int, cfg: StrategyConfig, un
     """(probe, feed, warm info) wired like run_replay: iterate ``feed.events(on_add=probe.add)``
     and call ``probe.on_event`` on every event."""
     specs = list(specs if specs is not None else universe.specs(cfg.quoting.enabled_series))
-    fv = FairValueModel.from_config(load_recommended_config())
-    winfo = warm_fair_value(fv, root, t0, warm, seed=seed, cache=universe.cache)
+    fv_cfg = universe.fv_config or load_recommended_config()
+    fv = FairValueModel.from_config(fv_cfg)
+    winfo = warm_fair_value(fv, root, t0, warm, seed=seed, cache=universe.cache, fv_config=fv_cfg)
     stream = ReplayStream(root, t0, t1, state_warm_s=state_warm_s, own_fills=universe.own_fills, own_filter=own_filter)
     feed = ReplayFeed(stream, universe, specs, add_horizon_s=add_horizon_s if add_horizon_s is not None
                       else cfg.quoting.max_tau_s + 300.0)
@@ -1599,5 +1719,6 @@ __all__ = [
     "Universe", "MarketRecord", "build_universe", "prescan_own_fills", "OwnFootprintFilter", "ReplayStream",
     "ReplayFeed", "brti_ticks", "warm_fair_value", "TickerFeeExchangeSim", "drive", "run_replay", "ReplayResult",
     "NearestStrikes", "FvProbe", "probe_for_window", "prime_probe", "FillCapture", "PortfolioSampler", "restrict_universe",
-    "default_streams", "load_price_file", "Recording", "open_recording",
+    "default_streams", "load_price_file", "Recording", "open_recording", "bind_replay_inputs", "resolve_fv_config",
+    "fv_params_status", "fv_label_for", "flow_status", "inputs_meta",
 ]

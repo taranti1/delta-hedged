@@ -28,9 +28,9 @@ Data path
 
 Safety
   * Order gate: new orders are refused (as OrderReject events, reason 'gate:<why>') while the
-    kill file exists, after a strategy Halt, on a fee mismatch, on consumer lag > max_lag_s,
-    during shutdown, and per market after a spec-changing lifecycle / fee update. Cancels
-    always pass.
+    kill file exists, after a strategy Halt, on a fee mismatch, on consumer lag > max_lag_s
+    or a loop stall, during shutdown, and per market after a close-time / tick-grid change
+    or a spec change found by re-discovery. Cancels always pass.
   * Kill file: checked every ``kill_check_interval_s`` on the consumer loop -> cancel all
     (REST) and stop.
   * Heartbeat file every ``heartbeat_interval_s`` while the consumer is alive (watchdog).
@@ -235,6 +235,7 @@ class LiveRunner:
         self._positions_now = asyncio.Event()
         self._discover_now = asyncio.Event()
         self._fee_acc: dict[str, Any] = {}  # order id -> OrderFeeAccumulator
+        self._fee_eff: dict[str, tuple[str, float]] = {}  # ticker -> fee override in force
         self._seen_fills: dict[str, None] = {}  # trade/fill ids delivered (bounded, FIFO)
         self._halt_until: dict[str, int] = {}  # gate reason -> reopen ts (0 = manual)
         self._last_brti_ns = 0
@@ -556,14 +557,17 @@ class LiveRunner:
         per-fill comparison with a one-cent tolerance could not detect a wrong maker-fee
         schedule at M1 sizes (a 2-contract maker fee is below one cent)."""
         spec = self.universe.get(f.ticker)
-        if spec is None or self.fee_engine is None or not spec.fee_type:
+        if spec is None or self.fee_engine is None:
+            return
+        ftype, mult = self._fee_eff.get(f.ticker, (spec.fee_type, spec.fee_multiplier))
+        if not ftype:
             return
         from dh.kalshi.fees import reconcile_fill_fee
 
         try:
             acc = self._fee_acc.get(f.order_id)
             if acc is None:
-                sched = self.fee_engine.schedule_for_spec(spec.fee_type, spec.fee_multiplier)
+                sched = self.fee_engine.schedule_for_spec(ftype, mult)
                 if not getattr(sched, "supported", True):
                     return
                 acc = self._fee_acc[f.order_id] = sched.order_accumulator(f.book_side)
@@ -600,17 +604,27 @@ class LiveRunner:
         self._cancel_scoped(new, f"blocked:{reason}", ts)
 
     def _on_fee_update(self, ev: KalshiFeeUpdate) -> None:
+        """Event-level fee override. The MarketMaker re-resolves its own schedules on this
+        event; the runner only tracks the effective (type, multiplier) the same way
+        (override > series base; None clears) so its exact per-fill fee check stays right.
+        An unparseable multiplier blocks the event's markets (never guess a fee)."""
         tickers = self._event_tickers(ev.event_ticker)
         if not tickers:
             return
-        spec = self.universe[tickers[0]]
-        new_type = ev.fee_type_override if ev.fee_type_override else spec.fee_type
-        try:
-            new_mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else spec.fee_multiplier
-        except ValueError:
-            new_mult = float("nan")
-        if new_type != spec.fee_type or new_mult != spec.fee_multiplier:
-            self._block(tickers, f"fee_update:{new_type}x{new_mult}", ev.ts)
+        for t in tickers:
+            spec = self.universe[t]
+            ftype = ev.fee_type_override if ev.fee_type_override is not None else spec.fee_type
+            try:
+                mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else spec.fee_multiplier
+            except ValueError:
+                self._block([t], f"fee_update_unparseable:{ev.fee_multiplier_override}", ev.ts)
+                continue
+            self._fee_eff[t] = (ftype, mult)
+            self._fee_acc.clear()  # accumulators were built with the old schedule
+            if self.paper_fees is not None and ftype:
+                self.paper_fees.set_fee(t, ftype, mult)
+        self.jlog("fee_update", ev.ts, event=ev.event_ticker, fee_type=ev.fee_type_override,
+                  multiplier=ev.fee_multiplier_override, tickers=tickers)
 
     def _on_lifecycle(self, ev: KalshiMarketLifecycle) -> None:
         if ev.event_type == "created" and (not self.series or ev.ticker.split("-", 1)[0] in self.series):

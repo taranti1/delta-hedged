@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 from dh.research.exp_common import Report, fmt_ns
-from dh.research.replay_env import PortfolioSampler, Universe, build_universe
+from dh.research.replay_env import PortfolioSampler, Universe, build_universe, inputs_meta
 from dh.research.replay_grid import Variant, interp_capacity, run_variants, run_warnings, scaled_cfg, variant_table
 from dh.strategy.config import StrategyConfig
 
@@ -71,7 +71,7 @@ def run(root: str | Path, t0: int, t1: int, out: str | Path, *, cfg: StrategyCon
                 cap_rows.append(row)
     cap = pd.DataFrame(cap_rows)
     rep = Report("e10_capacity", "E10 — Capacity: net edge vs quote size", Path(out), synthetic=uni.synthetic,
-                 rule=RULE_E10, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}",
+                 rule=RULE_E10, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", **inputs_meta(uni, t0)[0],
                                       "base_clip_contracts": cfg.quoting.clip_contracts,
                                       "limits_scaled_with_size": scale_limits})
     bk = cap[(cap.level_c == 0.0) & (cap.basis == "point")]

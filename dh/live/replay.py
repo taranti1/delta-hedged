@@ -121,6 +121,20 @@ class UniverseReplay:
         while self.changes and self.changes[0][0] <= ev.ts:
             t, kind, payload = self.changes.pop(0)
             self._apply(kind, payload, t)
+        if self.paper_fees is not None:
+            from dh.core.events import KalshiFeeUpdate
+
+            if isinstance(ev, KalshiFeeUpdate):  # as LiveRunner._on_fee_update does in paper mode
+                for t, spec in list(getattr(self.strategy, "specs", {}).items()):
+                    if spec.event_ticker != ev.event_ticker:
+                        continue
+                    ftype = ev.fee_type_override if ev.fee_type_override is not None else spec.fee_type
+                    try:
+                        mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else spec.fee_multiplier
+                    except ValueError:
+                        continue
+                    if ftype:
+                        self.paper_fees.set_fee(t, ftype, mult)
         if self.live:
             from dataclasses import replace
 

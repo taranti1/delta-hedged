@@ -6,6 +6,8 @@
 names
   universe   rebuild and print the market universe of the window (specs, fees, rejects, own fills)
   replay     one replay of the strategy (MarketMaker + KalshiExchangeSim + Ledger): summary + ledger
+  flow       calibrate taker flow on the window with a time split (in-sample AND out-of-sample
+             table) -> flow_segments.json for replays that start after the window  dh.research.flow_recording
   e1         Kalshi staleness vs external BTC (lead-lag)                        dh.research.exp1_staleness
   e2         nowcast of the next BRTI print / settlement average (+ P&L hook)      dh.research.exp2_nowcast
   e3         fill toxicity: markouts, walk-forward models, cancel-rule replay     dh.research.exp3_toxicity
@@ -20,7 +22,11 @@ names
 
 Times: ISO-8601 UTC ('2026-10-01', '2026-10-01T13:00') or epoch s/ms/us/ns; 'auto' = the
 coverage of the kalshi.ws stream. Every P&L table is reported under fill policies B and C
-(--policies, A for reference only). See docs/research/EXPERIMENTS_RUNBOOK.md.
+(--policies, A for reference only). Fitted inputs are checked for look-ahead against t0:
+--fv-config (fair-value parameters; default dh/models/data/fv_recommended.json) and
+--flow-segments (taker flow; default the strategy config's) -- reports say "IN-SAMPLE" and warn
+when they were fitted on data that does not precede the window. See
+docs/research/EXPERIMENTS_RUNBOOK.md.
 """
 
 from __future__ import annotations
@@ -77,7 +83,7 @@ def latency_from(args):
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("name", choices=("universe", "replay", *EXPERIMENTS, "all", "synth", "demo"))
+    ap.add_argument("name", choices=("universe", "replay", "flow", *EXPERIMENTS, "all", "synth", "demo"))
     ap.add_argument("--root", default=str(REPO / "data"), help="recording root (holds raw/)")
     ap.add_argument("--t0", default="auto")
     ap.add_argument("--t1", default="auto")
@@ -108,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-strikes", type=int, default=0,
                     help="research speed knob: keep only the N strikes per event nearest the benchmark at the "
                          "event's first quotable time (0 = all; E9 then compares within those N)")
+    ap.add_argument("--fv-config", default=None,
+                    help="fair-value parameter JSON fitted strictly before t0 (walk-forward); default: the committed "
+                         "config (in-sample for windows before its data_end_utc: flagged in every report)")
+    ap.add_argument("--flow-segments", default=None,
+                    help="taker-flow segments JSON (from the 'flow' command on an EARLIER window) for the strategy's "
+                         "fill model; default: the strategy config's flow parameters")
+    ap.add_argument("--flow-split", type=float, default=0.7, help="flow: chronological train fraction")
+    ap.add_argument("--walk-forward-days", type=int, default=0, help="flow: walk-forward by day (> 0) instead")
     ap.add_argument("--log-level", default="WARNING")
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -144,17 +158,23 @@ def main(argv: list[str] | None = None) -> int:
 
         cfg = replace(cfg, timers=replace(cfg.timers, quote_period_ms=a.quote_period_ms))
     policies = parse_policies(a.policies)
-    from dh.research.replay_env import NearestStrikes, build_universe, restrict_universe
+    from dh.research.replay_env import NearestStrikes, bind_replay_inputs, build_universe, inputs_meta, restrict_universe
 
     uni = build_universe(root, t0, t1)
     if a.max_strikes > 0:
         uni = restrict_universe(uni, NearestStrikes(a.max_strikes, cfg.quoting.max_tau_s), cfg.quoting.enabled_series,
                                 reason=f"--max-strikes {a.max_strikes}")
+    bind_replay_inputs(uni, fv_config=a.fv_config, flow_segments=a.flow_segments)
     print(f"window {fmt_ns(t0)} .. {fmt_ns(t1)}  markets={len(uni.markets)} specs={len(uni.specs())} "
           f"rejected={len(uni.rejected())} own_fills={len(uni.own_fills)}"
           + ("  [SYNTHETIC DATA — pipeline validation only]" if uni.synthetic else ""))
     for n in uni.notes:
         print("note:", n)
+    imeta, iwarn = inputs_meta(uni, t0)
+    if a.name != "flow":
+        print("; ".join(f"{k}: {v}" for k, v in imeta.items()))
+        for w in iwarn:
+            print("WARNING:", w)
 
     def progress(msg: str) -> None:
         print("  ", msg, flush=True)
@@ -171,7 +191,14 @@ def main(argv: list[str] | None = None) -> int:
                 for k, v in list(sorted(rej.items()))[:10]:
                     print(f"  {k}: {v}")
             continue
-        if name == "replay":
+        if name == "flow":
+            from dh.research.flow_recording import fit_flow
+
+            res = fit_flow(root, t0, t1, o, universe=uni, train_frac=a.flow_split, walk_forward_days=a.walk_forward_days)
+            print(res.metrics.to_string(index=False))
+            print(f"flow_segments.json: fitted on data through {fmt_ns((res.all_end_ms or 0) * 1_000_000)} "
+                  "(use for replays that start later)")
+        elif name == "replay":
             from dh.research.replay_env import run_replay
 
             o.mkdir(parents=True, exist_ok=True)

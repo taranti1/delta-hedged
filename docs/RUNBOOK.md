@@ -147,7 +147,8 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
       the runner in paper mode + watchdog `--cancel-now`.
 - [ ] `config/m1.yaml` unchanged since paper (same digest in the logs).
 - [ ] The account/subaccount holds only the capital you accept to risk (M1 limits: daily loss
-      halt $25, worst case $20 per event / $50 total, 2-contract clips, 10 per market).
+      halt $25, worst case $20 per event / $50 total, clips and per-market limits as in
+      `config/m1.yaml`).
 
 ### 5.2 Configure and start
 1. `config/live.yaml`: `mode: live` (and `venue.subaccount` if used).
@@ -194,8 +195,10 @@ for the kill file and heartbeat.
   estimator (`dh_queue_error_contracts`, `queue_positions` log lines).
 * Every fill's `fee_cost` is checked exactly; a mismatch blocks new orders and cancels all.
 * New orders are blocked (cancels never) while the kill file exists, after a strategy Halt,
-  on a fee mismatch, while the consumer lags more than `loop.max_lag_s`, and per market after
-  a fee change or a close-time / tick-grid change of that market.
+  on a fee mismatch, while the consumer lags more than `loop.max_lag_s` (or the loop
+  stalled), and per market after a close-time / tick-grid change of that market or a spec
+  change found by re-discovery. Event fee overrides (`event_fee_update`) are re-priced by the
+  strategy itself; the runner's fee check follows them.
 
 ---------------------------------------------------------------------------------------------
 ## 6. Kill procedures (fastest first)
@@ -274,7 +277,8 @@ jq -c 'select(.k=="feed_status")' $L                 # gaps / disconnects
 | `halt` scope `all`, reason `daily_loss` | daily P&L <= -$25 | stop for the day; review fills/markouts |
 | `halt` scope `all`, reason `reconciliation:...` | position differs from the exchange for > 5 s | `tools reconcile`; compare `log.fill` with the Kalshi fill history; find the lost/extra fill |
 | `gate` `fee_mismatch` | a fill's fee differs from the model | `verify_fee_schedule.py`; fix `config/fees.yaml` / precision |
-| `block` `fee_update` / `close_date_updated` / `tick_grid_changed` / `spec_changed` | a traded market changed | nothing: that market is out for the session; new markets use new specs |
+| `block` `close_date_updated` / `tick_grid_changed` / `spec_changed` | a traded market changed | nothing: that market is out for the session; new markets use new specs |
+| `fee_update` (log) | an event fee override | nothing: the strategy re-prices (unsupported types become untradable) |
 | `log.risk` `abnormal_move`, `settlement_loss_pause` | timed pauses inside the strategy | nothing (they expire) |
 | `gate` `lag` | the event loop is overloaded | check CPU, `dh_queue_depth`; reduce feeds |
 
