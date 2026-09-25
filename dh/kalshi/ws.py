@@ -9,7 +9,11 @@ Behaviour
   * Handshake: signed headers for ``GET /trade-api/ws/v2`` (fresh timestamp per connect).
   * Subscribe: one ``subscribe`` command per Subscription with an incrementing ``id``
     (unique for the client's lifetime); orderbook subscriptions send ``use_yes_price``
-    explicitly (default false: NO bids on the NO price scale, the normalizer's convention).
+    explicitly (default TRUE: NO levels in yes-leg pricing, the only behaviour Kalshi will
+    support once the flag is removed; see asyncapi ``use_yes_price`` "Migration plan").
+    The flag in force is written into the raw stream (``use_yes_price`` field of the
+    synthetic 'connected' record) so replay knows each connection's NO-side price scale;
+    the normalizer also checks it against every two-sided snapshot (dh.kalshi.sequencer).
     VERIFIED LIVE (prod, 2026-09-25): the server keeps ONE subscription (sid) per channel
     per connection. The first subscribe for a channel is answered with
     ``{"type":"subscribed","id":N,"msg":{"channel":C,"sid":S}}`` per channel; a later
@@ -22,6 +26,8 @@ Behaviour
   * Raw capture: ``on_raw('kalshi.ws', recv_ns, raw_bytes)`` for EVERY inbound frame, before
     parsing, plus synthetic ``dh.feed_status`` records for connected / disconnected / stale /
     error (see dh.kalshi.sequencer) so replay reproduces outages.
+  * Fairness: the pump yields to the event loop once per frame (buffered frames are otherwise
+    drained without suspending on Python >= 3.12, starving every other task on the loop).
   * Events: every raw record goes through ``sequencer.normalize_ws_message`` (the same code
     replay uses): per-sid seq continuity, duplicate/out-of-order suppression, gap ->
     FeedStatus('gap') + ``update_subscription/get_snapshot`` for the affected markets, books
@@ -93,7 +99,7 @@ class Subscription:
     index_ids: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)  # e.g. {"send_initial_snapshot": True}
 
-    def params(self, use_yes_price: bool = False) -> dict[str, Any]:
+    def params(self, use_yes_price: bool = True) -> dict[str, Any]:
         """``params`` object of the subscribe command."""
         p: dict[str, Any] = {"channels": list(self.channels)}
         if self.market_tickers:
@@ -177,7 +183,7 @@ class KalshiWS:
         backoff_max_s: float = 30.0,
         healthy_reset_s: float = 30.0,
         max_reconnects: int | None = None,
-        use_yes_price: bool = False,
+        use_yes_price: bool = True,
         ws_path: str = WS_PATH,
         stream: str = STREAM,
         on_message: MessageCallback | None = None,
@@ -200,6 +206,7 @@ class KalshiWS:
         self.healthy_reset_s = healthy_reset_s
         self.max_reconnects = max_reconnects
         self.use_yes_price = use_yes_price
+        self._conn_use_yes_price = bool(use_yes_price)  # the flag of the current connection
         self.ws_path = ws_path
         self.stream = stream
         self.on_message = on_message  # parsed exchange messages (e.g. metadata_updated bodies)
@@ -252,7 +259,9 @@ class KalshiWS:
             self._sub_sent.clear()
             self._unmapped_ok.clear()
             self._resync_since.clear()
-            self._synthetic("connected", self.url)
+            # One NO-side price convention per connection, declared in-band for replay.
+            self._conn_use_yes_price = bool(self.use_yes_price)
+            self._synthetic("connected", self.url, use_yes_price=self._conn_use_yes_price)
             reason = "closed"
             try:
                 for idx in range(len(self.subscriptions)):
@@ -403,7 +412,7 @@ class KalshiWS:
     async def _send_subscribe(self, idx: int) -> None:
         sub = self.subscriptions[idx]
         self._sub_sent[idx] = (list(sub.market_tickers), list(sub.index_ids))
-        await self.send_command("subscribe", sub.params(self.use_yes_price), sub_index=idx)
+        await self.send_command("subscribe", sub.params(self._conn_use_yes_price), sub_index=idx)
 
     async def _sync_new_sid(self, idx: int, channel: str, sid: int) -> None:
         """Markets/indices changed between our subscribe and its 'subscribed' reply: send the
@@ -435,8 +444,8 @@ class KalshiWS:
             self._resync_since.setdefault((sid, t), now)
         await self.send_command("update_subscription", {"sid": sid, "market_tickers": list(tickers), "action": "get_snapshot"})
 
-    def _synthetic(self, status: str, detail: str) -> None:
-        self._handle_raw(synthetic_status_frame(status, detail))
+    def _synthetic(self, status: str, detail: str, **fields: Any) -> None:
+        self._handle_raw(synthetic_status_frame(status, detail, **fields))
 
     def _handle_raw(self, raw: bytes) -> dict[str, Any] | None:
         """Record, parse, sequence and emit one raw record. Returns the parsed message."""
@@ -490,6 +499,12 @@ class KalshiWS:
             for sid, tickers in self.state.take_resync_requests():
                 await self._send_get_snapshot(sid, list(tickers))
             self._check_resync_timeout()
+            # websockets returns BUFFERED frames without suspending, and since Python 3.12
+            # asyncio.wait_for awaits recv() inline instead of in a separate Task, so nothing
+            # above yields while a backlog drains. Yield once per frame (as dh.feeds.base does)
+            # so a burst never starves the rest of the loop: other feeds' receive timestamps,
+            # the strategy, add_markets()/stop() callers, keepalive pings.
+            await asyncio.sleep(0)
 
     async def _control(self, msg: dict[str, Any]) -> None:
         typ = msg.get("type")

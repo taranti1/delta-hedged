@@ -15,7 +15,8 @@ Checks (PASS/FAIL each; exit 1 if any fails):
   5. WS for --seconds: orderbook_delta + trade on those markets, cfbenchmarks_value and
      cfbenchmarks_value_5hz on BRTI (signed handshake, subscriptions, sequencing)
   6. WS-maintained books == a fresh REST snapshot (up to 5 attempts to avoid races) — also
-     validates the NO-side price convention (use_yes_price=false)
+     validates the NO-side price convention: WS in ws.use_yes_price (default true: yes-leg)
+     against REST's no-leg NO levels
   7. BRTI tick rate per feed, latency recv - source_ts and Kalshi hop received_at - source_ts
   8. no WS gaps / errors during the run
 Places NO orders.
@@ -199,7 +200,7 @@ async def amain(args: argparse.Namespace) -> int:
                     proxy=True if bool((cfg.rest or {}).get("use_env_proxy", True)) else None,
                 ),
                 stale_after_s=float(wscfg.get("stale_after_s", 15)),
-                use_yes_price=bool(wscfg.get("use_yes_price", False)),
+                use_yes_price=bool(wscfg.get("use_yes_price", True)),
             )
             t0 = time.monotonic()
             task = asyncio.create_task(ws.run())

@@ -8,12 +8,28 @@ that are delivered before the rest of the script unless held. Script items:
   Exception          raised from recv() (simulated disconnect)
   STALL              recv() never returns (staleness)
   RELEASE            deliver replies held while ``hold_replies`` was on
+  Pause()            the script stops here until ``pause.resume()``; replies to commands sent
+                     meanwhile are still delivered. ``await pause.reached.wait()`` returns once
+                     the client has processed every earlier frame and is blocked in recv():
+                     the deterministic point to act on a live connection from the test.
+
+Like the real ``websockets`` connection, recv() returns an already-queued frame WITHOUT
+suspending; tests must not rely on other tasks running between frames (the client yields
+once per frame by design, but ordering assertions should use Pause / hold_replies).
+``hold_replies`` holds only get_snapshot replies; subscribe/add_markets replies always flow.
+
+Order books are defined on Kalshi's NO scale (``books``: ticker -> (yes levels, no levels);
+delta prices on the changed side's own scale) and RENDERED per orderbook sid like the real
+server: NO prices in yes-leg pricing (1 - q) when that sid's subscribe had
+``use_yes_price: true``. ``server_yes_price`` overrides the client's flag (None = honour it,
+missing flag = False, today's server default; True = after Kalshi removes the flag).
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
+from decimal import Decimal
 from typing import Any
 
 import orjson
@@ -23,14 +39,41 @@ STALL = object()
 RELEASE = object()
 
 
+class Pause:
+    """Script item: see module docstring."""
+
+    def __init__(self) -> None:
+        self.reached = asyncio.Event()
+        self.resumed = False
+        self._conn: FakeConn | None = None
+
+    def resume(self) -> None:
+        self.resumed = True
+        if self._conn is not None:
+            self._conn._wake.set()
+
+
 def dumps(obj: Any) -> str:
     return orjson.dumps(obj).decode()
 
 
+def flip(px: str) -> str:
+    """'0.5300' -> '0.4700' (exact 1e-4 dollar arithmetic)."""
+    v = 10000 - int(Decimal(px) * 10000)
+    return f"{v // 10000}.{v % 10000:04d}"
+
+
+DEFAULT_BOOK = ((("0.4500", "10.00"),), (("0.5300", "5.00"),))  # (YES bids, NO bids on the NO scale)
+
+
 class FakeConn:
     def __init__(self, script: list[Any], *, hold_replies: bool = False, drop_snapshots: bool = False,
-                 merge_subscriptions: bool = True) -> None:
+                 merge_subscriptions: bool = True, books: dict[str, Any] | None = None,
+                 server_yes_price: bool | None = None) -> None:
         self.merge_subscriptions = merge_subscriptions
+        self.books = dict(books or {})
+        self.server_yes_price = server_yes_price
+        self.yes_priced: dict[int, bool] = {}  # orderbook sid -> NO levels rendered in yes-leg pricing
         self.script: deque[Any] = deque(script)
         self.replies: deque[Any] = deque()  # str frames or thunks built at delivery time
         self.held: deque[Any] = deque()
@@ -53,18 +96,28 @@ class FakeConn:
         return self.seq[sid]
 
     def snapshot(self, sid: int, ticker: str, cid: int | None = None) -> str:
-        msg: dict[str, Any] = {"type": "orderbook_snapshot", "sid": sid, "seq": self.next_seq(sid),
-                               "msg": {"market_ticker": ticker, "market_id": "m-" + ticker,
-                                       "yes_dollars_fp": [["0.4500", "10.00"]], "no_dollars_fp": [["0.5300", "5.00"]]}}
+        yes, no = self.books.get(ticker, DEFAULT_BOOK)
+        if self.yes_priced.get(sid):
+            no = [(flip(px), q) for px, q in reversed(no)]
+        body: dict[str, Any] = {"market_ticker": ticker, "market_id": "m-" + ticker}
+        if yes:
+            body["yes_dollars_fp"] = [list(lv) for lv in yes]
+        if no:
+            body["no_dollars_fp"] = [list(lv) for lv in no]
+        msg: dict[str, Any] = {"type": "orderbook_snapshot", "sid": sid, "seq": self.next_seq(sid), "msg": body}
         if cid is not None:
             msg["id"] = cid
         return dumps(msg)
 
-    def delta(self, ticker: str, *, skip: int = 0, px: str = "0.4500", d: str = "1.00") -> str:
+    def delta(self, ticker: str, *, skip: int = 0, px: str = "0.4500", d: str = "1.00", side: str = "yes",
+              client_order_id: str | None = None) -> str:
+        """px on the changed side's own scale (NO scale for side 'no'), rendered like snapshots."""
         sid = self.sid_of("orderbook_delta")
-        return dumps({"type": "orderbook_delta", "sid": sid, "seq": self.next_seq(sid, skip),
-                      "msg": {"market_ticker": ticker, "market_id": "m-" + ticker, "price_dollars": px,
-                              "delta_fp": d, "side": "yes", "ts_ms": 1}})
+        body: dict[str, Any] = {"market_ticker": ticker, "market_id": "m-" + ticker, "delta_fp": d, "side": side, "ts_ms": 1,
+                                "price_dollars": flip(px) if side == "no" and self.yes_priced.get(sid) else px}
+        if client_order_id is not None:
+            body["client_order_id"] = client_order_id
+        return dumps({"type": "orderbook_delta", "sid": sid, "seq": self.next_seq(sid, skip), "msg": body})
 
     def trade(self, tid: str, ticker: str = "A") -> str:
         sid = self.sid_of("trade")
@@ -118,6 +171,9 @@ class FakeConn:
                 sid = self.next_sid
                 self.next_sid += 1
                 self.sid_channel[sid] = ch
+                if ch == "orderbook_delta":
+                    flag = self.server_yes_price
+                    self.yes_priced[sid] = bool(p.get("use_yes_price", False)) if flag is None else flag
                 self.sid_tickers[sid] = list(p.get("market_tickers") or [])
                 self.replies.append(dumps({"id": cmd["id"], "type": "subscribed", "msg": {"channel": ch, "sid": sid}}))
                 if ch == "orderbook_delta":
@@ -146,6 +202,16 @@ class FakeConn:
             if self.replies:
                 r = self.replies.popleft()
                 return r() if callable(r) else r
+            if self.script and isinstance(self.script[0], Pause):
+                pause = self.script[0]
+                pause._conn = self
+                pause.reached.set()
+                if pause.resumed:
+                    self.script.popleft()
+                    continue
+                self._wake.clear()
+                await self._wake.wait()  # a command reply or resume()
+                continue
             if self.script:
                 item = self.script.popleft()
                 if callable(item):

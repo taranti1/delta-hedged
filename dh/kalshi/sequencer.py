@@ -19,9 +19,22 @@ that replaying the recorded raw frames reproduces exactly the live event stream:
   * a delta for a market never snapshotted on its sid -> invalid + resync as above
   * fills are de-duplicated by trade_id (bounded memory)
 
+NO-side price convention of orderbook messages (``use_yes_price``, see dh.kalshi.normalize),
+per sid, first match wins:
+  1. proven by a two-sided snapshot on that sid (dh.kalshi.normalize.no_side_yes_priced);
+  2. declared by the connection: the live client writes ``"use_yes_price": <bool>`` into
+     its synthetic 'connected' record;
+  3. ``KalshiWsState(use_yes_price=...)``: the fallback for streams that declare nothing,
+     i.e. every recording made before the declaration existed -- all no-leg (False).
+A snapshot that proves the OTHER convention than the one in force is followed (it is
+normalized by its proof), reported as FeedStatus('kalshi.ws:orderbook_delta', 'error'),
+counted in ``pricing_mismatches``, and every other book on that sid is invalidated and
+resynced (it was built on the wrong NO scale).
+
 Connection boundaries: sids are per connection. The live client injects synthetic records
 ``{"type": "dh.feed_status", "status": connected|disconnected|stale|error, "detail": ...}``
-into the SAME raw stream (via ``synthetic_status_frame``) so replay sees reconnects too.
+(+ ``use_yes_price`` on 'connected') into the SAME raw stream (via ``synthetic_status_frame``)
+so replay sees reconnects too.
 'connected'/'disconnected' reset all sid state; 'disconnected' first emits
 FeedStatus('kalshi.book:<ticker>', 'disconnected') for every book it was maintaining.
 A ``subscribed`` response also resets its sid (sid numbers can be reused).
@@ -44,7 +57,7 @@ from dh.core.events import (
     KalshiBookSnapshot,
     KalshiFill,
 )
-from dh.kalshi.normalize import WS_STREAM, ws_message_to_events
+from dh.kalshi.normalize import WS_STREAM, snapshot_no_side_pricing, ws_message_to_events
 from dh.kalshi.wire import as_dict
 
 SYNTHETIC_TYPE = "dh.feed_status"
@@ -63,11 +76,14 @@ _CHANNEL_OF_TYPE = {
 _CONTROL_TYPES = frozenset({"ok", "error", "unsubscribed", "subscribed", "list_subscriptions"})
 
 
-def synthetic_status_frame(status: str, detail: str = "") -> bytes:
-    """Raw record the live client writes for connection-state changes (replayable)."""
+def synthetic_status_frame(status: str, detail: str = "", **fields: Any) -> bytes:
+    """Raw record the live client writes for connection-state changes (replayable).
+
+    Extra ``fields`` are recorded verbatim, e.g. ``use_yes_price=True`` on 'connected'.
+    """
     if status not in SYNTHETIC_STATUSES:
         raise ValueError(f"bad synthetic status {status!r}")
-    return orjson.dumps({"type": SYNTHETIC_TYPE, "status": status, "detail": detail})
+    return orjson.dumps({"type": SYNTHETIC_TYPE, "status": status, "detail": detail, **fields})
 
 
 def book_stream(ticker: str) -> str:
@@ -81,13 +97,16 @@ class SidState:
     last_seq: int = 0  # 0 = nothing seen yet
     tickers: set[str] = field(default_factory=set)  # books snapshotted on this sid
     invalid: set[str] = field(default_factory=set)  # books awaiting a fresh snapshot
+    yes_priced: bool | None = None  # NO-side price scale proven by a snapshot on this sid
 
 
 class KalshiWsState:
     """Mutable sequencing state for one ``kalshi.ws`` stream (live or replay)."""
 
     def __init__(self, *, use_yes_price: bool = False, fill_dedupe_size: int = 20_000) -> None:
+        # NO-side price convention of connections that do not declare one (see module doc).
         self.use_yes_price = use_yes_price
+        self.conn_use_yes_price: bool | None = None  # declared by the current 'connected' record
         self.sids: dict[int, SidState] = {}
         self.counters: dict[str, int] = {
             "frames": 0,
@@ -98,6 +117,7 @@ class KalshiWsState:
             "dup_fills": 0,
             "parse_errors": 0,
             "resync_requests": 0,
+            "pricing_mismatches": 0,
         }
         self._resync: list[tuple[int, tuple[str, ...]]] = []
         self._fill_ids: OrderedDict[str, None] = OrderedDict()
@@ -120,6 +140,15 @@ class KalshiWsState:
                 return sid
         return None
 
+    def book_yes_priced(self, sid: int | None) -> bool:
+        """NO-side price convention in force on orderbook sid `sid` (see module docstring)."""
+        st = self.sids.get(sid) if sid is not None else None
+        if st is not None and st.yes_priced is not None:
+            return st.yes_priced
+        if self.conn_use_yes_price is not None:
+            return self.conn_use_yes_price
+        return self.use_yes_price
+
     def book_tickers(self) -> set[str]:
         out: set[str] = set()
         for st in self.sids.values():
@@ -128,9 +157,10 @@ class KalshiWsState:
 
     # ------------------------------------------------------------------ mutation
     def reset_connection(self) -> None:
-        """Forget all sid state (sids are per connection)."""
+        """Forget all sid state (sids are per connection) and the connection's declaration."""
         self.sids.clear()
         self._resync.clear()
+        self.conn_use_yes_price = None
 
     def _sid(self, sid: int, typ: str) -> SidState:
         st = self.sids.get(sid)
@@ -196,7 +226,12 @@ def normalize_ws_message(msg: dict[str, Any], recv_ns: int, state: KalshiWsState
         st.last_seq = seq
 
     try:
-        events = ws_message_to_events(msg, recv_ns, use_yes_price=state.use_yes_price)
+        yes_priced = proven = None
+        if typ in ("orderbook_snapshot", "orderbook_delta"):
+            yes_priced = state.book_yes_priced(None if sid_raw is None else int(sid_raw))
+            if typ == "orderbook_snapshot":
+                proven = snapshot_no_side_pricing(as_dict(msg.get("msg")))
+        events = ws_message_to_events(msg, recv_ns, use_yes_price=bool(yes_priced))
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
         state.counters["parse_errors"] += 1
         detail = f"malformed {typ}: {type(exc).__name__}: {exc}"
@@ -205,6 +240,8 @@ def normalize_ws_message(msg: dict[str, Any], recv_ns: int, state: KalshiWsState
         _invalidate_from_msg(msg, typ, recv_ns, state, out)
         return out
 
+    if proven is not None and sid_raw is not None:
+        _book_pricing(state, int(sid_raw), proven, bool(yes_priced), msg, recv_ns, out)
     for ev in events:
         if isinstance(ev, KalshiBookSnapshot):
             st = state._sid(ev.sid, "orderbook_snapshot")
@@ -269,6 +306,34 @@ def _gap(state: KalshiWsState, st: SidState, sid: int, seq: int, recv_ns: int, o
         state.counters["resync_requests"] += 1
 
 
+def _book_pricing(state: KalshiWsState, sid: int, proven: bool, assumed: bool, msg: dict, recv_ns: int, out: list[Event]) -> None:
+    """A snapshot on `sid` proved its NO-side convention: adopt it for the sid; on a mismatch
+    with the one in force, report it and resync every other book built on the wrong scale."""
+    st = state._sid(sid, "orderbook_snapshot")
+    st.yes_priced = proven
+    if proven == assumed:
+        return
+    ticker = str(as_dict(msg.get("msg")).get("market_ticker") or "")
+    state.counters["pricing_mismatches"] += 1
+    out.append(
+        FeedStatus(
+            ts=recv_ns,
+            ts_exch=0,
+            stream=f"{WS_STREAM}:orderbook_delta",
+            status="error",
+            detail=f"sid={sid} {ticker}: book proves use_yes_price={proven}, {assumed} was in force; following the book",
+        )
+    )
+    stale = sorted(st.tickers - st.invalid - {ticker})
+    st.invalid.update(stale)
+    for t in stale:
+        detail = f"sid={sid} NO-side price scale changed"
+        out.append(FeedStatus(ts=recv_ns, ts_exch=0, stream=book_stream(t), status="gap", detail=detail))
+    if stale:
+        state._resync.append((sid, tuple(stale)))
+        state.counters["resync_requests"] += 1
+
+
 def _invalidate_from_msg(msg: dict, typ: str, recv_ns: int, state: KalshiWsState, out: list[Event]) -> None:
     if typ not in ("orderbook_snapshot", "orderbook_delta"):
         return
@@ -297,5 +362,7 @@ def _synthetic(msg: dict, recv_ns: int, state: KalshiWsState) -> list[Event]:
             out.append(FeedStatus(ts=recv_ns, ts_exch=0, stream=book_stream(t), status="disconnected", detail="ws disconnected"))
     if status in ("connected", "disconnected"):
         state.reset_connection()
+    if status == "connected" and isinstance(msg.get("use_yes_price"), bool):
+        state.conn_use_yes_price = msg["use_yes_price"]
     out.append(FeedStatus(ts=recv_ns, ts_exch=0, stream=WS_STREAM, status=status, detail=detail))  # type: ignore[arg-type]
     return out

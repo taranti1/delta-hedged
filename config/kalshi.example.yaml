@@ -43,7 +43,9 @@ ws:
   backoff_initial_s: 0.5
   backoff_max_s: 30
   healthy_reset_s: 30
-  use_yes_price: false # keep NO bids on the NO price scale (normalizer convention)
+  # orderbook_delta NO levels in yes-leg pricing. Kalshi will make true the default and then
+  # remove the flag (true only); the normalizer handles both shapes and records the flag.
+  use_yes_price: true
   ping_interval_s: 10
   ping_timeout_s: 10
 
