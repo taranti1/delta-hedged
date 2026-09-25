@@ -175,8 +175,8 @@ class Side:
     """Side-channel input processed in queue order at ``ts`` (not a strategy event)."""
 
     ts: int
-    kind: str  # universe_add | spec_changed | positions | positions_ws | fills | resting | queue_positions |
-    #            reconcile_done | hold | hold_end | persist | call
+    kind: str  # universe_add | clock_gate | spec_changed | positions | positions_ws | fills | fills_periodic |
+    #            resting | resting_all | queue_positions | reconcile_done | hold | hold_end | persist | call
     payload: Any = None
 
 

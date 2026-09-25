@@ -1,0 +1,17 @@
+{
+ "experiment": "e1_staleness",
+ "verdict": "INCONCLUSIVE \u2014 only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable); synthetic recording (pipeline check only)",
+ "outcome": "INCONCLUSIVE",
+ "rule_outcome": "ACCEPT (lag coefficient 0.440 [0.420, 0.461] at 1 s beyond 0.1 s receive latency; response to a > 2 sd external move 1.69 tick; holds in every month: 2026-09)",
+ "guards": [
+  "only 4 settlement event(s) behind the decision (< 20; event-clustered CIs over so few events are unreliable)",
+  "synthetic recording (pipeline check only)"
+ ],
+ "decision_events": 4,
+ "min_events": 20,
+ "policies": null,
+ "in_sample": null,
+ "in_sample_why": "",
+ "synthetic": true,
+ "rule": "accept if the lag coefficient on the PAST external fair-value change has a 95% CI lower bound > 0 at some horizon <= 1 s measured beyond the Kalshi receive latency, the implied response to a > 2 sd external move is >= 0.5 tick, and both hold in every calendar month of the window; reject if the response is < 0.2 tick (CI upper bound) at every horizon <= 1 s beyond the receive latency"
+}

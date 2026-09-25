@@ -1,0 +1,3 @@
+synthetic,sample,fit_on,eval_on,markets,segments,exposure_h,orders,realized_ct,pred_ct,ratio_ct,wape_ct,dev_model,dev_pooled,dev_explained
+True,in_sample,train,train,27,40,13.275,4211,78855,49616.2,0.629208,0.68176,6473.4,12727.5,0.491385
+True,out_of_sample,train,test,9,31,4.425,1365,24932,16644.1,0.667578,0.737605,1657.37,3569.62,0.535702

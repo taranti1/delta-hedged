@@ -35,14 +35,23 @@ loop:
   lag_resume_s: 2.0            # ... until fresh data kept the lag < max_lag_s/2 this long
   lag_window_s: 600.0          # trailing window of the exchange-time latency baseline
   lag_confirm_s: 0.5           # exchange-time lag = smallest excess over this window (relay batching)
+  lag_baseline_cap_ms: 0.0     # the baseline never exceeds this (0 = clock_block_ms + 100): a backlog
+                               # present from the start or longer than lag_window_s stays lag.
+                               # dh_lag_baseline_seconds shows each source's uncapped baseline; raise
+                               # the cap only after measuring a larger normal latency (paper mode)
   yield_items: 64              # the consumer yields to the event loop every N items / N ms,
   yield_ms: 5.0                # and after every item that sent orders
   shutdown_timeout_s: 10.0     # 'stopping' heartbeats stop after this (the watchdog takes over)
   strategy_error: stop         # stop | continue ('continue' is refused in live mode)
-  clock_sample_s: 60.0         # chrony/adjtimex sample -> 'clock' stream + dh_clock_offset_seconds
+  clock_sample_s: 60.0         # chrony/timedatectl sample -> 'clock' stream + dh_clock_offset_seconds
+                               # (must be > 0 in live mode)
+  clock_resample_s: 5.0        # while the last sample was bad or unmeasurable: sample this often
   clock_alarm_ms: 5.0          # |offset| above this: alarm
-  clock_block_ms: 250.0        # |offset| above this on clock_block_samples samples in a row:
+  clock_block_ms: 250.0        # |offset| above this on clock_block_samples checks in a row:
   clock_block_samples: 2       # new orders blocked (restart re-anchors the session clock)
+  clock_max_est_error_ms: 0.0  # live: a sample must come from chronyc/timedatectl, be synchronised and
+                               # have an estimated error <= this (0 = clock_block_ms), else it blocks
+                               # like a large offset (no chronyd reachable = blocked)
   risk_state_interval_s: 2.0   # persist the day's risk state this often (and on every halt)
 
 venue:

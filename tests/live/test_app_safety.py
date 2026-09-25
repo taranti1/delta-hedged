@@ -316,3 +316,169 @@ async def test_live_session_with_a_lag_episode_replays_bit_for_bit(tmp_path):
     assert any(a[1] == "PlaceOrder" for a in live_a)
     assert any(a[1] == "CancelAll" and a[2].get("reason") == "runner_lag" for a in live_a)
     assert live_a == rep_a and live_l == rep_l
+
+
+# ============================================================================ review round 2
+async def test_restart_with_open_inventory_is_valued_at_exchange_prices_and_settles_in_session(tmp_path):
+    """N1: the account holds 10 short YES (sold today at 20c) in an event the session excludes.
+    The seed values them at the 21c YES ask (-$0.10 in total), not at the $1 worst case, and
+    ignores the pessimistic mark the previous session persisted; when that market settles NO
+    during the session the strategy and the persisted state see +$2.00 at once."""
+    import time
+
+    from dh.core.events import Settlement
+
+    from .fakes import market_row
+
+    rest, fake, lcfg, scfg, tickers = _setup(tmp_path, "live", forbid_writes=False)
+    now = time.time_ns()
+    day0 = now - now % DAY_NS
+    ex = "KXBTCD-OTHER-T90000.00"
+    rest.positions = {ex: "-10.00"}
+    rest.fills = [fill_row("f-1", "o-1", ex, side="ask", px="0.2000", count="10.00", created_ns=max(day0, now - 60 * NS_PER_S))]
+    rest.markets[ex] = market_row(ex, bid="0.1900", ask="0.2100")
+    _store(lcfg).save(RiskState(day0, -8.0, False, "", 0, "live-earlier", "live", now - 60 * NS_PER_S,
+                                realized_usd=2.0, mark_usd=-10.0))  # it had marked them at the worst case
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
+    runner = await app.build()
+    assert app.info["day_pnl_rest"]["open_px"] == {ex: 2100} and app.info["day_pnl_rest"]["fallbacks"] == []
+    assert app.info["risk_seed"]["real_pnl_usd"] == pytest.approx(-0.10)
+    runner.process_pending()
+    mm = runner.strategy
+    assert mm.risk.seed_day_pnl == pytest.approx(-0.10) and not mm.risk.halted_all
+    assert ex not in mm.specs and runner.riskbook.excluded == {ex: (-1000, 2100)}
+    t = runner.clock_ns()
+    runner.push(Settlement(t, 0, ex, "no", None, 0))
+    runner.process_pending()
+    assert mm.risk.seed_day_pnl == pytest.approx(2.0)
+    runner.persist_risk_state(runner.clock_ns())
+    st = _store(lcfg).load()
+    assert st.day_pnl_usd == pytest.approx(2.0) and st.mark_usd == pytest.approx(0.0)
+    await runner.shutdown()
+    await app.close()
+    recs = _live_records(tmp_path)
+    assert [round(e.day_pnl_usd, 6) for e in recs if isinstance(e, RiskStateSeed)] == [-0.1, 2.0]  # replayable
+
+
+@pytest.mark.parametrize("bad", ["fill_without_time", "settlement_unknown_payout", "cutoff_down", "position_row"])
+async def test_malformed_rest_data_refuses_the_start(tmp_path, bad):
+    """N8: the day's P&L is never derived from a partial or unparseable view: exit 2, nothing
+    traded, the heartbeat says stopped."""
+    from .fakes import fill_row as frow
+    from .test_riskstate import settle_row
+
+    rest, fake, lcfg, scfg, tickers = _setup(tmp_path, "live", forbid_writes=False)
+    if bad == "fill_without_time":
+        rest.fills = [frow("f-1", "o-1", tickers[0], created_ns=0) | {"created_time": None}]
+    elif bad == "settlement_unknown_payout":
+        rest.settlements = [settle_row(tickers[0], "scalar", yes="1.00")]
+    elif bad == "cutoff_down":
+        rest.on("get_historical_cutoff", ConnectionError("down"))
+    else:
+        rest.on("get_all_positions", {"market_positions": [{"ticker": "X", "position_fp": "abc"}], "event_positions": []})
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
+    assert await app.run(duration_s=1.0) == 2
+    names = rest.names()
+    assert "create_order" not in names and "batch_create_orders" not in names and "create_order_group" not in names
+    assert fake.conns == [] and read_heartbeat(tmp_path / "run" / "hb.json")["state"] == "stopped"
+    logs = [json.loads(x) for f in (tmp_path / "logs").iterdir() for x in f.read_text().splitlines()]
+    assert any(x["k"] == "startup_refused" for x in logs)
+
+
+async def test_stale_watchdog_marker_is_moved_aside_and_a_new_one_about_this_runner_halts(tmp_path):
+    """Addendum (b) + N6: a marker left by an earlier trigger is renamed at start-up (logged) and
+    cannot halt the new runner; a marker written later by a watchdog watching THIS runner halts
+    it (Halt(all), sticky: a restart starts halted until the operator resets)."""
+    from dh.live.monitor import write_json_atomic
+
+    rest, fake, lcfg, scfg, _ = _setup(tmp_path, "live", forbid_writes=False)
+    marker = tmp_path / "run" / "hb.json.cancel_all"
+    write_json_atomic(marker, {"t": 1, "ok": True, "by": "watchdog", "watched": [1, "live-old"]})
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
+    runner = await app.build()
+    moved = list((tmp_path / "run").glob("hb.json.cancel_all.stale-*"))
+    assert len(moved) == 1 and not marker.exists() and app.info["stale_watchdog_marker"] == str(moved[0])
+    runner.process_pending()
+    runner._check_marker(runner.clock_ns())  # noqa: SLF001
+    runner.process_pending()
+    assert not runner.strategy.risk.halted_all and "halt:all" not in runner.gate.reasons
+    t = runner.clock_ns()
+    write_json_atomic(marker, {"t": t, "ok": True, "by": "watchdog", "watched": [os.getpid(), app.session_id]})
+    runner._check_marker(t)  # noqa: SLF001 - the housekeeping check (once a second)
+    runner.process_pending()
+    mm = runner.strategy
+    assert mm.risk.halted_all and mm.risk.halt_reason == "carried_over:watchdog_cancel_all"
+    assert "halt:all" in runner.gate.reasons
+    st = _store(lcfg).load()
+    assert st.halted and st.halt_reason == "watchdog_cancel_all"
+    await runner.shutdown()
+    await app.close()
+    (tmp_path / "b").mkdir()
+    rest2, fake2, _, _, _ = _setup(tmp_path / "b", "live", forbid_writes=False)
+    app2 = LiveApp(scfg, lcfg, "live", Overrides(rest=rest2, ws_connect=fake2.connect, install_signals=False))
+    runner2 = await app2.build()
+    runner2.process_pending()
+    assert runner2.strategy.risk.halted_all  # sticky across restarts
+    await runner2.shutdown()
+    await app2.close()
+
+
+async def test_operator_reset_keeps_the_real_pnl_and_counts_the_limit_from_it(tmp_path):
+    """N1c: --reset-daily-halt after a daily-loss halt at -$26: the halt and pause are cleared, the
+    real day P&L (-$26) stays recorded, and the $25 limit counts from there (a later restart the
+    same day keeps that base)."""
+    import time
+
+    rest, fake, lcfg, scfg, _ = _setup(tmp_path, "live", forbid_writes=False)
+    now = time.time_ns()
+    day0 = now - now % DAY_NS
+    _store(lcfg).save(RiskState(day0, -26.0, True, "daily_loss", now + 3600 * NS_PER_S, "x", "live", now,
+                                realized_usd=-26.0, halt_scope="all", halt_day_ns=day0))
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False),
+                  reset_daily_halt=True)
+    runner = await app.build()
+    runner.process_pending()
+    mm = runner.strategy
+    assert not mm.risk.halted_all and mm.risk.seed_day_pnl == pytest.approx(0.0) and mm.risk.pause_until_ns < now
+    st = _store(lcfg).load()
+    assert st.day_pnl_usd == pytest.approx(-26.0) and st.budget_base_usd == pytest.approx(-26.0) and not st.halted
+    runner.persist_risk_state(runner.clock_ns())
+    st = _store(lcfg).load()
+    assert st.day_pnl_usd == pytest.approx(-26.0) and st.budget_base_usd == pytest.approx(-26.0)
+    await runner.shutdown()
+    await app.close()
+    (tmp_path / "b").mkdir()
+    rest2, fake2, _, _, _ = _setup(tmp_path / "b", "live", forbid_writes=False)
+    app2 = LiveApp(scfg, lcfg, "live", Overrides(rest=rest2, ws_connect=fake2.connect, install_signals=False))
+    runner2 = await app2.build()
+    runner2.process_pending()
+    assert runner2.strategy.risk.seed_day_pnl == pytest.approx(0.0)  # the base carries within the day
+    assert app2.info["risk_seed"]["real_pnl_usd"] == pytest.approx(-26.0)
+    await runner2.shutdown()
+    await app2.close()
+
+
+async def test_restart_with_inventory_carried_over_midnight_values_it_at_the_last_trade(tmp_path):
+    """N1a: 10 YES held at 00:00 UTC (bought yesterday), sold today at 40c; the last trade at or
+    before midnight was 30c: today's P&L is +$1.00 (not the -$6.00 of a $1-per-contract bound)."""
+    import time
+
+    from .fakes import trade_row
+
+    rest, fake, lcfg, scfg, _ = _setup(tmp_path, "live", forbid_writes=False)
+    now = time.time_ns()
+    day0 = now - now % DAY_NS
+    m01 = "KXBTCD-MIDNIGHT-T84000.00"
+    rest.fills = [fill_row("f-1", "o-1", m01, side="ask", px="0.4000", count="10.00", created_ns=max(day0, now - 60 * NS_PER_S))]
+    rest.trades = [trade_row("t-1", m01, px="0.3000", created_ns=day0 - 120 * NS_PER_S)]
+    app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
+    runner = await app.build()
+    d = app.info["day_pnl_rest"]
+    assert d["positions_midnight"] == {m01: 1000} and d["midnight_px"] == {m01: 3000} and d["fallbacks"] == []
+    assert d["pnl_usd"] == pytest.approx(1.0)
+    q = rest.of("iter_trades")[0][1]
+    assert q["ticker"] == m01 and q["max_ts"] == day0 // NS_PER_S and not q["historical"]
+    runner.process_pending()
+    assert runner.strategy.risk.seed_day_pnl == pytest.approx(1.0)
+    await runner.shutdown()
+    await app.close()

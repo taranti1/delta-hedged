@@ -9,8 +9,9 @@ What a session leaves on disk (dh.live.runner / dh.live.app):
   events.live               events the runner fed that are not raw frames, in processing
                             order: the start-up RiskStateSeed, adapter results (acks, rejects,
                             reconciliation updates, gate rejects), runner-derived events (lag /
-                            reconciliation FeedStatus, checked position snapshots, back-filled
-                            fills, order-group updates)
+                            reconciliation / clock FeedStatus, checked position snapshots,
+                            back-filled fills, order-group updates, the updated RiskStateSeed
+                            after an excluded market settled or the watchdog's halt)
   events.paper              simulator messages (audit only: the replay regenerates them)
   meta                      session_start (configs, universe, paper simulator config, id
                             prefix, subaccount), fv_warmup (the exact benchmark points fed to

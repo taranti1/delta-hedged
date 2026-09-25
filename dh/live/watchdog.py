@@ -155,8 +155,9 @@ class Watchdog:
             if st.foreign == 1 or st.foreign % 1000 == 0:
                 self._note("ignoring a heartbeat from another writer", pid=hb.get("pid"), session=hb.get("session"),
                            mode=mode, state=hstate)
+        parsed = hb is not None and not hb.get("unparsed")  # an unreadable file names no runner to lock onto
         if st.state == "DISARMED":
-            if fresh and self._relevant(mode) and hstate in ("running", "stopping"):
+            if fresh and parsed and self._relevant(mode) and hstate in ("running", "stopping"):
                 self._arm(hb, "armed")  # type: ignore[arg-type]
             return st.state
         if st.state == "ARMED":
@@ -175,7 +176,7 @@ class Watchdog:
                 await self._attempt(now)
             return st.state
         # TRIGGERED
-        if hb is not None and fresh and self._relevant(mode) and hstate == "running":
+        if parsed and fresh and self._relevant(mode) and hstate == "running":
             # the watched runner recovered, or a new live runner started (a restart)
             self._arm(hb, "re-armed: runner alive again" if ours else "re-armed on a new live runner")
             return st.state
