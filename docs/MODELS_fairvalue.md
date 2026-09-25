@@ -9,18 +9,25 @@ material (section 3 below).
 
 ## 1. What is priced
 
-A KXBTCD market expiring at `T` pays $1 if the expiration value `A` beats the strike, where
+A KXBTCD / KXBTC / KXBTC15M market pays $1 if the expiration value `A` beats the strike, where
 `A` is the simple average of `n = 60` once-per-second BRTI prints stamped `T-59s, ..., T`
-(window `(T-60s, T]`, the convention Kalshi documents for `last_60s_windowed_average_15min`;
-it still has to be reconciled with published `expiration_value`s, see section 7).
+(window `(T-60s, T]`, the convention Kalshi documents for `last_60s_windowed_average_15min`),
+**`T` = the market's `close_time`** (not `expected_expiration_time`, which is close + 5 min on
+every KXBTC* market), and the average is **rounded to cents** before the comparison (the
+published `expiration_value` has 2 decimals). Convention: `dh/settlement/convention.py`,
+verified against published `expiration_value`s in `docs/research/M1_2_SETTLEMENT_CHECK.md`.
+Missing or incomplete benchmark data resolves the market No (contract terms).
 
-| strike_type | YES iff |
-|---|---|
-| `greater` | `A > floor` |
-| `greater_or_equal` | `A >= floor` |
-| `less` | `A < cap` |
-| `less_or_equal` | `A <= cap` |
-| `between` | `floor <= A <= cap` |
+| strike_type | YES iff (on the rounded value `round(A, 2)`) | threshold on the unrounded `A` |
+|---|---|---|
+| `greater` (KXBTCD "above", strikes X.99) | `round(A) > floor` | `A >= floor + 0.005` |
+| `greater_or_equal` (KXBTC15M "at least" the previous quarter's value) | `round(A) >= floor` | `A >= floor - 0.005` |
+| `less` | `round(A) < cap` | `A < cap - 0.005` |
+| `less_or_equal` | `round(A) <= cap` | `A < cap + 0.005` |
+| `between` (inclusive) | `floor <= round(A) <= cap` | `floor - 0.005 <= A < cap + 0.005` |
+
+(`MarketSpec.settle_thresholds`; for strikes on the cent grid, rounding half up.) The pricing
+model below uses the thresholds; determined outcomes use `MarketSpec.yes_wins`, which rounds.
 
 ## 2. Window state
 
@@ -45,9 +52,12 @@ timestamp) defines the second. 1 Hz print for second `s` = the tick stamped in `
 tick stamped exactly `s`, and of two ticks in one second the later is kept);
 with only the 5 Hz feed, the last 5 Hz tick at or before `s` (final once a later tick
 arrives). Duplicates are idempotent; conflicting values for the same source timestamp keep the
-first. Missing seconds: `gap_policy='carry_forward'` (default, previous print) or `'skip'`
-(average of the prints that exist). Observations whose time has passed but whose print has not
-arrived are *pending*: unfixed with `tau_first = 0`.
+first. Missing seconds are counted in `WindowState.n_missing`: incomplete data resolves No, so a
+gap inside the window is a **No-risk condition** and the strategy stops quoting every market of
+that expiration whose YES band exceeds `quoting.window_gap_max_yes_p` (2c) rather than trusting
+an imputed value; the value used meanwhile is `gap_policy='carry_forward'` (default, previous
+print) or `'skip'` (average of the prints that exist). Observations whose time has passed but
+whose print has not arrived are *pending*: unfixed with `tau_first = 0`.
 
 ## 3. Distribution of the remaining average
 
@@ -209,9 +219,10 @@ Approximations and limitations:
    were fitted on Bitstamp 1-minute candles with OHLC4 of the final minute as the settlement
    proxy. Re-fit on captured BRTI 1 Hz data and published `expiration_value`s before relying
    on the tails.
-7. **Settlement convention.** The `(T-60s, T]` window, the gap policy and any rounding of
-   `expiration_value` are inferred from the API documentation, not verified against settled
-   markets.
+7. **Settlement convention.** `T = close_time`, window `(T-60s, T]` and cents rounding are
+   checked against published `expiration_value`s (`docs/research/M1_2_SETTLEMENT_CHECK.md`).
+   How CF Benchmarks / Kalshi treat a missing second is not observable from the API beyond the
+   contract's "resolves No"; the strategy therefore pulls at-risk quotes during a gap.
 
 ## 8. Using it in the strategy
 
@@ -219,7 +230,7 @@ Approximations and limitations:
 from dh.settlement import SettlementTracker
 from dh.models.fvmodel import FairValueModel, load_recommended_config
 
-tracker = SettlementTracker()                      # gap_policy='carry_forward' until verified
+tracker = SettlementTracker()                      # gaps: WindowState.n_missing -> No-risk
 fv = FairValueModel.from_config(load_recommended_config())
 
 def on_index(tick):                                # every IndexTick (1 Hz and/or 5 Hz)

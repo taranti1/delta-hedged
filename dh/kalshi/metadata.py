@@ -9,9 +9,11 @@ from price_ranges, fee type/multiplier with event > series precedence). Markets 
 be modeled are kept in ``rejected`` with the reason (e.g. KXBTC15M before its strike is set).
 
 ``rules_flags(market)`` sanity-checks the contract text: the settlement model assumes the
-simple average of 60 one-second BRTI prints before expiration; a market whose rules do not
-mention an average, BRTI/CF Benchmarks and a 60-second window is flagged and should not be
-traded until a human has read the rules.
+simple average of 60 one-second BRTI prints before T = close_time (dh.settlement.convention);
+a market whose rules do not mention an average, BRTI/CF Benchmarks and a 60-second window, or
+whose rules/ticker time disagrees with close_time, is flagged and should not be traded until a
+human has read the rules. ``expected_expiration_time`` is metadata only (close + 5 min on every
+KXBTC* market): its absence or its difference from close_time is informational.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from dh.core.market import MarketSpec, PriceRange
 from dh.kalshi.fees import FeeEngine, FeeSchedule, resolve_fee_fields
 from dh.kalshi.normalize import UnsupportedMarket, rest_market_to_spec
 from dh.kalshi.wire import as_dict, opt_iso_to_ns
+from dh.settlement.convention import check_settlement_time
 
 BTC_SERIES = ("KXBTCD", "KXBTC", "KXBTC15M")
 # Flags that make a market untradable until a human has checked it; others are informational.
@@ -36,7 +39,7 @@ BLOCKING_FLAGS = frozenset(
         "rules_no_average",
         "rules_no_brti",
         "rules_no_60s_window",
-        "no_expected_expiration_time",
+        "settlement_time_mismatch",
         "ticker_strike_mismatch",
     }
 )
@@ -83,9 +86,19 @@ def rules_flags(market: dict[str, Any]) -> list[str]:
         flags.append("rules_no_brti")
     if not _RX_60S.search(text):
         flags.append("rules_no_60s_window")
+    close_ns = opt_iso_to_ns(market.get("close_time"))
+    if close_ns:
+        status, why = check_settlement_time(market, close_ns)
+        if status == "mismatch":
+            flags.append("settlement_time_mismatch")  # blocking: T = close_time is not what the rules say
+        elif status == "unverified":
+            flags.append("settlement_time_unverified")  # informational: nothing to cross-check
+        elif why:
+            flags.append("ticker_time_differs")  # informational: the rules text (binding) verified T
+    # informational only: T is close_time; expected_expiration_time is close + 5 min on KXBTC*
     if not market.get("expected_expiration_time"):
         flags.append("no_expected_expiration_time")
-    elif market.get("close_time") and opt_iso_to_ns(market["expected_expiration_time"]) != opt_iso_to_ns(market["close_time"]):
+    elif close_ns and opt_iso_to_ns(market["expected_expiration_time"]) != close_ns:
         flags.append("expiration_differs_from_close")
     if market.get("market_type") not in (None, "binary"):
         flags.append(f"market_type_{market.get('market_type')}")

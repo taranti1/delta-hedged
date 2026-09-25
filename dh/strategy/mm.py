@@ -673,7 +673,7 @@ class MarketMaker:
                 D += self._contracts(s.ticker) * f.delta
             first = next(iter(fvs.values()))
             tail_obj, _ = self.fv.tails.at(max(0.0, (T - now) / NS_PER_S))
-            bps = sorted({b for s in specs for b in (s.floor_strike, s.cap_strike) if b is not None})
+            bps = sorted({b for s in specs for b in s.breakpoints()})  # strikes shifted by the cents rounding
             grid = EventGrid.build(n_obs=ws.n_obs, sum_fixed=ws.sum_fixed, m_remaining=ws.m_remaining,
                                    mu_R=S, sd_R=first.sd_R, tail=tail_obj, spot=S, breakpoints_A=bps)
             payoffs = {s.ticker: payoff_vector(s, grid.A) for s in specs}
@@ -745,6 +745,10 @@ class MarketMaker:
             reason = "fee_unresolved"
         elif not book.valid or not self.risk.book_ok(t, now):
             reason = "book_invalid"
+        elif ev["ws"].n_missing > 0 and f.F_hi > q.window_gap_max_yes_p:
+            # a benchmark print of this settlement window is missing: "no data / incomplete data"
+            # resolves No (contract terms), so every non-negligible YES is at risk
+            reason = "brti_gap_in_window"
         elif tau < q.min_tau_s and f.z_near < q.z_min_final:
             reason = "final_window_near_strike"
         elif tau < 600 and not health.near_expiry_allowed:

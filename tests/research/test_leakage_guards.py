@@ -46,7 +46,7 @@ def test_btc_bar_is_used_only_after_it_closes():
 
 def _mkt(ticker="M0", K=100_000.0, open_ms=0, exp_ms=H_MS, result="no"):
     return dict(ticker=ticker, event_ticker="E" + ticker, strike_type="greater", floor_strike=K, cap_strike=np.nan,
-                result=result, open_ts_ms=open_ms, expected_expiration_ts_ms=exp_ms)
+                result=result, open_ts_ms=open_ms, close_ts_ms=exp_ms)
 
 
 def test_exp0_z_uses_the_previous_bar_not_the_open_one():

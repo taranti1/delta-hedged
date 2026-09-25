@@ -81,8 +81,27 @@ MARKET_KXBTCD: dict[str, Any] = {
 }
 
 
+def rules_kxbtcd(close_time: str, strike: float | None) -> str:
+    """KXBTCD rules text for a close time (New York time, like the real markets): the settlement
+    time T stated in the rules must equal close_time (dh.settlement.convention)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    d = _dt.datetime.fromisoformat(close_time.replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
+    h = d.hour % 12 or 12
+    hm = f"{h}:{d.minute:02d}" if d.minute else f"{h}"
+    ampm = "PM" if d.hour >= 12 else "AM"
+    return (f"If the simple average of the sixty seconds of CF Benchmarks' Bitcoin Real-Time Index (BRTI) "
+            f"before {hm} {ampm} {d.tzname()} on {d.strftime('%b')} {d.day}, {d.year} is above {strike}, "
+            f"then the market resolves to Yes.")
+
+
 def market(**overrides: Any) -> dict[str, Any]:
+    """MARKET_KXBTCD with overrides; a new close_time also gets a matching rules_primary unless one
+    is given (the rules' settlement time is checked against close_time)."""
     m = copy.deepcopy(MARKET_KXBTCD)
+    if overrides.get("close_time") and "rules_primary" not in overrides:
+        m["rules_primary"] = rules_kxbtcd(str(overrides["close_time"]), overrides.get("floor_strike", m["floor_strike"]))
     m.update(overrides)
     return m
 

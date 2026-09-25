@@ -16,7 +16,7 @@ def test_split_tau_exact_durations():
 
 def _market(i, K=100_000.0, open_ms=0, exp_ms=3_600_000):
     return dict(ticker=f"M{i}", event_ticker="E", strike_type="greater", floor_strike=K, cap_strike=np.nan,
-                result="no", open_ts_ms=open_ms, expected_expiration_ts_ms=exp_ms)
+                result="no", open_ts_ms=open_ms, close_ts_ms=exp_ms)
 
 
 def test_constant_flow_rate_recovered_in_every_tau_bucket():

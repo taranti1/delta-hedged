@@ -146,6 +146,10 @@ class QuotingCfg:
     expected_rounding_per_order: float = 0.005
     min_tau_s: float = 90.0  # no new near-strike quotes after T - min_tau_s
     z_min_final: float = 2.5  # |z| required to quote inside min_tau_s
+    # a BRTI print of the settlement window is missing (WindowState.n_missing > 0): incomplete
+    # data resolves No, so only markets whose fair-value band stays at or below this YES
+    # probability are still quoted (dh.settlement.window module doc)
+    window_gap_max_yes_p: float = 0.02
     max_tau_s: float = 3900.0  # only quote events expiring within this horizon
     price_floor_px: int = 100  # never quote below 1c / above 99c YES (M1)
     price_cap_px: int = 9900

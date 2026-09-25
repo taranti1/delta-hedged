@@ -99,21 +99,14 @@ def _sf(tail: object, x: np.ndarray, nu: float, cv: float) -> np.ndarray:
 
 # ----------------------------------------------------------------------------- payoffs
 def payoff_vector(spec: MarketSpec, A: np.ndarray) -> np.ndarray:
-    """YES payoff (0/1 as float) of `spec` at each settlement value in A."""
-    st = spec.strike_type
-    if st == "greater":
-        return (A > spec.floor_strike).astype(float)
-    if st == "greater_or_equal":
-        return (A >= spec.floor_strike).astype(float)
-    if st == "less":
-        return (A < spec.cap_strike).astype(float)
-    if st == "less_or_equal":
-        return (A <= spec.cap_strike).astype(float)
-    return ((A >= spec.floor_strike) & (A <= spec.cap_strike)).astype(float)
+    """YES payoff (0/1 as float) of `spec` at each settlement AVERAGE in A (rounded to cents like
+    the published expiration value before the strike comparison: ``MarketSpec.yes_wins_vec``)."""
+    return spec.yes_wins_vec(np.asarray(A, dtype=np.float64)).astype(float)
 
 
 def breakpoints(spec: MarketSpec) -> list[float]:
-    return [v for v in (spec.floor_strike, spec.cap_strike) if v is not None]
+    """Settlement averages where the payoff jumps (strikes shifted by the cents rounding)."""
+    return spec.breakpoints()
 
 
 # ----------------------------------------------------------------------------- event grid

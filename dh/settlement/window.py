@@ -1,8 +1,11 @@
 """Settlement-window state for Kalshi crypto contracts (BRTI 60-print average).
 
-Settlement convention (see ``dh.core.market.SettlementSpec``): the expiration value of a
-KXBTCD market expiring at T is the simple average of ``n_obs`` (=60) once-per-second BRTI
-prints stamped at T-59s, ..., T-1s, T (window (T-60s, T]).  This module turns a stream of
+Settlement convention (see ``dh.core.market.SettlementSpec`` and ``dh.settlement.convention``;
+VERIFIED against published ``expiration_value``, docs/research/M1_2_SETTLEMENT_CHECK.md): the
+expiration value of a KXBTCD / KXBTC / KXBTC15M market is the simple average of ``n_obs`` (=60)
+once-per-second BRTI prints stamped at T-59s, ..., T-1s, T (window (T-60s, T]) with
+T = the market's ``close_time`` (NOT ``expected_expiration_time`` = close + 5 min), rounded to
+cents before the strike comparison (``MarketSpec.yes_wins``).  This module turns a stream of
 ``IndexTick`` events into, for any expiration and any "now":
 
     WindowState(n_obs, k_fixed, sum_fixed, m_remaining, tau_first_s, step_s)
@@ -34,21 +37,21 @@ a different value for the same source timestamp is ignored too (first one wins, 
 Kalshi's "duplicate or out-of-order upstream source timestamps are ignored") and counted in
 ``stats['conflicts']``.
 
-Missing seconds (gap policy) -- MUST be verified against Kalshi ``expiration_value``
--------------------------------------------------------------------------------------
+Missing seconds: a No-risk condition, not a modelling detail
+------------------------------------------------------------
 If no print exists for an observation second but a later print does (so none will arrive),
-the second is "missing":
+the second is "missing" and counted in ``WindowState.n_missing``.  The contract terms say that
+if benchmark data is unavailable or incomplete the market resolves **No** (BTC.pdf; CRYPTO.pdf:
+"the affected strikes"), so a gap inside the window is a risk to every YES holder, not a value to
+be imputed: the strategy must not quote at-risk (non-negligible YES) markets of an expiration
+whose window has ``n_missing > 0`` (``dh.strategy.mm``: ``brti_gap_in_window``).  Our feed can
+also miss a second that CF Benchmarks did publish, so the value used meanwhile is still a best
+estimate:
 
 * ``gap_policy='carry_forward'`` (default): use the last print at or before s (from either
-  feed).  Many index averaging methodologies treat a missing publication this way, and it is
-  what "last tick at or before s" on the 5 Hz feed does automatically.
+  feed); what "last tick at or before s" on the 5 Hz feed does automatically.
 * ``gap_policy='skip'``: drop the observation; the settlement is then the average of the
   prints that exist (n_obs shrinks accordingly; WindowState.n_obs == k_fixed + m_remaining).
-
-Which of the two Kalshi/CF Benchmarks actually apply is NOT documented in the vendored specs;
-``dh.research`` must reconcile reconstructed averages with published ``expiration_value`` (and
-with the ``last_60s_windowed_average_15min`` field, which Kalshi streams for quarter-hour
-closes -- every hourly expiry is a quarter-hour close) before trading size.
 
 Pending observations: an observation whose time has passed (obs_time <= now) but whose print
 has not arrived yet (latency) and cannot yet be declared missing is *pending*: it is treated
@@ -90,6 +93,8 @@ class WindowState:
     step_s       spacing of the remaining observations (s)
     n_filled     fixed observations whose value came from the gap policy (diagnostic)
     n_pending    unfixed observations whose time already passed (print not yet received)
+    n_missing    observations declared missing (no print, a later print exists), filled OR
+                 skipped: > 0 means the window is incomplete, a No-risk condition (module doc)
     """
 
     n_obs: int
@@ -100,6 +105,7 @@ class WindowState:
     step_s: float
     n_filled: int = 0
     n_pending: int = 0
+    n_missing: int = 0
 
     def __post_init__(self) -> None:
         if self.k_fixed < 0 or self.m_remaining < 0:
@@ -117,6 +123,11 @@ class WindowState:
     def fixed_avg(self) -> float:
         """Average of the fixed prints ($); nan when nothing is fixed."""
         return self.sum_fixed / self.k_fixed if self.k_fixed else math.nan
+
+    @property
+    def incomplete(self) -> bool:
+        """True when some observation of the window is missing (contract terms: No-risk)."""
+        return self.n_missing > 0
 
     @property
     def is_final(self) -> bool:
@@ -184,6 +195,7 @@ def window_state_from_prints(
     k = 0
     s = 0.0
     filled = 0
+    missing = 0
     last = last_before
     idx_first_unfixed = len(obs)
     for i, t in enumerate(obs):
@@ -192,6 +204,7 @@ def window_state_from_prints(
             break
         v = prints.get(t)
         if v is None:
+            missing += 1
             if gap_policy == "carry_forward" and last is not None:
                 v = last
                 filled += 1
@@ -203,7 +216,8 @@ def window_state_from_prints(
     m = len(obs) - idx_first_unfixed
     tau_first = max(0.0, (obs[idx_first_unfixed] - now_ns) / NS_PER_S) if m > 0 else 0.0
     return WindowState(
-        n_obs=k + m, k_fixed=k, sum_fixed=s, m_remaining=m, tau_first_s=tau_first, step_s=step_s, n_filled=filled
+        n_obs=k + m, k_fixed=k, sum_fixed=s, m_remaining=m, tau_first_s=tau_first, step_s=step_s, n_filled=filled,
+        n_missing=missing,
     )
 
 
@@ -415,6 +429,7 @@ class SettlementTracker:
         k = 0
         s = 0.0
         filled = 0
+        missing = 0
         first_unfixed = len(obs)
         pending = 0
         for i, t in enumerate(obs):
@@ -426,6 +441,8 @@ class SettlementTracker:
                 first_unfixed = i
                 pending = sum(1 for tt in obs[i:] if tt <= now_ns)
                 break
+            if status in ("filled", "skipped"):
+                missing += 1
             if status == "skipped":
                 continue
             k += 1
@@ -448,18 +465,22 @@ class SettlementTracker:
             step_s=step_s,
             n_filled=filled,
             n_pending=pending,
+            n_missing=missing,
         )
 
     def required_remaining_avg(self, K: float, ws: WindowState) -> float:
         """(K * n_obs - sum_fixed) / m_remaining; see module-level ``required_remaining_avg``."""
         return required_remaining_avg(K, ws)
 
-    def settlement_value(self, spec: SettlementSpec, expiration_ns: int) -> float | None:
-        """Reconstructed expiration value once every observation is determined, else None."""
+    def settlement_value(self, spec: SettlementSpec, expiration_ns: int, *, rounded: bool = False) -> float | None:
+        """Reconstructed average once every observation is determined, else None.
+
+        ``rounded=True`` returns it as Kalshi publishes ``expiration_value`` (spec.round_value)."""
         ws = self.window_state(spec, expiration_ns, expiration_ns)
         if ws.m_remaining:
             return None
-        return ws.sum_fixed / ws.n_obs
+        v = ws.sum_fixed / ws.n_obs
+        return spec.round_value(v) if rounded else v
 
     def kalshi_window_avg(self, expiration_ns: int) -> tuple[float, int] | None:
         """Kalshi's own running (avg, count) of the final-minute window closing at expiration.

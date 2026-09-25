@@ -338,8 +338,9 @@ def test_rest_market_to_spec_kxbtcd():
     assert spec.strike_type == "greater" and spec.floor_strike == 114999.99 and spec.cap_strike is None
     assert spec.open_ts == iso_to_ns("2025-08-05T20:00:00Z")
     assert spec.close_ts == spec.expiration_ts == iso_to_ns("2025-08-05T21:00:00Z")
+    assert spec.expected_expiration_ts == iso_to_ns("2025-08-05T21:00:00Z")
     assert spec.price_ranges == (PriceRange(0, 10000, 100),)
-    assert spec.settlement == SettlementSpec(index_id="BRTI", n_obs=60)
+    assert spec.settlement == SettlementSpec(index_id="BRTI", n_obs=60, round_decimals=2)
     assert (spec.fee_type, spec.fee_multiplier) == ("quadratic", 1.0)
     assert spec.is_valid_px(4500) and not spec.is_valid_px(4550)
     assert spec.yes_wins(115000.0) and not spec.yes_wins(114999.99)

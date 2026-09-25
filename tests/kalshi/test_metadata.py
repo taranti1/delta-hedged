@@ -12,6 +12,7 @@ from dh.kalshi.metadata import (
     discover_markets,
     parse_market_ticker,
     refresh_markets,
+    BLOCKING_FLAGS,
     rules_flags,
 )
 from dh.kalshi.wire import iso_to_ns
@@ -20,8 +21,12 @@ from . import samples as S
 
 T = S.MARKET_KXBTCD["ticker"]
 NOW = iso_to_ns("2025-08-05T20:30:00Z")
+RULES_15M = ("If the simple average of the sixty seconds of CF Benchmarks' BRTI before 5:15 PM EDT on Aug 5, 2025 is at "
+             "least the simple average of the sixty seconds of CF Benchmarks' BRTI before 5:00 PM EDT on August 5, 2025, "
+             "then the market resolves to Yes.")
 M15 = S.market(ticker="KXBTC15M-25AUG051715-15", event_ticker="KXBTC15M-25AUG051715", floor_strike=None,
-               close_time="2025-08-05T21:15:00Z", expected_expiration_time="2025-08-05T21:15:00Z")
+               strike_type="greater_or_equal", rules_primary=RULES_15M,
+               close_time="2025-08-05T21:15:00Z", expected_expiration_time="2025-08-05T21:20:00Z")
 SERIES_15M = dict(S.SERIES_KXBTCD, ticker="KXBTC15M")
 EVENT_15M = dict(S.EVENT_KXBTCD, event_ticker="KXBTC15M-25AUG051715", series_ticker="KXBTC15M")
 
@@ -47,8 +52,16 @@ def test_parse_ticker_and_rules_flags():
     assert rules_flags(alt) == []
     bad = S.market(rules_primary="Resolves Yes if BTC trades above 115000 at any time.", floor_strike=115000.0)
     assert set(rules_flags(bad)) == {"rules_no_average", "rules_no_brti", "rules_no_60s_window", "ticker_strike_mismatch"}
-    info = S.market(close_time="2025-08-05T20:59:00Z", fee_waiver_expiration_time="2025-08-06T00:00:00Z")
+    # expected_expiration_time = close + 5 min (every real KXBTC* market): informational only
+    info = S.market(expected_expiration_time="2025-08-05T21:05:00Z", fee_waiver_expiration_time="2025-08-06T00:00:00Z")
     assert rules_flags(info) == ["expiration_differs_from_close", "fee_waiver_present"]
+    # close_time disagreeing with the rules text / event ticker: T ambiguous -> blocking
+    moved = S.market(close_time="2025-08-05T20:59:00Z", rules_primary=S.RULES_KXBTCD)
+    assert "settlement_time_mismatch" in rules_flags(moved) and "settlement_time_mismatch" in BLOCKING_FLAGS
+    # nothing to cross-check (synthetic ticker, no parseable time in the rules): informational
+    unk = S.market(ticker="KXBTCD-SYNTH-T114999.99", event_ticker="KXBTCD-SYNTH", rules_primary="simple average of sixty seconds of BRTI")
+    assert rules_flags(unk) == ["settlement_time_unverified"]
+    assert "no_expected_expiration_time" not in BLOCKING_FLAGS
 
 
 def test_registry_build_rejections_and_tradability():

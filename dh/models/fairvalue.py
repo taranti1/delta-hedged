@@ -25,9 +25,12 @@ i.e. iff R beats the *required remaining average*  K_req = (K * n - sum_fixed) /
     gamma = d2P/dspot2 (per $^2)
 
 Greeks are analytic in the tail density: for greater, delta = pdf(z)/sd, gamma = -pdf'(z)/sd^2.
-Strict vs non-strict inequalities only differ on a null set in the continuous model; they are
-honoured exactly when the outcome is already determined (m = 0 or sd = 0) via
-``MarketSpec.yes_wins``.
+Kalshi compares the expiration value ROUNDED to cents with the strike, so the continuous model
+uses the equivalent thresholds on the unrounded average, ``MarketSpec.settle_thresholds`` (e.g.
+"above 92799.99" -> A >= 92799.995; "at least 83950.62" -> A >= 83950.615). Strict vs non-strict
+inequalities then only differ on a null set; they are honoured exactly when the outcome is
+already determined (m = 0 or sd = 0) via ``MarketSpec.yes_wins`` (which rounds). ``digital_vec``
+takes raw floor/cap arrays (research use; pass the thresholds for the exact convention).
 
 Scalar API:     digital(spec, ws, spot, sigma_abs, tail, drift_abs) -> Digital
 Vectorized API: digital_vec(...) (arrays of strikes / spots / sds, used by research)
@@ -322,18 +325,19 @@ def digital(
         return Digital(p_yes=1.0 if yes else 0.0, delta=0.0, gamma=0.0, sd_remaining=sd, z=z, z_cap=z_cap)
     mu = spot + drift_abs
     st = spec.strike_type
+    k_lo, k_hi = spec.settle_thresholds  # thresholds on the unrounded average (cents rounding)
     if st in _UPPER:
-        kf = required_remaining_avg(float(spec.floor_strike), ws)  # type: ignore[arg-type]
+        kf = required_remaining_avg(float(k_lo), ws)  # type: ignore[arg-type]
         z = (kf - mu) / sd
         p, d, g = _upper_prob(tail_m, np.float64(z), np.float64(sd))
         return Digital(float(p), float(d), float(g), sd, float(z))
     if st in _LOWER:
-        kc = required_remaining_avg(float(spec.cap_strike), ws)  # type: ignore[arg-type]
+        kc = required_remaining_avg(float(k_hi), ws)  # type: ignore[arg-type]
         z = (kc - mu) / sd
         p, d, g = _lower_prob(tail_m, np.float64(z), np.float64(sd))
         return Digital(float(p), float(d), float(g), sd, float(z))
-    kf = required_remaining_avg(float(spec.floor_strike), ws)  # type: ignore[arg-type]
-    kc = required_remaining_avg(float(spec.cap_strike), ws)  # type: ignore[arg-type]
+    kf = required_remaining_avg(float(k_lo), ws)  # type: ignore[arg-type]
+    kc = required_remaining_avg(float(k_hi), ws)  # type: ignore[arg-type]
     zf, zc = (kf - mu) / sd, (kc - mu) / sd
     p, d, g = _between_prob(tail_m, np.float64(zf), np.float64(zc), np.float64(sd))
     return Digital(float(p), float(d), float(g), sd, float(zf), float(zc))

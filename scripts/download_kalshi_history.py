@@ -531,7 +531,8 @@ async def download(
                     await _candles(rest, series, et, markets, msrc, candle_period, skip_zero_volume, out, sem, stats)
                     ck_c.mark(et)
                 if need_b and markets:
-                    exp_ns = max(opt_iso_to_ns(m.get("expected_expiration_time")) or opt_iso_to_ns(m.get("close_time")) for m in markets)
+                    # T = close_time (dh.settlement.convention); expected_expiration_time is close + 5 min
+                    exp_ns = max(opt_iso_to_ns(m.get("close_time")) for m in markets)
                     rows, raw = await fetch_brti(rest, et, exp_ns, brti_window_s, brti_timespan, brti_timestamp)
                     write_parquet(out / "brti" / f"series={series}" / f"{et}.parquet", rows, BRTI_SCHEMA)
                     write_json(out / "brti" / f"series={series}" / f"{et}.raw.json", raw)

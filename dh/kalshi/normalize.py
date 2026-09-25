@@ -801,14 +801,16 @@ BTC_INDEX_BY_SERIES_PREFIX = (("KXBTC", "BRTI"),)
 
 
 def default_settlement(series_ticker: str) -> SettlementSpec | None:
-    """BRTI 60 x 1s average for KXBTC* series (KXBTCD, KXBTC, KXBTC15M); None otherwise.
+    """BRTI 60 x 1s average, rounded to cents, for KXBTC* series (KXBTCD, KXBTC, KXBTC15M); None
+    otherwise.
 
-    MUST be validated per series against rules_primary (dh.kalshi.metadata.rules_flags) and
-    settled markets' expiration_value before trading.
+    Convention VERIFIED on settled markets (dh.settlement.convention,
+    docs/research/M1_2_SETTLEMENT_CHECK.md): window (close_time - 60 s, close_time], published
+    expiration value = average rounded half-up to 2 decimals.
     """
     for prefix, index_id in BTC_INDEX_BY_SERIES_PREFIX:
         if series_ticker.startswith(prefix):
-            return SettlementSpec(index_id=index_id, n_obs=60)
+            return SettlementSpec(index_id=index_id, n_obs=60, round_decimals=2)
     return None
 
 
@@ -831,16 +833,24 @@ def rest_market_to_spec(
 ) -> MarketSpec:
     """openapi Market (+ optional Series, EventData) -> MarketSpec.
 
-    Times: open_time, close_time, expected_expiration_time (fallback close_time) -> ns.
+    Times: open_time, close_time -> ns. The settlement reference time T (``expiration_ts``) is
+    ``close_time`` (VERIFIED: "the simple average of the sixty seconds of BRTI before 3 PM EDT"
+    with close_time = 3 PM EDT; ``expected_expiration_time`` is close + 5 min on every KXBTC*
+    market and is kept only as metadata in ``expected_expiration_ts``). T is cross-checked against
+    the time stated in ``rules_primary`` (the contract's definition): a disagreement raises
+    UnsupportedMarket (never trade a market whose settlement time is ambiguous). The event-ticker
+    time is checked by ``dh.kalshi.metadata.rules_flags`` (blocking flag
+    ``settlement_time_mismatch`` when the rules text states no parseable time).
     Tick grid: market.price_ranges (authoritative; price_level_structure is only a label).
     Fees: event fee_type_override/fee_multiplier_override > series fee_type/fee_multiplier >
-    market fields; unresolved -> fee_type ''. Settlement: explicit arg, else BRTI/60 obs for
-    KXBTC* series, else UnsupportedMarket. Raises UnsupportedMarket for unsupported strike
+    market fields; unresolved -> fee_type ''. Settlement: explicit arg, else BRTI/60 obs/cents
+    for KXBTC* series, else UnsupportedMarket. Raises UnsupportedMarket for unsupported strike
     types, missing strikes or a missing tick grid.
     """
     from dh.kalshi.fees import (
         resolve_fee_fields,  # local import: fees does not import us
     )
+    from dh.settlement.convention import rules_settlement_time_ns
 
     ticker = str(market["ticker"])
     strike_type = str(market.get("strike_type") or "")
@@ -854,8 +864,12 @@ def rest_market_to_spec(
     if settle is None:
         raise UnsupportedMarket(f"{ticker}: no settlement model for series {series_ticker!r}")
     close_ns = iso_to_ns(str(market["close_time"]))
+    rules_T = rules_settlement_time_ns(market.get("rules_primary"))
+    if rules_T is not None and rules_T != close_ns:  # the contract's own definition disagrees
+        raise UnsupportedMarket(f"{ticker}: settlement time ambiguous (rules_primary time {rules_T // 10**9} "
+                                f"!= close_time {close_ns // 10**9})")
     exp_raw = market.get("expected_expiration_time")
-    exp_ns = iso_to_ns(str(exp_raw)) if exp_raw else close_ns
+    expected_ns = iso_to_ns(str(exp_raw)) if exp_raw else 0
     fee_type, mult, _src = resolve_fee_fields(series, event, market)
     base_type, base_mult, _bsrc = resolve_fee_fields(series, None, market)  # without event override
     floor = market.get("floor_strike")
@@ -870,7 +884,7 @@ def rest_market_to_spec(
             cap_strike=None if cap is None else float(cap),
             open_ts=opt_iso_to_ns(market.get("open_time")),
             close_ts=close_ns,
-            expiration_ts=exp_ns,
+            expiration_ts=close_ns,  # T = close_time (see docstring), never expected_expiration_time
             settlement=settle,
             price_ranges=tuple(PriceRange(s, e, st) for s, e, st in ranges),
             fee_type=fee_type,
@@ -878,6 +892,7 @@ def rest_market_to_spec(
             title=str(market.get("title") or market.get("yes_sub_title") or ""),
             base_fee_type=base_type,
             base_fee_multiplier=float(base_mult) if base_mult is not None else None,
+            expected_expiration_ts=expected_ns,
         )
     except ValueError as exc:  # MarketSpec validation (e.g. strike missing)
         raise UnsupportedMarket(str(exc)) from exc

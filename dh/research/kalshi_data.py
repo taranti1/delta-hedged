@@ -6,7 +6,12 @@ the minimal research schema used in tests:
   trades:  ticker, ts_ms, yes_px (int 1e-4 $), qty (int 0.01), taker_side | taker_outcome_side,
            [is_block_trade], [event_ticker, series_ticker, ...]
   markets: ticker, event_ticker, strike_type, floor_strike, cap_strike, result,
-           expiration_ts_ms | expected_expiration_ts_ms | close_ts_ms, [open_ts_ms]
+           expiration_ts_ms | close_ts_ms, [open_ts_ms]
+
+Settlement time (VERIFIED, dh.settlement.convention): T = close_time. ``expiration_ts_ms`` is
+taken from ``close_ts_ms`` when the table does not carry it; ``expected_expiration_ts_ms``
+(close + 5 min on every KXBTC* market) is metadata and is NEVER used as T (using it made tau
+5 minutes too long and the final-minute segments wrong).
 
 Rules (audit M6): block trades (matched off book via RFQ / negotiated blocks) are dropped; they
 are neither maker fills nor taker flow on the order book. Trade-side event/series columns are
@@ -62,12 +67,10 @@ def normalize_trades(trades: pd.DataFrame) -> pd.DataFrame:
 def normalize_markets(markets: pd.DataFrame) -> pd.DataFrame:
     m = markets.copy()
     if "expiration_ts_ms" not in m.columns:
-        for alt in ("expected_expiration_ts_ms", "close_ts_ms"):
-            if alt in m.columns:
-                m["expiration_ts_ms"] = m[alt]
-                break
-        else:
-            raise KeyError("markets need expiration_ts_ms / expected_expiration_ts_ms / close_ts_ms")
+        if "close_ts_ms" not in m.columns:
+            raise KeyError("markets need expiration_ts_ms or close_ts_ms (T = close_time; "
+                           "expected_expiration_ts_ms is close + 5 min and is not the settlement time)")
+        m["expiration_ts_ms"] = m["close_ts_ms"]
     for c in ("floor_strike", "cap_strike"):
         if c not in m.columns:
             m[c] = float("nan")

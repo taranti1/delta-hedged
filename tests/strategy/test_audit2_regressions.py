@@ -118,3 +118,33 @@ def test_fee_override_reprices_the_cached_order_fee():
     assert d.mm._order_fee(TICK, 5000, 4.0, "bid") == pytest.approx(0.005)  # ceil(1.75c) / 4
     d.feed(KalshiFeeUpdate(T0, 0, "KXBTCD-TEST", "quadratic", "1"))  # makers no longer pay
     assert d.mm._order_fee(TICK, 5000, 5.0, "bid") == 0.0
+
+
+def _window_run(gap: bool):
+    """ATM market expiring 70 s after T0 (window opens at T0 + 10 s); final-window guard off so
+    only the BRTI-gap rule can stop quoting. With ``gap`` the benchmark skips 1.4 s inside the
+    window (no 1 Hz or 5 Hz print for one observation second; below the 3 s staleness limit)."""
+    base = default_kat_config()
+    cfg = replace(base, quoting=replace(base.quoting, min_tau_s=0.0, clip_contracts=1.0))
+    exp = T0 + 70 * NS_PER_S
+    d = Driver([spec(exp=exp)], cfg=cfg)
+    _ready(d, bid=4000, no_bid=4000)
+    d.advance(T0 + 20 * NS_PER_S)
+    if gap:
+        d.now += 1400 * 1_000_000  # silent 1.4 s: the print for second T0+21 s is missing
+    acts = d.advance(T0 + 40 * NS_PER_S)
+    return d, acts
+
+
+def test_brti_gap_inside_settlement_window_pulls_at_risk_quotes():
+    """Contract terms: missing/incomplete benchmark data resolves No, so a gap inside the window is
+    a No-risk condition: at-risk (non-negligible YES) markets are not quoted; control run quotes."""
+    ctl, _ = _window_run(gap=False)
+    live = [w for w in ctl.mm.om.working(TICK) if not w.cancel_requested]
+    assert live and ctl.mm.stats.reasons.get("brti_gap_in_window", 0) == 0
+    d, acts = _window_run(gap=True)
+    ws = d.mm.tracker.window_state(d.mm.specs[TICK].settlement, d.mm.specs[TICK].expiration_ts, d.now)
+    assert ws.n_missing >= 1
+    assert d.mm.stats.reasons.get("brti_gap_in_window", 0) > 0
+    assert not _places(acts)
+    assert all(w.cancel_requested for w in d.mm.om.working(TICK))  # resting quotes were pulled

@@ -155,7 +155,7 @@ def _flow_sample(n_markets: int, t_open_ms: int = 1_790_000_000_000):
     for i in range(n_markets):
         o = t_open_ms + i * H_MS
         mk.append(dict(ticker=f"M{i:03d}", event_ticker=f"EM{i:03d}", strike_type="greater", floor_strike=100_000.0,
-                       cap_strike=np.nan, result="no", open_ts_ms=o, expected_expiration_ts_ms=o + H_MS))
+                       cap_strike=np.nan, result="no", open_ts_ms=o, close_ts_ms=o + H_MS))
         for k in range(60):
             rows.append(dict(ticker=f"M{i:03d}", ts_ms=o + 60_000 * k + 20_000, yes_px=5000, qty=100,
                              taker_outcome_side="no"))

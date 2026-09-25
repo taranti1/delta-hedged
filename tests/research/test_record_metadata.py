@@ -17,7 +17,7 @@ from dh.store.recorder import Recorder
 REPO = Path(__file__).resolve().parents[2]
 T0 = 1_790_251_200 * 10**9  # 2026-09-24T12:00Z
 SERIES = {"ticker": "KXBTCD", "fee_type": "quadratic", "fee_multiplier": 1}
-EVENT = "KXBTCD-26SEP2413"
+EVENT = "KXBTCD-26SEP2409"  # event tickers carry New York time: 09:00 EDT = 13:00Z close
 
 
 def _market(k: float) -> dict[str, Any]:
