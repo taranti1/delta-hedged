@@ -11,7 +11,7 @@ echo $$ > data/logs/paper_loop.pid
 while true; do
   if [ -e "$KILL_FILE" ]; then echo "$(date -u +%FT%TZ) kill file present: paper loop stops"; exit 0; fi
   echo "$(date -u +%FT%TZ) paper session starting"
-  .venv/bin/python scripts/run_live.py --config config/m1.yaml --live-config config/live.yaml \
+  .venv/bin/python scripts/run_live.py --config config/m1.yaml --live-config config/paper.yaml \
       --mode paper --duration 86400
   rc=$?
   echo "$(date -u +%FT%TZ) paper session exited rc=$rc"
