@@ -141,15 +141,18 @@ Results so far:
   - All ten ran end to end on a synthetic 4-event recording (`docs/research/synthetic_demo/`).
     Every verdict there is INCONCLUSIVE by design: the demo validates the pipelines, never
     edge.
-  - **Do not act on any experiment verdict until the fixes from the independent review
-    land.** The review found decision-rule defects that can produce false ACCEPTs:
-    - E1 tested the wrong statistic;
-    - some verdicts did not require results under both B and C;
-    - the latency flag was ignored by the maker replays;
-    - strike selection used a future price;
-    - segment searches had no multiple-comparison control;
-    - inference clustered by event ticker instead of by expiration.
-    The fixes are in progress, and each comes with a null (zero-effect) test.
+  - An independent review found 22 decision-rule and inference defects; all are fixed
+    (5 critical, 8 major, 9 minor):
+    - E1 now tests the lag coefficient on past external moves;
+    - every verdict needs results under both B and C;
+    - latency, including market-data delay, reaches every replay;
+    - strike selection is causal;
+    - segment searches use Holm correction, and E6/E7 confirm on a later sample;
+    - inference clusters by expiration;
+    - fees include Kalshi's per-order rounding;
+    - in-sample or synthetic results are capped at INCONCLUSIVE.
+  - Each fix has a test that fails on the audited code, and the null (zero-effect) tests never
+    ACCEPT on any verdict path.
 
 ---------------------------------------------------------------------------------------------
 ## F. M1: the simplest version that can trade tiny size safely and produce useful data
