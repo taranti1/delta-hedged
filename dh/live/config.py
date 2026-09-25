@@ -29,11 +29,32 @@ LIVE_CONFIRM_FLAG = "--i-understand-this-sends-real-orders"
 class PathsCfg:
     # Recorder root: <data_root>/raw/<stream>/... Must NOT be the collector's root
     # (scripts/record.py): two processes writing kalshi.ws into one store would interleave
-    # two connections' sequence numbers.
+    # two connections' sequence numbers. One runner per data_root: the runner holds
+    # <data_root>/runner.lock (flock) while it runs.
     data_root: str = "data/live"
     log_dir: str = "data/live_logs"  # JSON-lines decision/action logs
-    kill_file: str = "/run/dh/KILL"  # touch it to cancel everything and stop
-    heartbeat_file: str = "/run/dh/heartbeat.json"  # read by scripts/watchdog.py
+    kill_file: str = "/run/dh/KILL"  # touch it to cancel everything and stop (live AND paper)
+    heartbeat_file: str = "/run/dh/heartbeat.json"  # LIVE runner; read by scripts/watchdog.py
+    paper_heartbeat_file: str = "/run/dh/heartbeat.paper.json"  # paper runner (never the watchdog's file)
+    # per-UTC-day risk state (day P&L, carried halt, pause); '' = <data_root>/state/risk_state.<mode>.json
+    risk_state_file: str = ""
+
+    def heartbeat_for(self, mode: str) -> str:
+        """The heartbeat file of a runner in ``mode``: paper never writes the live file (a paper
+        runner beating into it would look like the live runner to the watchdog)."""
+        if mode == "live":
+            return self.heartbeat_file
+        if self.paper_heartbeat_file and self.paper_heartbeat_file != self.heartbeat_file:
+            return self.paper_heartbeat_file
+        p = Path(self.heartbeat_file)
+        return str(p.with_name(f"{p.stem}.paper{p.suffix or '.json'}"))
+
+    def risk_state_for(self, mode: str) -> str:
+        """Risk-state file of ``mode`` (paper and live never share one)."""
+        if self.risk_state_file:
+            p = Path(self.risk_state_file)
+            return str(p if mode == "live" else p.with_name(f"{p.stem}.paper{p.suffix or '.json'}"))
+        return str(Path(self.data_root) / "state" / f"risk_state.{mode}.json")
 
 
 @dataclass(frozen=True)
@@ -48,23 +69,44 @@ class LoopCfg:
     heartbeat_interval_s: float = 0.5
     kill_check_interval_s: float = 0.2  # checked on the consumer loop at least this often
     metrics_refresh_s: float = 1.0
-    max_lag_s: float = 1.0  # consumer lag above this blocks NEW orders until it recovers
+    # Data lag above this (the larger of the runner-queue lag and the exchange-time lag of
+    # Kalshi market data, see LiveRunner) closes the order gate AND tells the strategy
+    # (FeedStatus 'runner.lag' stale -> it cancels its quotes); both reopen once fresh data
+    # has shown a lag below max_lag_s / 2 for lag_resume_s.
+    max_lag_s: float = 1.0
+    lag_resume_s: float = 2.0
+    lag_window_s: float = 600.0  # trailing window of the exchange-time latency baseline
+    lag_confirm_s: float = 0.5  # exchange-time lag = the SMALLEST excess age over this window
+    yield_items: int = 64  # the consumer yields to the event loop at least every N items ...
+    yield_ms: float = 5.0  # ... or N ms of work, and always after dispatching orders
     shutdown_timeout_s: float = 10.0
-    strategy_error: str = "stop"  # stop (fail safe) | continue (paper debugging only)
+    strategy_error: str = "stop"  # stop (fail safe) | continue (paper debugging only; refused live)
     clock_sample_s: float = 60.0  # chrony/adjtimex sample to the 'clock' stream; 0 = off
-    clock_alarm_ms: float = 5.0
+    clock_alarm_ms: float = 5.0  # |offset| above this: alarm (metric + log)
+    clock_block_ms: float = 250.0  # |offset| above this on clock_block_samples samples in a row:
+    clock_block_samples: int = 2  # new orders blocked until it recovers
+    risk_state_interval_s: float = 2.0  # persist day P&L / halt / pause this often (0 = off)
+
+    def __post_init__(self) -> None:
+        if self.strategy_error not in ("stop", "continue"):
+            raise ValueError(f"loop.strategy_error must be 'stop' or 'continue', got {self.strategy_error!r}")
 
 
 @dataclass(frozen=True)
 class VenueCfg:
-    subaccount: int | None = None  # Kalshi subaccount (None = primary / omitted)
+    # Kalshi subaccount (null / 0 = primary). ALWAYS sent explicitly (0 for primary): Kalshi
+    # reads an omitted subaccount as "all subaccounts" on GET orders/fills and cancel-all.
+    subaccount: int | None = None
     max_batch: int = 20  # places / cancels per batched request (also capped by the write bucket)
     max_place_wait_s: float = 0.5  # never send a quote that would wait longer than this for write tokens
     self_trade_prevention: str = "taker_at_cross"
     reconcile_backoff_s: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
     reconcile_missing_after_s: float = 30.0  # unknown create not found this long -> rejected
     reconcile_min_attempts: int = 3
-    max_cancel_retries: int = 5
+    create_match_skew_s: float = 2.0  # a lookup match must be created >= request time - this
+    missing_recheck_s: tuple[float, ...] = (10.0, 30.0)  # re-look for a create declared missing
+    max_cancel_retries: int = 5  # re-cancels of a still-resting order before the stuck alarm
+    recancel_backoff_max_s: float = 5.0  # (re-cancelling never stops while the order rests)
     queue_positions_interval_s: float = 2.0  # GET /portfolio/orders/queue_positions; 0 = off
     queue_positions_resync: bool = False  # True: overwrite the estimator (breaks replay parity)
     queue_positions_max_tickers: int = 20
@@ -72,10 +114,20 @@ class VenueCfg:
     positions_interval_s: float = 30.0  # GET /portfolio/positions reconciliation; 0 = off
     position_confirm_s: float = 5.0  # a mismatch must persist this long before it halts
     ghost_sweep: bool = True  # cancel resting orders the strategy does not know about
-    startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start
-    exclude_events_with_positions: bool = True  # never trade events we already hold at start
+    fills_backfill_interval_s: float = 60.0  # GET /portfolio/fills safety net (0 = off)
+    fills_backfill_margin_s: float = 120.0  # look-back overlap of every fill back-fill
+    reconnect_settle_s: float = 2.0  # after a WS reconnect, let subscriptions settle, then reconcile
+    reconcile_retry_max_s: float = 30.0
+    startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start (live: required)
+    cancel_all_hold_s: float = 60.0  # Kalshi may cancel orders placed within 1 min of a cancel-all
+    exclude_events_with_positions: bool = True  # never trade events we already hold at start (live: required)
     shutdown_delete_group: bool = True
     halt_on_fee_mismatch: bool = True
+
+    @property
+    def sub(self) -> int:
+        """The subaccount number sent on every request (0 = primary)."""
+        return int(self.subaccount) if self.subaccount is not None else 0
 
 
 @dataclass(frozen=True)
@@ -137,6 +189,7 @@ class WatchdogCfg:
     repeat_s: float = 30.0  # repeat while still stale (orders placed in flight)
     max_repeats: int = 10
     only_live: bool = True  # ignore heartbeats written by paper runners
+    stopping_grace_s: float = 5.0  # a 'stopping' runner older than its shutdown_timeout_s + this is stuck
     key_id_env: str = "KALSHI_WATCHDOG_KEY_ID"  # optional separate API key (falls back to the main one)
     private_key_path_env: str = "KALSHI_WATCHDOG_PRIVATE_KEY_PATH"
 
@@ -205,6 +258,20 @@ class ModeError(SystemExit):
 
     def __str__(self) -> str:
         return self.message
+
+
+def live_config_problems(cfg: LiveConfig) -> list[str]:
+    """Settings that are refused in live mode (each is safe only for paper debugging)."""
+    out = []
+    if cfg.loop.strategy_error != "stop":
+        out.append("loop.strategy_error must be 'stop' in live mode (a strategy exception must stop trading)")
+    if not cfg.venue.exclude_events_with_positions:
+        out.append("venue.exclude_events_with_positions must be true in live mode (positions held at start-up "
+                   "are not seeded into the strategy: its first fill there would be a position mismatch)")
+    if not cfg.venue.startup_cancel_all:
+        out.append("venue.startup_cancel_all must be true in live mode (leftover orders must be cancelled "
+                   "before positions are read)")
+    return out
 
 
 def resolve_mode(cli_mode: str | None, config_mode: str, confirmed: bool) -> str:
