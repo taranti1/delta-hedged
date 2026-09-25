@@ -176,8 +176,16 @@ class QueueEstimator:
         *,
         match_window_ns: int = 250 * NS_PER_MS,
         book_includes_own: bool = False,
+        exch_offset_ns: int | None = None,
     ) -> None:
+        """exch_offset_ns: when set, market events carrying an exchange timestamp (ts_exch) are
+        placed on this estimator's clock at ts_exch + exch_offset_ns, and only orders that had
+        arrived by then take part in that match (a sweep reported late by the feed cannot fill
+        an order that arrived after the sweep executed). None = use receive time only."""
         self.policy = normalize_policy(policy)
+        self.exch_offset_ns = exch_offset_ns
+        self._arrivals: list[tuple[int, int]] = []  # (arrival ts, seq), sorted by ts
+        self._arr_prefmax: list[int] = []
         self._level_qty = level_qty or (lambda ticker, book, px: 0)
         self.match_window_ns = int(match_window_ns)
         self.book_includes_own = book_includes_own
@@ -202,6 +210,7 @@ class QueueEstimator:
         if key in self.orders:
             raise ValueError(f"duplicate queue key {key!r}")
         self._seq += 1
+        self._note_arrival(ts, self._seq)
         book, px = resting_book(book_side), book_px(book_side, yes_px)
         o = QueueOrder(key, ticker, book, px, int(qty), 0, self._seq, ts, pending)
         self.orders[key] = o
@@ -303,7 +312,8 @@ class QueueEstimator:
                 self.stats["delta_matched_trade"] += explained
             rest = vol - explained
             if rest > 0:
-                it = _Pend(ev.ts, rest, lvl, "d", level_before=self._level_excl(lvl) + rest, max_seq=self._seq)
+                it = _Pend(ev.ts, rest, lvl, "d", level_before=self._level_excl(lvl) + rest,
+                           max_seq=self._seq_at(self._event_time(ev)))
                 self._pend_depl.setdefault(lvl, deque()).append(it)
                 self._fifo.append(it)
             return []
@@ -313,32 +323,47 @@ class QueueEstimator:
 
     def on_trade(self, tr: KalshiTrade) -> list[QueueFill]:
         """Process a public trade print; returns our fill capacity (caller applies fills and
-        then calls ``on_own_fill``). Updates the queue ahead of our orders at/through the price."""
+        then calls ``on_own_fill``). Updates the queue ahead of our orders at/through the price.
+
+        A print can explain book depletions that arrived BEFORE it (delta-first). That part of
+        the volume matched at the exchange when only the orders resting at that delta existed,
+        so it may fill / decrement only orders with seq <= the depletion's max_seq (audit C1:
+        orders that joined after the match must not be filled or double-decremented). Only
+        the unmatched, trade-first remainder applies to every current order.
+        """
         self._expire(tr.ts)
         if tr.is_block or tr.qty <= 0:
             return []
         book, p = trade_maker_book(tr)
         lvl: Level = (tr.ticker, book, p)
         v = tr.qty
-        matched = self._consume(self._pend_depl, lvl, v)
+        chunks: list[tuple[int, int | None]] = self._consume_chunks(self._pend_depl, lvl, v)
+        matched = sum(c for c, _ in chunks)
         if matched:
             self.stats["trade_matched_delta"] += matched
         if v - matched > 0:
             it = _Pend(tr.ts, v - matched, lvl, "t")
             self._pend_trade.setdefault(lvl, deque()).append(it)
             self._fifo.append(it)
-        fills = self._fills_through(tr.ticker, book, p, v, cross=False)
+            chunks.append((v - matched, self._seq_at(self._event_time(tr)) if self.exch_offset_ns is not None else None))
+        fills: list[QueueFill] = []
+        used: dict[str, int] = {}
         levels = self._side.get((tr.ticker, book))
-        if levels:
+        for vol, max_seq in chunks:
+            for k, f, mech in self._fills_through(tr.ticker, book, p, vol, cross=False, max_seq=max_seq, used=used):
+                used[k] = used.get(k, 0) + f
+                fills.append((k, f, mech))
+            if not levels:
+                continue
             for px, keys in levels.items():
                 if px < p:
                     continue
                 for k in keys:
                     o = self.orders[k]
-                    if o.pending:
+                    if o.pending or (max_seq is not None and o.seq > max_seq):
                         continue
                     if px == p:
-                        o.queue_ahead = max(0, o.queue_ahead - v)
+                        o.queue_ahead = max(0, o.queue_ahead - vol)
                     elif self.policy != "conservative":
                         o.queue_ahead = 0  # price priority: the whole level ahead of us traded
         return fills
@@ -372,6 +397,33 @@ class QueueEstimator:
                 "rmse": (sum(e * e for e in errs) / n) ** 0.5}
 
     # ------------------------------------------------------------------ internals
+    def _note_arrival(self, ts: int, seq: int) -> None:
+        import bisect
+
+        i = bisect.bisect_right([a[0] for a in self._arrivals], ts) if self._arrivals and ts < self._arrivals[-1][0] \
+            else len(self._arrivals)
+        self._arrivals.insert(i, (ts, seq))
+        pm = self._arr_prefmax[i - 1] if i > 0 else 0
+        self._arr_prefmax[i:] = []
+        for _, sq in self._arrivals[i:]:
+            pm = max(pm, sq)
+            self._arr_prefmax.append(pm)
+
+    def _event_time(self, ev) -> int:
+        te = getattr(ev, "ts_exch", 0)
+        if self.exch_offset_ns is not None and te:
+            return min(ev.ts, te + self.exch_offset_ns)
+        return ev.ts
+
+    def _seq_at(self, t: int) -> int:
+        """Largest seq among orders that had arrived by time t (0 if none)."""
+        import bisect
+
+        if not self._arrivals:
+            return 0
+        i = bisect.bisect_right(self._arrivals, (t, 1 << 62)) - 1
+        return self._arr_prefmax[i] if i >= 0 else 0
+
     def _own_at(self, lvl: Level) -> int:
         keys = self._side.get((lvl[0], lvl[1]), {}).get(lvl[2], [])
         return sum(self.orders[k].remaining for k in keys if not self.orders[k].pending)
@@ -388,6 +440,26 @@ class QueueEstimator:
 
     def _arrival_queue(self, o: QueueOrder) -> int:
         return max(0, self._level_excl(o.level) - self._pending_total(self._pend_trade, o.level))
+
+    def _consume_chunks(self, table: dict[Level, deque[_Pend]], lvl: Level, vol: int) -> list[tuple[int, int | None]]:
+        """Like _consume, but returns [(volume, max_seq of the pending item it matched)]."""
+        dq = table.get(lvl)
+        if not dq:
+            return []
+        out: list[tuple[int, int | None]] = []
+        used = 0
+        while dq and used < vol:
+            it = dq[0]
+            take = min(it.vol, vol - used)
+            if take > 0:
+                out.append((take, it.max_seq))
+            it.vol -= take
+            used += take
+            if it.vol <= 0:
+                dq.popleft()
+        if not dq:
+            del table[lvl]
+        return out
 
     def _consume(self, table: dict[Level, deque[_Pend]], lvl: Level, vol: int) -> int:
         dq = table.get(lvl)
@@ -444,8 +516,13 @@ class QueueEstimator:
                 continue
             o.queue_ahead = min(cancel_update(o.queue_ahead, it.level_before, vol, self.policy), bound)
 
-    def _fills_through(self, ticker: str, book: str, p: int, v: int, *, cross: bool) -> list[QueueFill]:
-        """Fill capacity of volume v reaching book ``book`` at price p (see module doc)."""
+    def _fills_through(self, ticker: str, book: str, p: int, v: int, *, cross: bool, max_seq: int | None = None,
+                       used: dict[str, int] | None = None) -> list[QueueFill]:
+        """Fill capacity of volume v reaching book ``book`` at price p (see module doc).
+
+        max_seq: only orders with seq <= max_seq existed when this volume matched (others are
+        skipped entirely). used: capacity already assigned to an order by earlier volume of
+        the same print (reduces its remaining)."""
         levels = self._side.get((ticker, book))
         if not levels or v <= 0:
             return []
@@ -462,13 +539,16 @@ class QueueEstimator:
             level_q = 0
             for k in levels[px]:
                 o = self.orders[k]
-                if o.pending:
+                if o.pending or (max_seq is not None and o.seq > max_seq):
+                    continue
+                rem = o.remaining - (used.get(k, 0) if used else 0)
+                if rem <= 0:
                     continue
                 q = o.queue_ahead if use_q else 0
-                f = min(o.remaining, max(0, v - (blocked + q + same)))
+                f = min(rem, max(0, v - (blocked + q + same)))
                 if f > 0:
                     out.append((k, f, mech))
-                same += o.remaining
+                same += rem
                 level_q = max(level_q, q)
             blocked += level_q + same
             if blocked >= v:
@@ -479,7 +559,8 @@ class QueueEstimator:
         # A new level on book X at px_X is a YES-equivalent offer crossing our orders on the
         # opposite book at px >= 1 - px_X (NO bid q == YES ask 1-q; YES bid p == NO ask 1-p).
         opp = "no" if ev.side == "yes" else "yes"
-        return self._fills_through(ev.ticker, opp, PX_SCALE - ev.px, ev.delta, cross=True)
+        ms = self._seq_at(self._event_time(ev)) if self.exch_offset_ns is not None else None
+        return self._fills_through(ev.ticker, opp, PX_SCALE - ev.px, ev.delta, cross=True, max_seq=ms)
 
 
 class QueueCalibrator:

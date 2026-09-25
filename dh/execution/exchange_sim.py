@@ -155,7 +155,8 @@ class KalshiExchangeSim:
         self.md_offset = self.latency.md_offset_ns
         self.emit_order_updates = emit_order_updates
         self.id_prefix = id_prefix
-        self.queue = QueueEstimator(self.policy, self._level_qty, match_window_ns=match_window_ns)
+        self.queue = QueueEstimator(self.policy, self._level_qty, match_window_ns=match_window_ns,
+                                    exch_offset_ns=self.md_offset)
         self.markets: dict[str, _Market] = {}
         self.orders: dict[str, _SimOrder] = {}  # order_id -> order (all, including done)
         self._resting: dict[str, _SimOrder] = {}  # order_id -> resting order (insertion ordered)
