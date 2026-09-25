@@ -74,13 +74,26 @@ def test_tracker_before_and_inside_window_1hz():
 
 
 def test_1hz_ticks_with_millisecond_offsets_map_to_their_second():
+    """Audit m9: Kalshi averages the prints in (close - 60 s, close], so a 1 Hz tick with source
+    time u is the print for second ceil(u) (a tick at s - 1 s + 123 ms belongs to second s)."""
     tr = SettlementTracker()
     for t in range(T - 70 * S, T + 2 * S, S):
         tr.on_index(tick(t + 123 * NS_PER_MS, val(t)))
-    # obs at second s is the tick stamped in [s, s+1)
     status, v = tr.print_for(T - 59 * S)
-    assert status == "exact" and v == val(T - 59 * S)
-    assert tr.settlement_value(SPEC, T) == pytest.approx(sum(val(t) for t in range(T - 59 * S, T + 1, S)) / 60)
+    assert status == "exact" and v == val(T - 60 * S)
+    # the window average is exactly the mean of the ticks whose source time lies in (T - 60 s, T]
+    in_window = [val(t) for t in range(T - 70 * S, T + 2 * S, S) if T - 60 * S < t + 123 * NS_PER_MS <= T]
+    assert len(in_window) == 60
+    assert tr.settlement_value(SPEC, T) == pytest.approx(sum(in_window) / 60)
+
+
+def test_1hz_two_ticks_in_one_second_keep_the_latest():
+    tr = SettlementTracker()
+    tr.on_index(tick(T - 10 * S - 900 * NS_PER_MS, 1.0))  # (T-11s, T-10s] -> second T-10s
+    tr.on_index(tick(T - 10 * S - 100 * NS_PER_MS, 2.0))  # same second, closer to T-10s: kept
+    tr.on_index(tick(T - 10 * S - 500 * NS_PER_MS, 3.0))  # earlier than the kept one: ignored
+    assert tr.print_for(T - 10 * S) == ("exact", 2.0)
+    assert tr.stats["conflicts"] == 2
 
 
 def test_duplicates_and_conflicts():
@@ -245,3 +258,12 @@ def test_latest_value_prefers_newest_source_time():
     assert tr.latest_value() == 11.0
     tr.on_index(tick(T - 1 * S, 12.0))
     assert tr.latest_value() == 12.0
+
+
+def test_carry_forward_with_offset_ticks_uses_newest_at_or_before():
+    tr = SettlementTracker(gap_policy="carry_forward")
+    for t in range(T - 70 * S, T + 2 * S, S):
+        if t != T - 30 * S:  # the tick stamped T-30s+123ms (the print for T-29s) is missing
+            tr.on_index(tick(t + 123 * NS_PER_MS, val(t)))
+    status, v = tr.print_for(T - 29 * S)
+    assert status == "filled" and v == val(T - 31 * S)  # newest tick with source time <= T-29s

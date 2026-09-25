@@ -14,7 +14,7 @@ fair_value:
 quoting:
   enabled_series: ["KXBTCD"]
   max_ticks_from_touch: 3
-  clip_contracts: 2.0      # tiny size: data first, P&L second
+  clip_contracts: 5.0      # tiny size; below ~5 the ~0.5c/order fee rounding dominates (audit M8)
   v_min_dollars: 0.002     # 0.2c minimum modeled net value per contract
   kappa_replace_per_s: 0.0002
   min_tau_s: 90.0

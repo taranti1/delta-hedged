@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 
 import numpy as np
 import pytest
@@ -15,7 +14,7 @@ from dh.strategy.fill_model import AdverseSelectionModel, FillIntensityModel, lo
 from dh.strategy.hedging import decide_hedge, no_trade_band
 from dh.strategy.quoting import ExistingOrder, MarketQuoteContext, decide_side
 from dh.strategy.risk import RiskEngine
-from dh.strategy.scenario import EventGrid, book_pnl, payoff_vector
+from dh.strategy.scenario import EventGrid, payoff_vector
 
 
 def test_lognormal_call_matches_mc():

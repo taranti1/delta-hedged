@@ -44,6 +44,7 @@ from dh.core.events import (
     IndexTick,
     KalshiBookDelta,
     KalshiBookSnapshot,
+    KalshiFeeUpdate,
     KalshiFill,
     KalshiMarketLifecycle,
     KalshiOrderGroupUpdate,
@@ -85,6 +86,14 @@ class MarketFV:
     z: float
     sd_R: float
     tail_nu: float
+    z_cap: float = math.nan  # 'between' markets: z of the cap strike
+
+    @property
+    def z_near(self) -> float:
+        """Distance (in sd) to the nearest strike boundary (audit M7: 'between' has two)."""
+        if math.isnan(self.z_cap):
+            return abs(self.z)
+        return min(abs(self.z), abs(self.z_cap))
 
 
 @dataclass
@@ -159,6 +168,9 @@ class MarketMaker:
         self.group_created = False
         self.group_triggered_at = 0
         self.halted_all = False
+        self.paused: set[str] = set()
+        self.base_fee: dict[str, tuple[str, float]] = {t: (sp.fee_type, sp.fee_multiplier) for t, sp in self.specs.items()}
+        self.fee_tolerance_micros = 10_000  # one cent of balance rounding per fill
         self.stats = MMStats()
         self.brti_hist: deque[tuple[int, float]] = deque()
 
@@ -174,6 +186,7 @@ class MarketMaker:
             self.specs[s.ticker] = s
             self.books[s.ticker] = KalshiBook(s.ticker)
             self.fv_hist[s.ticker] = deque()
+            self.base_fee[s.ticker] = (s.fee_type, s.fee_multiplier)
             self._resolve_fee(s.ticker, s)
             added.append(s.ticker)
         return added
@@ -256,7 +269,11 @@ class MarketMaker:
             self.risk.note_ext(ev.venue, ev.ts)
         elif isinstance(ev, (OrderAck, OrderReject, CancelAck, KalshiFill, KalshiOrderUpdate,
                              KalshiOrderGroupUpdate, KalshiPositionSnapshot)):
+            if isinstance(ev, KalshiFill):
+                out += self._reconcile_fee(ev)
             out += self._on_order_event(ev)
+        elif isinstance(ev, KalshiFeeUpdate):
+            out += self._on_fee_update(ev)
         elif isinstance(ev, FeedStatus):
             for a in self.risk.on_feed_status(ev):
                 out += self._apply_risk_action(ev.ts, a)
@@ -286,8 +303,10 @@ class MarketMaker:
         src = ev.ts_exch or ev.ts
         if ev.feed in ("1hz", "5hz", "rest"):
             self.fv.update(src, ev.value)
-        self.risk.note_brti(ev.ts)
+        self.risk.note_brti(ev.ts, ev.ts_exch)
         self.last_brti_ns = ev.ts
+        if ev.ts_exch:
+            self.last_brti_src_ns = max(getattr(self, "last_brti_src_ns", 0), ev.ts_exch)
         out: list[Action] = []
         # abnormal-move kill switch on 60 s returns
         self.brti_hist.append((ev.ts, ev.value))
@@ -348,7 +367,10 @@ class MarketMaker:
         if isinstance(ev, KalshiMarketLifecycle):
             if ev.event_type not in ("determined", "settled") or not ev.result:
                 if ev.event_type == "deactivated" or ev.is_deactivated:
+                    self.paused.add(ev.ticker)  # audit m3: no quoting until re-activated
                     return self._cancel_market(ev.ts, ev.ticker, "deactivated")
+                if ev.event_type == "activated" or ev.is_deactivated is False:
+                    self.paused.discard(ev.ticker)
                 return []
             px = PX_SCALE if ev.result == "yes" else 0
         else:
@@ -367,6 +389,47 @@ class MarketMaker:
         if all(s.ticker in self.settled for s in self.specs.values() if s.event_ticker == e):
             for a in self.risk.on_settlement_pnl(ev.ts, self.event_pnl[e]):
                 out += self._apply_risk_action(ev.ts, a)
+        return out
+
+    def _on_fee_update(self, ev: KalshiFeeUpdate) -> list[Action]:
+        """Event-level fee override (audit M6): override > series base; None clears it.
+        Markets whose resulting fee type is unsupported become untradable immediately."""
+        out: list[Action] = []
+        for t, spec in list(self.specs.items()):
+            if spec.event_ticker != ev.event_ticker:
+                continue
+            base_type, base_mult = self.base_fee.get(t, (spec.fee_type, spec.fee_multiplier))
+            ftype = ev.fee_type_override if ev.fee_type_override is not None else base_type
+            mult = float(ev.fee_multiplier_override) if ev.fee_multiplier_override not in (None, "") else base_mult
+            self.fee_sched.pop(t, None)
+            if ftype:
+                try:
+                    sched = self.fee_engine.schedule_for_spec(ftype, mult)
+                    if getattr(sched, "supported", True):
+                        self.fee_sched[t] = sched
+                except Exception:  # unsupported (e.g. flat): leave untradable
+                    pass
+            if t not in self.fee_sched:
+                out += self._cancel_market(ev.ts, t, "fee_unsupported")
+            out.append(Log("fees", {"ticker": t, "fee_type": ftype, "multiplier": mult,
+                                    "tradable": t in self.fee_sched}))
+        return out
+
+    def _reconcile_fee(self, ev: KalshiFill) -> list[Action]:
+        """Compare the exchange-reported fee of our fill with the fee model (audit M6).
+        The reported fee may include up to one balance unit of rounding (or a rebate)."""
+        sched = self.fee_sched.get(ev.ticker)
+        if sched is None:
+            return []
+        expected = sched.trade_fee_micros(ev.yes_px, ev.qty, ev.is_taker)
+        diff = ev.fee_micros - expected
+        if abs(diff) <= self.fee_tolerance_micros:
+            return []
+        out: list[Action] = [Log("fees", {"event": "fee_mismatch", "ticker": ev.ticker, "reported": ev.fee_micros,
+                                          "expected": expected, "px": ev.yes_px, "qty": ev.qty,
+                                          "taker": ev.is_taker})]
+        for a in self.risk.on_fee_mismatch(ev.ts, f"{ev.ticker}:{ev.fee_micros}vs{expected}"):
+            out += self._apply_risk_action(ev.ts, a)
         return out
 
     def _apply_risk_action(self, ts: int, a: Action) -> list[Action]:
@@ -422,7 +485,11 @@ class MarketMaker:
         S = self._spot()
         if S is None:
             return None, 0.0
-        age = max((now - self.last_brti_ns) / NS_PER_S, 0.0) + 0.25  # + relay latency allowance
+        age = max((now - self.last_brti_ns) / NS_PER_S, 0.0)
+        src = getattr(self, "last_brti_src_ns", 0)
+        if src:
+            age = max(age, (now - src) / NS_PER_S)  # audit m2: source age counts too
+        age += 0.25  # relay latency allowance
         return S, self._sigma_1s(now, S) * math.sqrt(age)
 
     def _band(self, spec: MarketSpec, ws, S: float, now: int, ns_sd: float) -> MarketFV:
@@ -439,7 +506,8 @@ class MarketMaker:
                     p = digital(spec, ws, S, sig * m, tl, nowcast_sd=nsd).p_yes
                     lo, hi = min(lo, p), max(hi, p)
         nu = getattr(tail, "nu", math.inf)
-        return MarketFV(now, center.p_yes, lo, hi, center.delta, center.gamma, center.z, center.sd_remaining, nu)
+        return MarketFV(now, center.p_yes, lo, hi, center.delta, center.gamma, center.z, center.sd_remaining, nu,
+                        center.z_cap)
 
     def _cycle(self, now: int) -> list[Action]:
         cfg = self.cfg
@@ -559,11 +627,13 @@ class MarketMaker:
         tau = (s.expiration_ts - now) / NS_PER_S
         book = self.books[t]
         reason = ""
-        if t not in self.fee_sched:
+        if t in self.paused:
+            reason = "paused"
+        elif t not in self.fee_sched:
             reason = "fee_unresolved"
         elif not book.valid or not self.risk.book_ok(t, now):
             reason = "book_invalid"
-        elif tau < q.min_tau_s and abs(f.z) < q.z_min_final:
+        elif tau < q.min_tau_s and f.z_near < q.z_min_final:
             reason = "final_window_near_strike"
         elif tau < 600 and not health.near_expiry_allowed:
             reason = "brti_not_fresh_near_expiry"
@@ -596,14 +666,14 @@ class MarketMaker:
         if len(h) > 1:
             dF = h[-1][1] - h[0][1]
         ctx = MarketQuoteContext(
-            spec=s, book=book, F=f.F, F_lo=f.F_lo, F_hi=f.F_hi, delta_btc=f.delta, tau_s=tau, z=f.z,
+            spec=s, book=book, F=f.F, F_lo=f.F_lo, F_hi=f.F_hi, delta_btc=f.delta, tau_s=tau, z=f.z_near,
             maker_fee=lambda px, sc=sched: sc.expected_fee_per_contract(px, False), dF_recent=dF, grid=grid,
             base_pnl=base, payoff_k=ev["payoffs"][t], lam=self.cfg.lam, lambda_tail=cfg.risk.lambda_tail,
             tail_budget=cfg.risk.tail_budget, D_btc=D, hedge_cost_frac=c_h, spot=S,
             rho_hedged=cfg.hedge.rho_hedged_fraction if cfg.hedge.enabled else 0.0,
             clip_contracts=q.clip_contracts, capacity_contracts=cap, existing=existing,
             max_ticks_from_touch=q.max_ticks_from_touch, price_floor_px=q.price_floor_px,
-            price_cap_px=q.price_cap_px,
+            price_cap_px=q.price_cap_px, rounding_per_order=q.expected_rounding_per_order,
         )
         for side in ("bid", "ask"):
             d = decide_side(ctx, side, self.flow, self.adverse, q.v_min_dollars, q.kappa_replace_per_s,

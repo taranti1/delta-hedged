@@ -146,12 +146,17 @@ class KalshiExchangeSim:
     """
 
     def __init__(self, latency: LatencyModel, fill_policy: str, fee_fn: FeeFn, seed: int = 0, *,
+                 order_fee_fn: Callable[[str, str, int, int, bool], int] | None = None,
                  latency_multiplier: float | None = None, match_window_ns: int = 250_000_000,
                  emit_order_updates: bool = True, id_prefix: str = "sim") -> None:
         self.policy = normalize_policy(fill_policy)
         mult = latency_multiplier if latency_multiplier is not None else (1.5 if self.policy == "conservative" else 1.0)
         self.latency = latency.fork(seed, latency.multiplier * mult)
         self.fee_fn = fee_fn
+        # optional order-aware fees (order_key, book_side, px, qty, is_taker) -> micros, e.g. a
+        # dh.kalshi.fees.OrderFeeAccumulator per order: includes Kalshi's per-order balance
+        # rounding/carry, which per-fill trade fees omit (audit M8)
+        self.order_fee_fn = order_fee_fn
         self.md_offset = self.latency.md_offset_ns
         self.emit_order_updates = emit_order_updates
         self.id_prefix = id_prefix
@@ -285,7 +290,13 @@ class KalshiExchangeSim:
         elif isinstance(ev, KalshiBookSnapshot):
             m = self._market(ev.ticker)
             m.book.apply_snapshot(ev)
-            m.consumed.clear()
+            # liquidity we already took stays taken: clamp to the new sizes (audit m1)
+            for key in list(m.consumed):
+                lvl = self._level_qty(ev.ticker, key[0], key[1])
+                if lvl <= 0:
+                    del m.consumed[key]
+                elif lvl < m.consumed[key]:
+                    m.consumed[key] = lvl
             self.queue.on_snapshot(ev)
         elif isinstance(ev, KalshiMarketLifecycle):
             self._on_lifecycle(ev, ts)
@@ -606,7 +617,10 @@ class KalshiExchangeSim:
         if qty <= 0:
             return 0
         o.filled += qty
-        fee = int(self.fee_fn(px, qty, is_taker))
+        if self.order_fee_fn is not None:
+            fee = int(self.order_fee_fn(o.order_id, o.book_side, px, qty, is_taker))
+        else:
+            fee = int(self.fee_fn(px, qty, is_taker))
         if is_taker:
             o.taker_fees += fee
         else:

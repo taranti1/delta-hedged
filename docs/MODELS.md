@@ -51,7 +51,9 @@ For market k and side s in {bid, ask}, candidate price p on the tick grid (up to
 the touch, never crossing), and size z:
 
     edge(p)    = F_lo - p                          (bid)      p - F_hi   (ask)
-    fee(p)     = expected maker fee per contract (dh.kalshi.fees, exact schedule incl. type)
+    fee(p, z)  = expected maker fee per contract (dh.kalshi.fees, exact schedule incl. type)
+                 + r / z, r = expected balance-rounding fee per order (~$0.005: each order's
+                 cash is rounded to the $0.01 balance precision with carry; audit M8)
     AS(p, x)   = E[F_{t+h} - F_t | our fill, features x]  signed against us (adverse selection)
     hedge(p)   = c_h * S * rho * (|D + delta_k| - |D|)     marginal expected hedge cost
     inv(p, z)  = [R(q_k + z*sgn) - R(q_k)] / z             marginal risk charge per contract
@@ -68,6 +70,9 @@ keeps its actual (smaller) queue-ahead Q_own, so it is replaced only if
 The same rule covers the explicit decision between joining the best price (long queue, full
 edge), improving by one tick (first in queue, one tick less edge) and stepping behind the best
 (fills only on sweeps).
+
+The rounding term makes small clips expensive: at z = 2 it costs 0.25c per contract (about
+the whole "viable" band of 0.15-0.30c), at z = 5 0.10c and at z = 10 0.05c, so M1 quotes 5-lots.
 
 Across markets, candidates are ranked by EVrate per unit of capital:
 

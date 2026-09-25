@@ -40,7 +40,9 @@ returns the exact payoff of `sum_fixed / n` (strict vs non-strict inequality hon
 zero delta and gamma.
 
 Print selection (details in the module docstring): `IndexTick.ts_exch` (the upstream source
-timestamp) defines the second. 1 Hz print for second `s` = the tick stamped in `[s, s+1)`;
+timestamp) defines the second. 1 Hz print for second `s` = the tick stamped in `(s-1, s]`
+(Kalshi's documented window is `(close - 60 s, close]`; with whole-second stamps this is the
+tick stamped exactly `s`, and of two ticks in one second the later is kept);
 with only the 5 Hz feed, the last 5 Hz tick at or before `s` (final once a later tick
 arrives). Duplicates are idempotent; conflicting values for the same source timestamp keep the
 first. Missing seconds: `gap_policy='carry_forward'` (default, previous print) or `'skip'`

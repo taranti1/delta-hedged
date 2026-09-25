@@ -301,11 +301,13 @@ standard error per horizon.
 * **Market-data jitter.** It is a constant offset; per-event md jitter should be folded into
   the submit distribution.
 * **Exchange behaviour not modeled:**
-  * the fee-rounding carry per order (use an order-aware `fee_fn` if needed);
+  * the fee-rounding carry per order, unless `KalshiExchangeSim(order_fee_fn=...)` is given
+    (the KAT harness passes an `OrderFeeAccumulator` per order; audit M8);
   * rate limits;
   * the "cancel-all also cancels orders placed within the next minute" behaviour;
   * self-trade prevention mode `maker`;
-  * IOC/FOK time-in-force, since `PlaceOrder` has no time_in_force field.
+  * IOC/FOK time-in-force: `PlaceOrder.time_in_force` reaches the live adapter, but the
+    simulator treats every order as good-till-canceled.
 * **Crossing inference.** Rule (iii) assumes the aggressor behind a crossing level would have
   traded with us. It may have been a post-only order that would have been rejected, which is why
   C excludes it.

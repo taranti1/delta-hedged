@@ -17,7 +17,7 @@ from dh.backtest.runner import RunResult, run
 from dh.core.units import NS_PER_S
 from dh.execution.exchange_sim import KalshiExchangeSim
 from dh.execution.latency import LatencyModel
-from dh.kalshi.fees import FeeEngine
+from dh.kalshi.fees import FeeEngine, OrderFeeAccumulator
 from dh.models.fvmodel import FairValueModel, load_recommended_config
 from dh.sim.synthetic import SynthConfig, SyntheticMarket
 from dh.strategy.config import StrategyConfig
@@ -63,8 +63,16 @@ def run_synthetic(synth: SynthConfig, cfg: StrategyConfig, *, policy: str = "rea
     def fee_fn(px: int, qty: int, is_taker: bool) -> int:
         return one.trade_fee_micros(px, qty, is_taker)
 
+    accs: dict[str, OrderFeeAccumulator] = {}
+
+    def order_fee_fn(order_key: str, book_side: str, px: int, qty: int, is_taker: bool) -> int:
+        acc = accs.get(order_key)
+        if acc is None:
+            acc = accs[order_key] = OrderFeeAccumulator(one, book_side)
+        return acc.apply_fill(px, qty, is_taker).net_micros
+
     sim = KalshiExchangeSim(latency or LatencyModel.fixed(submit_ms=40, response_ms=40, ws_ms=25), policy, fee_fn,
-                            seed=seed)
+                            seed=seed, order_fee_fn=order_fee_fn)
     for s in specs:
         sim.register_market(s)
     ledger = Ledger({s.ticker: s.event_ticker for s in specs}, {s.ticker: s.expiration_ts for s in specs})

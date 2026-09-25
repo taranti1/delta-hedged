@@ -17,9 +17,11 @@ Which print is "the" print for observation second s
 receive time -- defines which second a print belongs to.
 
 * 1 Hz feed (``feed in {'1hz', 'rest'}``): the print for second s is the tick whose source
-  timestamp lies in [s, s + 1s) ("the tick stamped at s").  BRTI 1 Hz values are published on
-  whole seconds, so in practice ts_exch == s exactly.  If two different 1 Hz ticks map to the
-  same second, the one closest to s (earliest) is kept and a conflict is counted.
+  timestamp lies in (s - 1s, s] (tick at u maps to ceil(u)).  This matches Kalshi's documented
+  settlement-window convention (close - 60 s, close] (asyncapi `cfbenchmarks_value`,
+  `last_60s_windowed_average_15min`) and the 5 Hz rule below; with whole-second source stamps
+  (the usual case) u == s and floor/ceil agree.  If two different 1 Hz ticks map to the same
+  second, the one closest to s (latest) is kept and a conflict is counted (audit m9).
 * 5 Hz feed only (``feed == '5hz'``): the print for second s is the LAST 5 Hz tick with
   ts_exch <= s ("last tick at or before s").  That value is final only once a tick with
   ts_exch > s has been seen (in-order delivery assumed; out-of-order ticks are inserted in
@@ -254,16 +256,17 @@ class SettlementTracker:
         self.stats["ticks"] += 1
         src = tick.ts_exch
         if tick.feed in _ONE_HZ_FEEDS:
-            sec = src - (src % NS_PER_S)
+            rem = src % NS_PER_S
+            sec = src if rem == 0 else src - rem + NS_PER_S  # ceil to the second: (s-1, s] -> s
             old = self._p1.get(sec)
             if old is None:
                 self._p1[sec] = (src, float(tick.value))
             elif old[0] == src:
                 self.stats["duplicates" if old[1] == tick.value else "conflicts"] += 1
             else:
-                # two different 1 Hz ticks in the same second: keep the one closest to s
+                # two different 1 Hz ticks in (s-1, s]: keep the one closest to s (latest)
                 self.stats["conflicts"] += 1
-                if src < old[0]:
+                if src > old[0]:
                     self._p1[sec] = (src, float(tick.value))
             if tick.qh_avg is not None and tick.qh_n > 0:
                 close = self._qh_close_ns(src)
@@ -345,10 +348,11 @@ class SettlementTracker:
         r = self._last_5hz_at_or_before(t)
         if r is not None:
             best_t, best_v = r
-        sec = t - (t % NS_PER_S)
-        for j in range(0, int(self.retain_s) + 1):  # bounded scan back over 1 Hz seconds
+        rem = t % NS_PER_S
+        sec = t if rem == 0 else t - rem + NS_PER_S  # 1 Hz keys are ceil(source time)
+        for j in range(0, int(self.retain_s) + 2):  # bounded scan back over 1 Hz seconds
             s = sec - j * NS_PER_S
-            if s + NS_PER_S <= best_t:  # every 1 Hz tick at or before second s is older
+            if s < best_t:  # every 1 Hz tick keyed at or before s has source time <= s: older
                 break
             e = self._p1.get(s)
             if e is not None and e[0] <= t:
@@ -370,7 +374,7 @@ class SettlementTracker:
         """Resolve the settlement print for observation time ``obs_ns`` (source time, ns).
 
         Returns (status, value) with status one of:
-          'exact'   1 Hz print stamped in that second
+          'exact'   1 Hz print with source time in (obs - 1 s, obs]
           'exact5'  derived from the 5 Hz feed (last tick at or before obs_ns, which is final)
           'filled'  missing, value from carry-forward (gap_policy='carry_forward')
           'skipped' missing and gap_policy='skip' (value None)

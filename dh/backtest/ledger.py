@@ -107,11 +107,12 @@ class Ledger:
         self.last_ts = max(self.last_ts, ev.ts)
         if isinstance(ev, KalshiFill):
             side = 1 if ev.book_side == "bid" else -1
+            t_fill = ev.ts_exch if ev.ts_exch else ev.ts  # match time, not delivery time (audit m4)
             self.fills.append(FillRecord(
-                ts=ev.ts, ticker=ev.ticker, event=self.event_of.get(ev.ticker, ev.ticker), side=side,
+                ts=t_fill, ticker=ev.ticker, event=self.event_of.get(ev.ticker, ev.ticker), side=side,
                 px=ev.yes_px / PX_SCALE, contracts=ev.qty / QTY_SCALE, fee=ev.fee_micros / MICROS,
                 is_taker=ev.is_taker,
-                tau_s=(self.expiration_of.get(ev.ticker, ev.ts) - ev.ts) / NS_PER_S,
+                tau_s=(self.expiration_of.get(ev.ticker, t_fill) - t_fill) / NS_PER_S,
             ))
         elif isinstance(ev, Settlement):
             self.settle[ev.ticker] = ev.settlement_px / PX_SCALE

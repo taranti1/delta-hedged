@@ -143,7 +143,8 @@ Results so far:
 | M1.5 | **Live tiny size** (`config/m1.yaml`), for >= 4 weeks and >= 5,000 fills | Section K decision |
 
 M1 live settings (`config/m1.yaml`):
-- **Size:** clip 2 contracts; max 10 contracts per market.
+- **Size:** clip 5 contracts; max 10 contracts per market. (Clip 2 would pay ~0.25c per
+  contract in per-order fee rounding alone; clip 5 pays ~0.10c.)
 - **Loss limits:** worst case $20 per event and $50 in total; daily loss halt $25; settlement
   loss pause at $15.
 - **Market scope:** YES price 3-97c; no near-strike quotes after T-90 s; only segments that

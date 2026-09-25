@@ -64,14 +64,28 @@ class RiskEngine:
         self.log: list[tuple[int, str]] = []  # (ts, message) informational, bounded by caller
 
     # ------------------------------------------------------------------ feed health
-    def note_brti(self, ts_ns: int) -> None:
-        """Called on every settlement-benchmark tick (receive time). An inter-tick gap longer
-        than the cancel-all threshold is an outage: quoting resumes only after
-        brti_resume_after_s of fresh ticks."""
+    def note_brti(self, ts_ns: int, src_ns: int = 0) -> None:
+        """Called on every settlement-benchmark tick (receive time ts_ns, CF source time
+        src_ns when known). An inter-tick gap longer than the cancel-all threshold is an
+        outage: quoting resumes only after brti_resume_after_s of fresh ticks. Staleness is
+        judged on the SOURCE time too (audit m2): a tick delivered now but printed 20 s ago is
+        stale."""
         c = self.cfg
         if self.last_brti_ns and ts_ns - self.last_brti_ns > c.stale_brti_cancel_all_s * NS_PER_S:
             self.brti_resume_ns = ts_ns + int(c.brti_resume_after_s * NS_PER_S)
         self.last_brti_ns = max(self.last_brti_ns, ts_ns)
+        if src_ns:
+            self.last_brti_src_ns = max(getattr(self, "last_brti_src_ns", 0), src_ns)
+
+    def brti_age_s(self, now_ns: int) -> float:
+        """Benchmark age: max of receive age and source age (source age only when known)."""
+        if not self.last_brti_ns:
+            return float("inf")
+        age = (now_ns - self.last_brti_ns) / NS_PER_S
+        src = getattr(self, "last_brti_src_ns", 0)
+        if src:
+            age = max(age, (now_ns - src) / NS_PER_S)
+        return age
 
     def note_ext(self, venue: str, ts_ns: int) -> None:
         self.last_ext_ns[venue] = max(self.last_ext_ns.get(venue, 0), ts_ns)
@@ -134,7 +148,7 @@ class RiskEngine:
     def health(self, now_ns: int) -> Health:
         c = self.cfg
         reasons: list[str] = []
-        brti_age = (now_ns - self.last_brti_ns) / NS_PER_S if self.last_brti_ns else float("inf")
+        brti_age = self.brti_age_s(now_ns)
         fresh_ext = sum(1 for t in self.last_ext_ns.values() if t and (now_ns - t) / NS_PER_S <= c.stale_ext_s)
         quoting = True
         if self.halted_all or self.halted_quoting:

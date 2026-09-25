@@ -58,6 +58,7 @@ class MarketQuoteContext:
     max_ticks_from_touch: int = 3
     price_floor_px: int = 100
     price_cap_px: int = 9900
+    rounding_per_order: float = 0.0  # $ expected balance-rounding fee per order (audit M8)
 
 
 @dataclass
@@ -146,7 +147,7 @@ def evaluate(
     key = segment_key(ctx.tau_s, abs(ctx.z), side)
     adverse_move = -ctx.dF_recent if side == "bid" else ctx.dF_recent
     as_cost = adverse.expected(key=key, adverse_recent_move=adverse_move, tau_s=ctx.tau_s, position=position)
-    fee = ctx.maker_fee(px)
+    fee = ctx.maker_fee(px) + ctx.rounding_per_order / max(size, 1e-9)
     dq = sgn * size
     d_new = ctx.D_btc + dq * ctx.delta_btc
     hedge_cost = ctx.hedge_cost_frac * ctx.spot * ctx.rho_hedged * (abs(d_new) - abs(ctx.D_btc)) / size

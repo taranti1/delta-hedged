@@ -316,3 +316,18 @@ async def test_aiohttp_transport_loopback():
             await tr("GET", f"http://127.0.0.1:{port}/x", {}, [], None, 2.0)
     finally:
         await tr.close()
+
+
+async def test_windowed_trades_deduped_across_three_overlapping_windows():
+    """Audit m8: with window_s=2 a trade on a boundary lies in three consecutive windows."""
+    trades = [{"trade_id": f"t{h}", "ts": h / 2} for h in range(200, 213)]  # every 0.5 s in [100, 106]
+
+    def server(call):
+        p = dict(call["params"])
+        lo, hi = int(p["min_ts"]), int(p["max_ts"])
+        return resp(200, {"trades": [x for x in trades if lo <= x["ts"] <= hi], "cursor": ""})
+
+    k, _, _ = client(FakeTransport(*[server] * 20))
+    got = await k.collect(k.iter_trades(ticker="T", min_ts=100, max_ts=106, window_s=2))
+    ids = [g["trade_id"] for g in got]
+    assert sorted(ids) == sorted(x["trade_id"] for x in trades) and len(ids) == len(set(ids))

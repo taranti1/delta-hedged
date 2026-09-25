@@ -37,6 +37,7 @@ class QuotingCfg:
     kappa_replace_per_s: float = 0.0002  # EVrate improvement ($/s) required to cancel/replace
     replace_rel: float = 0.5  # ...and a relative improvement of this fraction (hysteresis)
     min_order_age_ms: int = 3000  # positive-value orders are never replaced younger than this
+    expected_rounding_per_order: float = 0.005  # $: ~half the 1c balance precision per order (fee rounding)
     min_tau_s: float = 90.0  # no new near-strike quotes after T - min_tau_s
     z_min_final: float = 2.5  # |z| required to quote inside min_tau_s
     max_tau_s: float = 3900.0  # only quote events expiring within this horizon

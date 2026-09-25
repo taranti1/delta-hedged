@@ -57,3 +57,18 @@ def test_markouts_are_nan_when_fair_value_logging_stopped():
     df = L.attribute()
     assert "mo_0.1s_c" in df and not math.isnan(df["mo_0.1s_c"].iloc[0])  # 1.1 s old FV is fresh
     assert "mo_60s_c" not in df or math.isnan(df["mo_60s_c"].iloc[0])  # nothing logged near t+60 s
+
+
+def test_fill_is_attributed_at_match_time_not_delivery_time():
+    """Audit m4: an FV logged between the match (ts_exch) and the WS delivery (ts) must not be
+    used as the fill's fair value."""
+    ms = 1_000_000
+    led = Ledger({"M": "E"}, {"M": 10**12})
+    led.on_log(0, Log("fv", {"ticker": "M", "F": 0.50, "delta": 0.0}))
+    led.on_log(110 * ms, Log("fv", {"ticker": "M", "F": 0.40, "delta": 0.0}))
+    led.on_event(KalshiFill(ts=125 * ms, ts_exch=100 * ms, ticker="M", trade_id="f1", order_id="o1",
+                            client_order_id="c1", book_side="bid", yes_px=4800, qty=500, is_taker=False,
+                            fee_micros=0, post_position=500))
+    led.on_event(Settlement(10**12, 0, "M", "no", None, 0))
+    df = led.attribute()
+    assert float(df.F[0]) == 0.50 and math.isclose(float(df.gross_edge_c[0]), 2.0, abs_tol=1e-9)

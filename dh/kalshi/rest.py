@@ -643,6 +643,10 @@ class KalshiRest:
             return
         if window_s < 2:
             raise ValueError("window_s must be >= 2 seconds")
+        # ids yielded in the last two windows (audit m8): with window_s >= 2 and a 1 s overlap a
+        # trade can fall in at most three consecutive windows (e.g. t=102 in [100,102],
+        # [101,103], [102,104] when window_s=2), so memory stays bounded
+        older: set[str] = set()
         prev: set[str] = set()
         a = min_ts
         while True:
@@ -650,13 +654,13 @@ class KalshiRest:
             cur: set[str] = set()
             async for t in self.paginate(path, {**base, "min_ts": a, "max_ts": b}, "trades", stream="kalshi.rest.trades"):
                 tid = str(t.get("trade_id"))
-                if tid in prev or tid in cur:
+                if tid in prev or tid in cur or tid in older:
                     continue
                 cur.add(tid)
                 yield t
             if b >= max_ts:
                 return
-            prev = cur
+            older, prev = prev, cur
             a = b - 1
 
     async def get_market_candlesticks(
