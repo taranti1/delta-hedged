@@ -76,6 +76,19 @@ def tail_sf(x: np.ndarray, tail: str = "gauss", nu: float = 5.0, cv: float = 0.2
     raise ValueError(f"unknown tail model {tail!r}")
 
 
+def _sf(tail: object, x: np.ndarray, nu: float, cv: float) -> np.ndarray:
+    """Survival function of the unit-variance tail. Accepts a dh.models.tails.TailModel (the
+    SAME object the pricer uses, so risk and fair value share one distribution) or a legacy
+    name ('gauss' | 'student_t' | 'vol_mixture') with nu/cv."""
+    if hasattr(tail, "sf"):
+        return np.asarray(tail.sf(x), dtype=float)  # type: ignore[attr-defined]
+    if isinstance(tail, str) and tail not in ("gauss", "student_t", "vol_mixture"):
+        from dh.models.tails import make_tail
+
+        return np.asarray(make_tail(tail).sf(x), dtype=float)
+    return tail_sf(x, str(tail), nu, cv)
+
+
 # ----------------------------------------------------------------------------- payoffs
 def payoff_vector(spec: MarketSpec, A: np.ndarray) -> np.ndarray:
     """YES payoff (0/1 as float) of `spec` at each settlement value in A."""
@@ -115,7 +128,7 @@ class EventGrid:
         m_remaining: int,
         mu_R: float,
         sd_R: float,
-        tail: str = "gauss",
+        tail: object = "gauss",
         nu: float = 5.0,
         cv: float = 0.25,
         n_points: int = 1601,
@@ -140,7 +153,7 @@ class EventGrid:
             be = (be - mu_R) / sd_R
             be = be[(be > -eps_max) & (be < eps_max)]
             edges = np.unique(np.concatenate([edges, be]))
-        cdf = 1.0 - tail_sf(edges, tail, nu, cv)
+        cdf = 1.0 - _sf(tail, edges, nu, cv)
         cdf[0], cdf[-1] = 0.0, 1.0  # fold tails into the end cells
         w = np.diff(cdf)
         mid = 0.5 * (edges[:-1] + edges[1:])
