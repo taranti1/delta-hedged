@@ -1,0 +1,6 @@
+{"t":1790337600000000000,"s":"gemini.ws","q":0,"d":"{\"_dh\":\"status\",\"conn\":1,\"status\":\"connected\",\"url\":\"wss://api.gemini.com/v2/marketdata\"}"}
+{"t":1790337600070000001,"s":"gemini.ws","q":1,"d":"{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":[[\"buy\",\"84498.12\",\"0.25\"],[\"buy\",\"84497.00\",\"1.5\"],[\"sell\",\"84500.50\",\"0.4\"],[\"sell\",\"84502.00\",\"0.9\"]],\"trades\":[{\"type\":\"trade\",\"symbol\":\"BTCUSD\",\"event_id\":207000001,\"timestamp\":1790337596000,\"price\":\"84499.00\",\"quantity\":\"0.01\",\"side\":\"buy\"}],\"auction_events\":[]}"}
+{"t":1790337600090000002,"s":"gemini.ws","q":2,"d":"{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":[[\"buy\",\"84498.12\",\"0\"],[\"sell\",\"84500.00\",\"0.1\"]]}"}
+{"t":1790337600110000003,"s":"gemini.ws","q":3,"d":"{\"type\":\"trade\",\"symbol\":\"BTCUSD\",\"event_id\":207000002,\"timestamp\":1790337600105,\"price\":\"84500.00\",\"quantity\":\"0.05\",\"side\":\"buy\"}"}
+{"t":1790337600115000004,"s":"gemini.ws","q":4,"d":"{\"type\":\"trade\",\"symbol\":\"BTCUSD\",\"event_id\":207000002,\"timestamp\":1790337600105,\"price\":\"84500.00\",\"quantity\":\"0.05\",\"side\":\"buy\"}"}
+{"t":1790337600120000005,"s":"gemini.ws","q":5,"d":"{\"type\":\"heartbeat\",\"timestamp\":1790337600118}"}
