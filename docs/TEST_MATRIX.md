@@ -13,6 +13,9 @@ Conventions for every test:
   profitable contracts/day does not fall. Better Brier score alone is never sufficient.
 * **Fill-model robustness.** Every P&L claim is reported under fill policies A (optimistic),
   B (realistic) and C (conservative). A claim that holds only under A is rejected.
+* **Minimum evidence.** A verdict backed by fewer than 20 settlement events is reported as
+  INCONCLUSIVE whatever the rule says (`dh/research/exp_common.MIN_DECISION_EVENTS`); E0 keeps
+  its own stricter minimum of 200 events per segment.
 
 | # | Hypothesis | Dataset | Dependent variable | Features | Benchmark | Method | Accept if | Reject if |
 |---|---|---|---|---|---|---|---|---|

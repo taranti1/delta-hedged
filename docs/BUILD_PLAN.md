@@ -128,8 +128,19 @@ Results so far:
   - Maker P&L sign follows flow toxicity.
   - Injected maker lags of 0.3, 1.5 and 4 s give measured half-lives of 0.21, 0.75 and
     1.98 s. After 2-sd external moves the injected staleness shows as 1.4-3.7 ticks.
-- **E2-E4 and E6-E10:** replay harness in `dh/research/` (runbook:
-  `docs/research/EXPERIMENTS_RUNBOOK.md`).
+- **E1-E4 and E6-E10:** [BUILT]. Each runs with one command on a recording
+  (`scripts/run_experiment.py`; runbook `docs/research/EXPERIMENTS_RUNBOOK.md`).
+  - They drive the production `MarketMaker`, the queue-aware simulator (policies B and C, with
+    A as a reference) and the ledger.
+  - Look-ahead guards:
+    - fair-value parameters are labelled in- or out-of-sample against the window;
+    - BTC bars join only once closed;
+    - flow calibration uses a time split with out-of-sample rows;
+    - E3 folds purge overlapping labels.
+  - Any verdict backed by fewer than 20 settlement events is reported INCONCLUSIVE.
+  - All ten ran end to end on a synthetic 4-event recording (`docs/research/synthetic_demo/`).
+    Every verdict there is INCONCLUSIVE by design: the demo validates the pipelines, never
+    edge.
 
 ---------------------------------------------------------------------------------------------
 ## F. M1: the simplest version that can trade tiny size safely and produce useful data
