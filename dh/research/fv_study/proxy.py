@@ -1,6 +1,8 @@
 """Settlement-proxy error: OHLC4 of the final 1-minute candle vs the true 60-print average.
 
-The true KXBTCD settlement is the mean of 60 one-second BRTI prints at T-59s..T.  The study
+The true KXBTCD settlement is the mean of 60 one-second BRTI prints at T-60s..T-1s (verified,
+docs/research/M1_2_SETTLEMENT_CHECK.md; this simulation uses T-59s..T, a one-second shift that
+does not change the proxy statistics).  The study
 only has Bitstamp 1-minute candles, so it uses A_T = OHLC4 of the candle [T-60s, T).
 This module quantifies the proxy by simulation: Brownian log price on a 0.1 s grid, BRTI
 prints = the path at whole seconds, Bitstamp trades = Poisson arrivals at rate lam (per s)

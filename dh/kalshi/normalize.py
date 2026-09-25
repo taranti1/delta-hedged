@@ -805,12 +805,12 @@ def default_settlement(series_ticker: str) -> SettlementSpec | None:
     otherwise.
 
     Convention VERIFIED on settled markets (dh.settlement.convention,
-    docs/research/M1_2_SETTLEMENT_CHECK.md): window (close_time - 60 s, close_time], published
-    expiration value = average rounded half-up to 2 decimals.
+    docs/research/M1_2_SETTLEMENT_CHECK.md): the 60 prints stamped close_time - 60 s ..
+    close_time - 1 s (window [T-60 s, T)), published expiration value = average rounded to cents.
     """
     for prefix, index_id in BTC_INDEX_BY_SERIES_PREFIX:
         if series_ticker.startswith(prefix):
-            return SettlementSpec(index_id=index_id, n_obs=60, round_decimals=2)
+            return SettlementSpec(index_id=index_id, n_obs=60, include_close_tick=False, round_decimals=2)
     return None
 
 

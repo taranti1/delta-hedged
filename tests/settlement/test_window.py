@@ -17,7 +17,10 @@ from dh.settlement import (
 
 S = NS_PER_S
 T = 1_790_301_600 * S  # 2026-09-25 02:00:00 UTC, an hourly expiry (and a quarter-hour close)
-SPEC = SettlementSpec()
+# Tracker mechanics are tested on the (T-60 s, T] variant (prints T-59 s .. T). The PRODUCTION
+# window is [T-60 s, T) (prints T-60 s .. T-1 s; SettlementSpec() default, verified against published
+# expiration values): tests/settlement/test_convention.py.
+SPEC = SettlementSpec(include_close_tick=True)
 
 
 def tick(src_ns: int, value: float, feed: str = "1hz", **kw) -> IndexTick:

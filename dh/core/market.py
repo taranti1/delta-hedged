@@ -5,8 +5,10 @@ docs/research/M1_2_SETTLEMENT_CHECK.md):
   T = the market's ``close_time`` (NOT ``expected_expiration_time``, which is close + 5 min on
   every KXBTC* market and is kept only as metadata in ``MarketSpec.expected_expiration_ts``).
   The expiration value is the simple average of the CF Benchmarks Real-Time Index (BRTI for BTC)
-  over the 60 seconds before T, modelled as the mean of ``n_obs`` once-per-second prints stamped
-  at T-59s, ..., T-1s, T (window (T-60s, T]: start-boundary tick excluded, close tick included),
+  over the 60 seconds before T: the mean of the ``n_obs`` once-per-second prints whose CF source
+  timestamps are T-60s, T-59s, ..., T-1s (window [T-60s, T): start tick included, the print
+  stamped exactly T excluded; VERIFIED 11/11 live expirations to the cent, while the (T-60s, T]
+  window -- and Kalshi's streamed last_60s_windowed_average_15min, which uses it -- matched 1/11),
   ROUNDED to cents (``SettlementSpec.round_decimals``) before it is compared with the strike.
   Missing or incomplete benchmark data resolves the market No (contract terms).
 
@@ -58,8 +60,12 @@ class SettlementSpec:
     index_id: str = "BRTI"
     n_obs: int = 60
     step_ns: int = NS_PER_S
-    # Observation k (1..n_obs) is stamped at T - (n_obs - k) * step. True => window (T-60, T].
-    include_close_tick: bool = True
+    # False (VERIFIED, docs/research/M1_2_SETTLEMENT_CHECK.md): observation k (1..n_obs) is the
+    # print whose CF source time is T - (n_obs - k + 1) * step, i.e. the window [T-60 s, T): the
+    # 60 prints stamped T-60 s .. T-1 s, "the sixty seconds of BRTI BEFORE" T. The print stamped
+    # exactly T is NOT part of it (Kalshi's streamed last_60s_windowed_average_15min, which ends
+    # with it, differs from the published expiration value). True => prints T-59 s .. T.
+    include_close_tick: bool = False
     # The published expiration value is the average rounded half-up to this many decimals: 2 on
     # KXBTCD, KXBTC, KXBTC15M (dh.kalshi.normalize.default_settlement sets it for every real
     # market); None = compare the unrounded average (synthetic / analytic tests).
@@ -96,7 +102,7 @@ class MarketSpec:
     cap_strike: float | None
     open_ts: int  # ns
     close_ts: int  # ns: trading stops
-    expiration_ts: int  # ns: settlement reference time T (= close_time for KXBTC*; window (T-60 s, T])
+    expiration_ts: int  # ns: settlement reference time T (= close_time for KXBTC*; window [T-60 s, T))
     settlement: SettlementSpec = field(default_factory=SettlementSpec)
     price_ranges: tuple[PriceRange, ...] = (PriceRange(100, 9900, 100),)
     fee_type: str = ""  # resolved from series/event at runtime; '' = unresolved

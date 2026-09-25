@@ -1,6 +1,7 @@
 """Settlement convention on REAL Kalshi markets (docs/kalshi_specs/samples_2026-09-25, public GETs).
 
-T = close_time (not expected_expiration_time = close + 5 min); window (T-60 s, T]; the published
+T = close_time (not expected_expiration_time = close + 5 min); window [T-60 s, T) (the 60 prints
+stamped T-60 s .. T-1 s; the print stamped T is excluded); the published
 expiration value is the average rounded to cents; KXBTC15M strikes are the previous quarter's
 expiration value with >= semantics; a benchmark gap inside the window is a No-risk condition.
 """
@@ -68,7 +69,7 @@ def test_real_market_T_is_close_time(series, m):
     assert spec.expected_expiration_ts == expected  # metadata only
     assert spec.settlement.round_decimals == 2 and spec.settlement.n_obs == 60
     obs = spec.settlement.obs_times(spec.expiration_ts)
-    assert obs[0] == close - 59 * NS_PER_S and obs[-1] == close and len(obs) == 60  # (T-60 s, T]
+    assert obs[0] == close - 60 * NS_PER_S and obs[-1] == close - NS_PER_S and len(obs) == 60  # [T-60 s, T)
 
 
 def test_same_close_same_expiration_value_across_series():
@@ -190,3 +191,39 @@ def test_gap_in_window_is_flagged_not_hidden():
     full.on_ticks(IndexTick(t, t, "BRTI", 100.0, "1hz") for t in obs)
     assert full.window_state(spec, T, T).n_missing == 0
     assert full.settlement_value(spec, T, rounded=True) == 100.0
+
+
+LIVE = json.loads((Path(__file__).parent / "fixtures" / "brti_live_2026-09-25.json").read_text())["expirations"]
+
+
+@pytest.mark.parametrize("ex", LIVE, ids=[e["close_time"] for e in LIVE])
+def test_recorded_brti_reproduces_published_expiration_value(ex):
+    """Real 1 Hz BRTI prints (recorder, CF source times) vs the published expiration_value: the
+    production window [T-60 s, T) rounded to cents matches to the cent; the (T-60 s, T] window and
+    Kalshi's streamed last_60s_windowed_average_15min (which uses it) do not in general."""
+    T = int(pd_ts(ex["close_time"]))
+    prints = {int(k): v for k, v in ex["brti_1hz_cents"].items()}
+    spec = SettlementSpec(round_decimals=2)  # production window
+    tr = SettlementTracker(use_5hz=False)
+    tr.on_ticks(IndexTick(s * NS_PER_S, s * NS_PER_S, "BRTI", c / 100, "1hz") for s, c in sorted(prints.items()))
+    ws = tr.window_state(spec, T * NS_PER_S, (T + 2) * NS_PER_S)
+    assert ws.is_final and ws.n_missing == 0
+    assert f"{tr.settlement_value(spec, T * NS_PER_S, rounded=True):.2f}" == ex["expiration_value"]
+    exact = sum(prints[s] for s in range(T - 60, T)) / 60 / 100
+    assert abs(exact - float(ex["expiration_value"])) < 0.005 + 1e-9
+    legacy = SettlementSpec(round_decimals=2, include_close_tick=True)
+    assert tr.settlement_value(legacy, T * NS_PER_S) == pytest.approx(float(ex["kalshi_last_60s_windowed_average_15min"]), abs=1e-6)
+
+
+def test_recorded_legacy_window_fails():
+    bad = 0
+    for ex in LIVE:
+        T = int(pd_ts(ex["close_time"]))
+        prints = {int(k): v for k, v in ex["brti_1hz_cents"].items()}
+        legacy = sum(prints[s] for s in range(T - 59, T + 1))
+        bad += (2 * legacy + 60) // 120 != round(float(ex["expiration_value"]) * 100)
+    assert bad >= len(LIVE) - 2  # (T-60, T] matched 1 of 11 recorded expirations
+
+
+def pd_ts(iso: str) -> int:
+    return iso_to_ns(iso.replace("+00:00", "Z")) // NS_PER_S

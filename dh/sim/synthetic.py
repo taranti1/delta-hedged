@@ -5,7 +5,8 @@ attribution and experiment scripts recover properties we inject on purpose:
   * a known Kalshi staleness (background makers price off BTC lagged by `mm_lag_s`),
   * a known favorite-longshot bias (retail buys cheap YES above fair),
   * known informed flow (latency takers pick off quotes staler than a threshold),
-  * a known settlement rule (60 once-per-second benchmark prints in (T-60s, T]).
+  * a known settlement rule (60 once-per-second benchmark prints; the synthetic world uses its own
+    specs' SettlementSpec -- the verified Kalshi window is [T-60s, T), dh.settlement.convention).
 
 Everything is seeded and produced in receive-time order as dh.core.events.
 """

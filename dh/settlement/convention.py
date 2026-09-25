@@ -9,9 +9,11 @@ VERIFIED 2026-09-25 (docs/research/M1_2_SETTLEMENT_CHECK.md, docs/kalshi_specs/s
   of ... BRTI before 3 PM EDT" where close_time is 3 PM EDT. KXBTCD-26SEP2515 and
   KXBTC15M-26SEP251500 (both close 19:00Z) settled on the same ``expiration_value`` 83950.62, and
   the 15-minute one was settled at 19:00:08Z (before close + 5 min).
-* **Window** (T - 60 s, T]: the 60 once-per-second BRTI prints stamped T-59 s, ..., T
-  (``dh.core.market.SettlementSpec``; start tick excluded, close tick included, the convention
-  Kalshi documents for ``last_60s_windowed_average_15min``).
+* **Window** [T - 60 s, T): the 60 once-per-second BRTI prints whose CF source times are
+  T-60 s, ..., T-1 s ("the sixty seconds of BRTI before" T; ``dh.core.market.SettlementSpec``
+  include_close_tick=False). VERIFIED to the cent on every recorded expiration, whereas the
+  (T-60 s, T] window -- which Kalshi's streamed ``last_60s_windowed_average_15min`` uses --
+  matched 1 of 11 (docs/research/M1_2_SETTLEMENT_CHECK.md).
 * **Rounding**: the published ``expiration_value`` has 2 decimals on all three series (KXBTC15M
   ``rules_secondary``: "rounded to the nearest 2 decimal places"); the outcome compares that
   rounded value with the strike (``SettlementSpec.round_decimals``).

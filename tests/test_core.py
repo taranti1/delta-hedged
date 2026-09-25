@@ -73,10 +73,12 @@ def test_market_payoff_and_ticks():
 
 
 def test_settlement_obs_times():
-    s = SettlementSpec()
+    s = SettlementSpec()  # production: [T-60 s, T), the 60 prints stamped T-60 s .. T-1 s
     T = 3_600 * 10**9
     obs = s.obs_times(T)
-    assert len(obs) == 60 and obs[-1] == T and obs[0] == T - 59 * 10**9
+    assert len(obs) == 60 and obs[-1] == T - 10**9 and obs[0] == T - 60 * 10**9
+    alt = SettlementSpec(include_close_tick=True).obs_times(T)
+    assert alt[-1] == T and alt[0] == T - 59 * 10**9
 
 
 def test_kalshi_book_yes_view_and_invalidation():

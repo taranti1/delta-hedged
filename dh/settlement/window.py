@@ -3,7 +3,7 @@
 Settlement convention (see ``dh.core.market.SettlementSpec`` and ``dh.settlement.convention``;
 VERIFIED against published ``expiration_value``, docs/research/M1_2_SETTLEMENT_CHECK.md): the
 expiration value of a KXBTCD / KXBTC / KXBTC15M market is the simple average of ``n_obs`` (=60)
-once-per-second BRTI prints stamped at T-59s, ..., T-1s, T (window (T-60s, T]) with
+once-per-second BRTI prints whose CF source times are T-60s, ..., T-1s (window [T-60s, T)) with
 T = the market's ``close_time`` (NOT ``expected_expiration_time`` = close + 5 min), rounded to
 cents before the strike comparison (``MarketSpec.yes_wins``).  This module turns a stream of
 ``IndexTick`` events into, for any expiration and any "now":
@@ -20,10 +20,12 @@ Which print is "the" print for observation second s
 receive time -- defines which second a print belongs to.
 
 * 1 Hz feed (``feed in {'1hz', 'rest'}``): the print for second s is the tick whose source
-  timestamp lies in (s - 1s, s] (tick at u maps to ceil(u)).  This matches Kalshi's documented
-  settlement-window convention (close - 60 s, close] (asyncapi `cfbenchmarks_value`,
-  `last_60s_windowed_average_15min`) and the 5 Hz rule below; with whole-second source stamps
-  (the usual case) u == s and floor/ceil agree.  If two different 1 Hz ticks map to the same
+  timestamp lies in (s - 1s, s] (tick at u maps to ceil(u)), consistent with the 5 Hz rule
+  below.  Every recorded 1 Hz tick (and every CF-history row on a whole second) carries a
+  whole-second source stamp, so u == s and the rule only matters for malformed input.  NOTE:
+  Kalshi's streamed `last_60s_windowed_average_15min` averages the prints stamped T-59 s .. T;
+  the published expiration value averages T-60 s .. T-1 s (docs/research/M1_2_SETTLEMENT_CHECK.md),
+  which is what ``SettlementSpec()`` (include_close_tick=False) selects.  If two different 1 Hz ticks map to the same
   second, the one closest to s (latest) is kept and a conflict is counted (audit m9).
 * 5 Hz feed only (``feed == '5hz'``): the print for second s is the LAST 5 Hz tick with
   ts_exch <= s ("last tick at or before s").  That value is final only once a tick with
@@ -483,10 +485,14 @@ class SettlementTracker:
         return spec.round_value(v) if rounded else v
 
     def kalshi_window_avg(self, expiration_ns: int) -> tuple[float, int] | None:
-        """Kalshi's own running (avg, count) of the final-minute window closing at expiration.
+        """Kalshi's own running (avg, count) of ``last_60s_windowed_average_15min`` for the
+        quarter-hour closing at expiration (every hourly KXBTCD expiry is one).
 
-        From ``last_60s_windowed_average_15min`` (quarter-hour closes only; every hourly KXBTCD
-        expiry is one).  Use it to cross-check ``window_state`` (sum_fixed ~= avg * count).
+        CAUTION (docs/research/M1_2_SETTLEMENT_CHECK.md): this streamed field averages the prints
+        stamped T-59 s .. T, one second LATER than the published expiration value (T-60 s ..
+        T-1 s): at count 60 it differed from ``expiration_value`` on 10 of 11 recorded
+        expirations. Use it only as a feed-health cross-check of the prints, never as the
+        settlement value (compare with ``window_state`` on ``SettlementSpec(include_close_tick=True)``).
         """
         q = self._qh.get(expiration_ns)
         return None if q is None else (q.avg, q.n)
