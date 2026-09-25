@@ -1,0 +1,102 @@
+# Live / paper runner configuration (dh.live.config.load_live_config). Copy to
+# config/live.yaml and edit. Unknown keys are errors. No secrets in here: the Kalshi key id and
+# private-key PATH come from the environment (KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH), see
+# config/kalshi.example.yaml and docs/RUNBOOK.md.
+#
+# Strategy parameters (sizes, limits, timers) are NOT here: they live in config/m1.yaml.
+
+# paper = shadow trading against the live book through the conservative simulator (no orders).
+# live  = real orders; ALSO requires --i-understand-this-sends-real-orders on the command line.
+mode: paper
+session: m1                    # free label written into logs / meta records
+kalshi_config: ""              # '' = config/kalshi.yaml, else config/kalshi.example.yaml
+kalshi_env: ""                 # '' = the kalshi config's env (prod | demo)
+
+paths:
+  data_root: data/live         # raw capture of THIS process; never the collector's root
+  log_dir: data/live_logs      # JSON-lines: decisions (Log actions), actions, venue results
+  kill_file: /run/dh/KILL      # `touch /run/dh/KILL` -> cancel all + stop (dir must exist)
+  heartbeat_file: /run/dh/heartbeat.json   # read by scripts/watchdog.py
+
+metrics:
+  enabled: true
+  host: 127.0.0.1              # Prometheus text at http://127.0.0.1:9108/metrics, JSON at /health
+  port: 9108
+
+loop:
+  heartbeat_interval_s: 0.5
+  kill_check_interval_s: 0.2
+  metrics_refresh_s: 1.0
+  max_lag_s: 1.0               # consumer lag above this blocks NEW orders until it halves
+  shutdown_timeout_s: 10.0
+  strategy_error: stop         # stop | continue (never 'continue' in live mode)
+  clock_sample_s: 60.0         # chrony/adjtimex sample -> 'clock' stream + dh_clock_offset_seconds
+  clock_alarm_ms: 5.0
+
+venue:
+  subaccount: null             # Kalshi subaccount number (null = primary). Use a DEDICATED
+                               # (sub)account: cancel-all and the ghost sweep act on all its orders.
+  max_batch: 20                # places / cancels per batched request
+  max_place_wait_s: 0.5        # quotes that would wait longer for write tokens are dropped
+  self_trade_prevention: taker_at_cross
+  reconcile_backoff_s: [0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0]
+  reconcile_missing_after_s: 30.0
+  reconcile_min_attempts: 3
+  max_cancel_retries: 5
+  queue_positions_interval_s: 2.0   # GET /portfolio/orders/queue_positions (0 = off)
+  queue_positions_resync: false     # true overwrites the estimator (breaks replay parity)
+  queue_positions_max_tickers: 20
+  read_reserve_tokens: 30.0
+  positions_interval_s: 30.0        # GET /portfolio/positions reconciliation (0 = off)
+  position_confirm_s: 5.0           # a mismatch must persist this long before Halt(all)
+  ghost_sweep: true                 # cancel resting orders the strategy does not know
+  startup_cancel_all: true          # cancel leftovers from a previous session before trading
+  exclude_events_with_positions: true
+  shutdown_delete_group: true
+  halt_on_fee_mismatch: true
+
+universe:
+  series: []                   # [] = strategy quoting.enabled_series (KXBTCD in M1)
+  horizon_s: 7200.0            # trade markets expiring within 2 h (current + next hour)
+  discovery_interval_s: 120.0  # hourly roll-over: new markets added via MarketMaker.add_markets
+  prune_after_s: 900.0
+  market_channels: [orderbook_delta, trade]
+  max_markets_per_subscription: 100
+  index_ids: [BRTI]
+
+backfill:                      # fair-value warm-up (>= 1 day needed; 2 days at 1-minute sampling)
+  enabled: true
+  index_id: BRTI
+  days: 2.0
+  step_s: 60
+  chunk_s: 3600
+  # GET /cfbenchmarks/history/values?id=BRTI&timespan=<timespan>&timestamp=<timestamp>
+  # placeholders: {start_ms} {end_ms} {start_s} {end_s} {span_s} {span_ms}. The passthrough's
+  # formats are undocumented: confirm once against the live API and adjust.
+  timespan: "{span_s}s"
+  timestamp: "{end_ms}"
+  extra_params: {}
+  min_coverage: 0.9
+
+paper:                         # shadow-trading simulator (dh.execution.exchange_sim)
+  policy: conservative         # C: cancels ahead of us are assumed behind, latency x1.5
+  seed: 7
+  submit_ms: 40.0              # replace with measured REST round trips (dh_rest_rtt_seconds)
+  response_ms: 40.0
+  ws_ms: 25.0
+  sigma: 0.4
+  latency_multiplier: null
+
+feeds:                         # external venues for the risk engine's freshness check
+  config: config/feeds.yaml
+  only: []                     # e.g. [coinbase, kraken, bitstamp]; [] = none
+
+watchdog:                      # scripts/watchdog.py
+  stale_s: 2.0
+  poll_s: 0.25
+  retry_s: 1.0
+  repeat_s: 30.0
+  max_repeats: 10
+  only_live: true
+  key_id_env: KALSHI_WATCHDOG_KEY_ID
+  private_key_path_env: KALSHI_WATCHDOG_PRIVATE_KEY_PATH

@@ -21,7 +21,9 @@ Inputs (Parquet or DataFrames):
   trades:  ticker, ts_ms, yes_px (int, 1e-4 $), qty (int, 0.01 contracts), taker_side ('yes'|'no')
   markets: ticker, event_ticker, expiration_ts_ms, result ('yes'|'no'), strike_type,
            floor_strike, cap_strike
-  btc (optional): ts_ms, price  (any BRTI proxy; used for z = distance / expected move)
+  btc (optional): ts_ms, price  (any BRTI proxy; used for z = distance / expected move). ts_ms is
+           the bar OPEN time of --btc-bar-ms bars (default 60 000: 1-minute OHLC closes); the
+           join is causal (the bar is used only after it closed; kalshi_data.btc_price_asof)
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from dh.research.kalshi_data import normalize_markets, normalize_trades
+from dh.research.kalshi_data import DEFAULT_BTC_BAR_MS, btc_price_asof, normalize_markets, normalize_trades
 
 PRICE_BUCKETS = [0, 500, 1000, 2000, 3500, 5000, 6500, 8000, 9000, 9500, 10001]  # px units
 TAU_BUCKETS = [0, 30, 60, 300, 600, 1800, 3600, 1e9]  # seconds
@@ -42,10 +44,13 @@ Z_BUCKETS = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 1e9]
 
 
 def prepare(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | None = None,
-            vol_ann: float = 0.40, maker_rate: float = 0.0175) -> pd.DataFrame:
+            vol_ann: float = 0.40, maker_rate: float = 0.0175, btc_bar_ms: int = DEFAULT_BTC_BAR_MS) -> pd.DataFrame:
     """Join trades to settlements and compute per-trade maker P&L columns (dollars/contract).
 
     Accepts the downloader's schema (see dh.research.kalshi_data); block trades are dropped.
+    The BTC reference for z is joined causally (kalshi_data.btc_price_asof): ``btc.ts_ms`` is a
+    bar OPEN time and the bar's price is usable only from its close (``btc_bar_ms`` later; 0 for
+    point-in-time prices).
     """
     trades = normalize_trades(trades)
     markets = normalize_markets(markets)
@@ -67,10 +72,7 @@ def prepare(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | Non
     df["weekend"] = ts.dt.dayofweek >= 5
     df["size_b"] = pd.cut(df.contracts, [0, 5, 25, 100, 500, 1e9], right=False)
     if btc is not None and len(btc):
-        b = btc.sort_values("ts_ms")
-        idx = np.searchsorted(b.ts_ms.to_numpy(), df.ts_ms.to_numpy(), side="right") - 1
-        ok = idx >= 0
-        S = np.where(ok, b.price.to_numpy()[np.clip(idx, 0, None)], np.nan)
+        S = btc_price_asof(btc, df.ts_ms.to_numpy(), btc_bar_ms)
         K = df.floor_strike.fillna(df.cap_strike).to_numpy(dtype=float)
         sd = S * vol_ann * np.sqrt(np.maximum(df.tau_s.to_numpy() - 40.0, 20.0) / (365 * 24 * 3600.0))
         df["z"] = np.abs(K - S) / sd
@@ -116,8 +118,8 @@ def segment_table(df: pd.DataFrame, by: list[str], n_boot: int = 300, min_events
 
 
 def run(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame | None, out: Path,
-        maker_rate: float = 0.0175, n_boot: int = 300) -> dict[str, pd.DataFrame]:
-    df = prepare(trades, markets, btc, maker_rate=maker_rate)
+        maker_rate: float = 0.0175, n_boot: int = 300, btc_bar_ms: int = DEFAULT_BTC_BAR_MS) -> dict[str, pd.DataFrame]:
+    df = prepare(trades, markets, btc, maker_rate=maker_rate, btc_bar_ms=btc_bar_ms)
     out.mkdir(parents=True, exist_ok=True)
     tables = {
         "overall": segment_table(df.assign(all="all"), ["all"], n_boot),
@@ -145,9 +147,11 @@ def main() -> None:
     ap.add_argument("--out", default="docs/research/tables")
     ap.add_argument("--maker-rate", type=float, default=0.0175,
                     help="maker fee rate for the series (0 for fee_type 'quadratic')")
+    ap.add_argument("--btc-bar-ms", type=int, default=DEFAULT_BTC_BAR_MS,
+                    help="length of the BTC bars whose OPEN time is ts_ms (0 = point-in-time prices)")
     a = ap.parse_args()
     tables = run(pd.read_parquet(a.trades), pd.read_parquet(a.markets),
-                 pd.read_parquet(a.btc) if a.btc else None, Path(a.out), a.maker_rate)
+                 pd.read_parquet(a.btc) if a.btc else None, Path(a.out), a.maker_rate, btc_bar_ms=a.btc_bar_ms)
     for k, t in tables.items():
         print(f"\n== {k}\n{t.to_string(index=False)}")
 

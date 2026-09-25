@@ -11,11 +11,37 @@ the minimal research schema used in tests:
 Rules (audit M6): block trades (matched off book via RFQ / negotiated blocks) are dropped; they
 are neither maker fills nor taker flow on the order book. Trade-side event/series columns are
 dropped before joining so the market table is the single source of event membership.
+
+BTC reference prices (``btc``: ts_ms, price, optional close_ts_ms) are joined CAUSALLY with
+``btc_price_asof``: a price is usable only from the time it was known. Convention: ``ts_ms`` is
+the OPEN time of a ``bar_ms``-long bar whose ``price`` is the bar CLOSE (Bitstamp/Kraken OHLC
+exports), so the price becomes available at ``ts_ms + bar_ms`` (or ``close_ts_ms`` when the column
+exists). Point-in-time prices (index ticks stamped when observed) use ``bar_ms = 0``. A trade 1 s
+after a bar opens therefore sees the PREVIOUS bar's close, never the bar that has not closed yet
+(audit: the bar-open stamp joined as-of would leak up to 59 s of future BTC).
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+
+DEFAULT_BTC_BAR_MS = 60_000  # 1-minute OHLC bars stamped at their open (Bitstamp export)
+
+
+def btc_price_asof(btc: pd.DataFrame, ts_ms, bar_ms: int = DEFAULT_BTC_BAR_MS) -> np.ndarray:
+    """Causal reference price at each ``ts_ms`` (ms): the last price AVAILABLE at or before it,
+    i.e. from the last bar whose close time (``close_ts_ms``, else ``ts_ms + bar_ms``) is <= ts_ms.
+    NaN when no price is available yet. See the module docstring for the convention."""
+    t = np.asarray(ts_ms, dtype=np.int64)
+    if btc is None or not len(btc):
+        return np.full(t.shape, np.nan)
+    avail = (btc["close_ts_ms"] if "close_ts_ms" in btc else btc["ts_ms"] + int(bar_ms)).to_numpy(dtype=np.int64)
+    px = btc["price"].to_numpy(dtype=float)
+    order = np.argsort(avail, kind="stable")
+    a, p = avail[order], px[order]
+    idx = np.searchsorted(a, t, side="right") - 1
+    return np.where(idx >= 0, p[np.clip(idx, 0, None)], np.nan)
 
 
 def normalize_trades(trades: pd.DataFrame) -> pd.DataFrame:

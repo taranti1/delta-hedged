@@ -217,3 +217,64 @@ def gap_after_moves(panel: pd.DataFrame, step_ms: int = 100, lookback_s: float =
     big = np.abs(mv) > k_sigma * sd
     return {"gap_ticks_all": float(gap.mean() / tick), "gap_ticks_after_move": float(gap[big].mean() / tick)
             if big.any() else math.nan, "share_big_moves": float(big.mean())}
+
+
+# ============================================================================ recorded-data runner
+RULE_E1 = ("accept if the lag coefficient > 0 with CI, economically >= 0.5 tick within 1 s and stable across "
+           "months; reject if no response beyond receive latency or < 0.2 tick")
+
+
+def realized_vol_ann(root, t0: int, t1: int) -> float:
+    """Annualized realized vol of the recorded benchmark (60 s returns received in [t0, t1))."""
+    from dh.research.replay_env import brti_ticks
+
+    ticks = [e for e in brti_ticks(root, t0, t1) if e.feed in ("1hz", "rest")]
+    if len(ticks) < 120:
+        return 0.35
+    s = pd.Series([e.value for e in ticks], index=pd.to_datetime([e.ts_exch or e.ts for e in ticks], unit="ns"))
+    r = np.log(s.resample("60s").last().dropna()).diff().dropna()
+    return float(r.std() * math.sqrt(365 * 24 * 60)) if len(r) > 10 else 0.35
+
+
+def run(root, t0: int, t1: int, out, *, cfg=None, step_ms: int = 100, nowcast: str = "venues", micro: bool = False,
+        vol_ann: float | None = None, universe=None, n_boot: int = 200) -> dict:
+    """E1 on a recording: the ReplayStream (own-footprint filtered) -> build_panel -> lead_lag.
+
+    Uses the market universe's specs (enabled series of ``cfg``) and the realized vol of the
+    recorded benchmark unless ``vol_ann`` is given. Writes CSV + markdown to ``out``."""
+    from pathlib import Path
+
+    from dh.research.exp_common import Report, fmt_ns
+    from dh.research.replay_env import ReplayStream, build_universe
+    from dh.strategy.config import StrategyConfig
+
+    cfg = cfg or StrategyConfig()
+    Path(out).mkdir(parents=True, exist_ok=True)
+    uni = universe or build_universe(root, t0, t1)
+    specs = {s.ticker: s for s in uni.specs(cfg.quoting.enabled_series)}
+    vol = vol_ann if vol_ann is not None else realized_vol_ann(root, t0 - 6 * 3600 * NS_PER_S, t1)
+    stream = ReplayStream(root, t0, t1, own_fills=uni.own_fills)
+    panel = build_panel((e for e in stream if e.ts < t1), specs, step_ms=step_ms, vol_ann=vol, nowcast=nowcast,
+                        micro=micro)
+    res = lead_lag(panel, step_ms=step_ms, n_boot=n_boot)
+    tab = pd.DataFrame([{"horizon_s": r.horizon_s, "b_gap": r.b_gap, "b_gap_lo": r.b_gap_ci[0], "b_gap_hi": r.b_gap_ci[1],
+                         "b_gap_se_ols": r.b_gap_se_ols, "c_move": r.c_move, "c_move_lo": r.c_move_ci[0],
+                         "c_move_hi": r.c_move_ci[1], "n": r.n, "block_units": r.units} for r in res])
+    econ = gap_after_moves(panel, step_ms=step_ms)
+    hl = half_life(res) if res else math.inf
+    rep = Report("e1_staleness", "E1 — Is Kalshi stale relative to external BTC?", Path(out), synthetic=uni.synthetic,
+                 rule=RULE_E1, meta={"root": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "markets": len(specs),
+                                     "panel_rows": len(panel), "nowcast": nowcast, "vol_ann": vol,
+                                     "gap-closure half-life (s)": hl, **{k: v for k, v in econ.items()}})
+    big = econ.get("gap_ticks_after_move", math.nan)
+    b1 = tab.loc[tab.horizon_s == 1.0, "b_gap_lo"]
+    if len(b1) and b1.iloc[0] > 0 and big >= 0.5:
+        rep.verdict = "ACCEPT (lag coefficient CI > 0 at 1 s and >= 0.5 tick gap after external moves; check stability across months)"
+    elif math.isfinite(big) and big < 0.2:
+        rep.verdict = "REJECT (< 0.2 tick)"
+    else:
+        rep.verdict = "INCONCLUSIVE"
+    rep.table("lead_lag", tab, "Gap closure y(t+h)-y(t) on x(t)-y(t) (b_gap) and response to the 1 s external move "
+                               "(c_move); block bootstrap over (event, 60 s block) units.")
+    rep.write()
+    return {"lead_lag": tab, "economics": econ, "half_life_s": hl, "panel": panel}

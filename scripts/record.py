@@ -12,7 +12,10 @@ What runs (each in its own supervised asyncio task: one venue crashing never sto
     KXBTCD/KXBTC/KXBTC15M markets, market_lifecycle_v2 (all markets) and
     cfbenchmarks_value + cfbenchmarks_value_5hz for BRTI; plus periodic REST snapshots via
     dh.kalshi.rest.KalshiRest(on_raw=recorder.write). New markets are added from lifecycle
-    events and a periodic REST re-discovery. (dh.kalshi is imported lazily.)
+    events and a periodic REST re-discovery. At start-up and on every refresh the series
+    objects, scheduled series/event fee changes and each newly discovered event (GET
+    /events/{e}) are recorded too, so specs, strikes and fees can be rebuilt offline
+    (dh.research.replay_env). (dh.kalshi is imported lazily.)
   * clock-health sampler -> stream 'clock'; a 'meta' record with the session configuration.
   * a status line every ``status_interval_s``: msgs/s per stream, last message age, gaps,
     reconnects, stale events.
@@ -160,6 +163,8 @@ class KalshiSource:
         self.rest: Any = None
         self._refresh_now = asyncio.Event()
         self.series = [str(s) for s in kcfg.get("series") or []]
+        self.events_found: set[str] = set()  # event tickers of discovered markets
+        self.events_recorded: set[str] = set()  # events whose GET /events/{e} was recorded
 
     async def run(self) -> None:
         try:
@@ -179,6 +184,7 @@ class KalshiSource:
         try:
             self.tickers = await self.discover()
             log.info("kalshi: %d open markets in %s", len(self.tickers), ",".join(self.series))
+            await self.record_metadata()
             tasks.append(asyncio.create_task(self.refresh_loop(), name="kalshi:refresh"))
             if float(self.kcfg.get("rest_orderbook_interval_s", 60) or 0) > 0:
                 tasks.append(asyncio.create_task(self.orderbook_loop(), name="kalshi:orderbooks"))
@@ -238,7 +244,35 @@ class KalshiSource:
                     except ValueError:
                         pass
                 out.add(str(t))
+                if m.get("event_ticker"):
+                    self.events_found.add(str(m["event_ticker"]))
         return sorted(out)
+
+    async def record_metadata(self) -> None:
+        """Record what offline replay needs to rebuild specs and fees (dh.research.replay_env):
+        GET /series/{s} per configured series (fee_type, fee_multiplier) -> 'kalshi.rest.series';
+        GET /series/fee_changes and /events/fee_changes (scheduled changes) -> 'kalshi.rest.fees';
+        GET /events/{e} (event + nested markets: strikes, rules, fee overrides) once per newly
+        discovered event -> 'kalshi.rest.events'. Recorded through KalshiRest(on_raw=...);
+        failures are logged and never stop the collector. Runs at start-up and every refresh."""
+        for s in self.series:
+            for what, call in ((f"series {s}", lambda s=s: self.rest.get_series(s)),
+                               (f"series fee changes {s}", lambda s=s: self.rest.get_series_fee_changes(s))):
+                try:
+                    await call()
+                except Exception as exc:  # noqa: BLE001 - recorded by KalshiRest; keep going
+                    log.warning("kalshi: %s failed: %s", what, exc)
+        try:
+            async for _ in self.rest.iter_event_fee_changes():
+                pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kalshi: event fee changes failed: %s", exc)
+        for e in sorted(self.events_found - self.events_recorded):
+            try:
+                await self.rest.get_event(e, with_nested_markets=True)
+                self.events_recorded.add(e)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("kalshi: GET /events/%s failed: %s", e, exc)
 
     async def refresh_loop(self) -> None:
         period = float(self.kcfg.get("market_refresh_s", 300))
@@ -257,6 +291,7 @@ class KalshiSource:
             add = [t for t in fresh if t not in set(self.tickers)]
             gone = [t for t in self.tickers if t not in set(fresh)]
             self.tickers = fresh
+            await self.record_metadata()
             if self.ws is not None:
                 chans = self.kcfg.get("market_channels") or ["orderbook_delta"]
                 if add:
