@@ -401,9 +401,11 @@ class Settlement:
 class RiskStateSeed:
     """Risk state carried over from earlier sessions of the same UTC day (audit live C1).
 
-    Pushed once by the live runner at start-up, before any Timer, from its persisted state and
-    the day's REST fills/settlements; recorded, so replay reproduces it. Without it a restart
-    would silently reset the daily-loss halt and any pause.
+    Pushed by the live runner at start-up, before any Timer, from its persisted state and the
+    day's REST fills/settlements, and again during a session when the carried P&L changes (an
+    excluded event settles) or a watchdog cancel-all names this runner (a halting seed). Every
+    seed is recorded, so replay reproduces it; repeats are safe. Without it a restart would
+    silently reset the daily-loss halt and any pause.
 
     day_pnl_usd: net P&L of the UTC day starting at ``day_start_ns`` before this session (fees,
     settlements and events excluded from this session included; negative = loss). It counts
@@ -418,6 +420,7 @@ class RiskStateSeed:
     halted: bool = False
     halt_reason: str = ""
     pause_until_ns: int = 0
+    halt_scope: str = "all"  # all | quoting: the scope of the carried-over halt
 
 
 EVENT_TYPES: dict[str, type] = {

@@ -241,3 +241,12 @@ def test_order_expiry_is_spread_deterministically():
     assert d.mm._expiry_ns(T0, "x-1") == d.mm._expiry_ns(T0, "x-1")  # deterministic
     d0 = Driver([spec()])  # order_expiry_s = 0 -> good till canceled
     assert d0.mm._expiry_ns(T0, "x-1") == 0
+
+
+def test_carried_over_quoting_halt_keeps_its_scope():
+    d = Driver([spec()])
+    acts = d.feed(RiskStateSeed(T0, 0, DAY_START, halted=True, halt_reason="fee_mismatch", halt_scope="quoting"))
+    halts = [a for a in acts if isinstance(a, Halt)]
+    assert halts and halts[0].scope == "quoting" and not d.mm.halted_all and d.mm.risk.halted_quoting
+    d.feed(RiskStateSeed(T0 + 1, 0, DAY_START, halted=True, halt_reason="fee_mismatch", halt_scope="quoting"))
+    assert not d.mm.halted_all  # a repeated seed is harmless

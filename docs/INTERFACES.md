@@ -135,3 +135,14 @@ class HedgeVenueSim: ...  # walks external L2 for marketable orders, maker fills
 * `dh.strategy.mm.MarketMaker(config, markets, ...)` implements `Strategy`.
 * `dh.backtest.runner.run(events, strategy, exchange_sim, hedge_sim, timers) -> Ledger`.
 * `dh.live.runner` wires real adapters to the identical `MarketMaker`.
+
+## Runner-generated strategy inputs (live mode)
+
+All are recorded on `events.live`, so a session replays bit for bit.
+
+| Event | When | Strategy effect |
+|---|---|---|
+| `RiskStateSeed(day_start_ns, day_pnl_usd, halted, halt_reason, pause_until_ns, halt_scope)` | start-up (first event); again when an excluded event settles, or a watchdog cancel-all names this runner | the day's earlier P&L counts toward the daily-loss limit; a carried halt (with its scope) or pause is restored; repeats are safe |
+| `FeedStatus("runner.lag", stale/resumed)` | consumer or exchange-time lag above / back under the limit | cancel all quotes and block quoting until resumed |
+| `FeedStatus("kalshi.reconcile", stale/resynced)` | reconnect reconciliation, and the 60 s after a global cancel-all | same |
+| `FeedStatus("runner.clock", stale/resumed)` | receive-clock offset cannot be measured or exceeds the limit | same |

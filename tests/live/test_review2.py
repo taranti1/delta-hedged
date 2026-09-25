@@ -423,9 +423,8 @@ def test_persisted_mark_is_bounded_by_the_open_positions():
 
 
 async def test_a_carried_quoting_halt_keeps_its_scope_in_the_state(tmp_path):
-    """Review nit: a quoting-scope halt (fee mismatch) is persisted as such and stays 'quoting'
-    across restarts, although the strategy restores every carried halt as Halt(all) until
-    RiskStateSeed can carry a scope."""
+    """Review nit: a quoting-scope halt (fee mismatch) is persisted as such, stays 'quoting'
+    across restarts, and the strategy restores it with that scope (RiskStateSeed.halt_scope)."""
     from dh.live.riskstate import RiskState, make_seed
 
     prev = RiskState(D0, 0.0, True, "fee_mismatch:x", 0, "s0", "live", D0 + H, realized_usd=0.0, halt_scope="quoting",
@@ -437,7 +436,7 @@ async def test_a_carried_quoting_halt_keeps_its_scope_in_the_state(tmp_path):
     r, venue, _ = live_runner(s, risk_store=store, risk_book=RiskBook.from_decision(dec), clock_ns=lambda: D0 + 2 * H)
     r.push_result(make_seed(D0 + 2 * H, dec))
     r.process_pending()
-    assert s.risk.halted_all and "halt:all" in r.gate.reasons
+    assert s.risk.halted_quoting and not s.risk.halted_all and "halt:quoting" in r.gate.reasons
     st = store.load()  # persisted at once by the halt
     assert st.halted and st.halt_reason == "fee_mismatch:x" and st.halt_scope == "quoting" and st.halt_day_ns == D0 - DAY_NS
     await venue.wait_idle(1.0)

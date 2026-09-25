@@ -108,8 +108,9 @@ class RiskEngine:
             return out
         self.seed_day, self.seed_day_pnl = day, float(ev.day_pnl_usd)
         self.pause_until_ns = max(self.pause_until_ns, int(ev.pause_until_ns))
-        if ev.halted and not self.halted_all:
-            out += self._halt(ev.ts, f"carried_over:{ev.halt_reason or 'halt'}", scope="all")
+        scope = "quoting" if getattr(ev, "halt_scope", "all") == "quoting" else "all"
+        if ev.halted and not self.halted_all and not (scope == "quoting" and self.halted_quoting):
+            out += self._halt(ev.ts, f"carried_over:{ev.halt_reason or 'halt'}", scope=scope)
         elif not self.halted_all and self.seed_day_pnl <= -self.cfg.daily_loss_halt:
             out += self._halt(ev.ts, "daily_loss", scope="all")
         return out
