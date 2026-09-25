@@ -305,8 +305,9 @@ class LiveApp:
             raise StartupError(str(exc)) from exc
 
         # 3. REST
+        # paper never writes: a non-GET from a paper session raises before it is signed
         self.rest = self.ov.rest or KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write,
-                                               clock_ns=self.clock, **kc.rest_kwargs())
+                                               clock_ns=self.clock, read_only=(mode != "live"), **kc.rest_kwargs())
         try:
             limits = await self.rest.configure_rate_limits()
             self.info["rate_limits"] = limits

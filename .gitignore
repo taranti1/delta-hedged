@@ -24,6 +24,12 @@ config/live.yaml
 # Recorder / process logs, pid files and the recorder's single-instance lock.
 data/logs/
 data/recorder.lock
+# Runner state (paper/live sessions, kill file, heartbeats, risk state): host-local, never source.
+data/run/
+data/paper/
+data/paper_logs/
+data/live/
+data/live_logs/
 
 # Claude Code agent worktrees
 .claude/
