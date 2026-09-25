@@ -10,7 +10,7 @@ import yaml
 from dh.core.units import NS_PER_S
 from dh.live.config import LiveConfig, VenueCfg
 from dh.live.monitor import JsonLog
-from dh.live.tools import cmd_backfill, cmd_ledger, cmd_orders, cmd_reconcile, cmd_replay
+from dh.live.tools import cmd_backfill, cmd_balance, cmd_ledger, cmd_orders, cmd_reconcile, cmd_replay
 
 from .fakes import FakeRest, order_row
 from .test_app import _setup
@@ -25,7 +25,14 @@ async def test_backfill_orders_and_reconcile_commands(tmp_path):
     assert '"ok": true' in out[-1]
     rest.orders["o-1"] = order_row("c-1", "o-1", "KXBTCD-X")
     assert await cmd_orders(LiveConfig(venue=VenueCfg(subaccount=2)), rest, out.append) == 1  # not empty
-    assert rest.of("iter_orders")[-1][1] == {"status": "resting", "subaccount": 2} and out[-1] == "1 resting orders"
+    assert rest.of("iter_orders")[-1][1] == {"status": "resting", "subaccount": 2}
+    assert out[-1] == "1 resting orders (subaccount 2)"
+    # balance of the subaccount on every configured shard vs the start-up requirement ($50 + margin)
+    rest.balances = {2: "75.0000"}
+    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 0
+    assert rest.of("get_balance")[-1][1] == {"subaccount": 1, "exchange_index": 2} and out[-1].endswith("OK")
+    rest.balances = {2: "59.0000"}
+    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 1 and "TOO LOW" in out[-1]
     # reconcile: log.fill vs exchange fills
     log = tmp_path / "live-x.jsonl"
     jl = JsonLog(log, "c", "s")

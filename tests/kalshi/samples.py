@@ -27,6 +27,7 @@ SERIES_KXBTCD: dict[str, Any] = {
     "fee_type": "quadratic",
     "fee_multiplier": 1,
     "additional_prohibitions": [],
+    "exchange_index": 2,  # every KXBTC* series / event / market is on exchange shard 2 (2026-08-24)
 }
 
 EVENT_KXBTCD: dict[str, Any] = {
@@ -38,6 +39,7 @@ EVENT_KXBTCD: dict[str, Any] = {
     "mutually_exclusive": False,
     "settlement_sources": [{"name": "CF Benchmarks", "url": "https://www.cfbenchmarks.com/data/indices/BRTI"}],
     "strike_date": "2025-08-05T21:00:00Z",
+    "exchange_index": 2,
 }
 
 MARKET_KXBTCD: dict[str, Any] = {
@@ -78,6 +80,7 @@ MARKET_KXBTCD: dict[str, Any] = {
     "price_ranges": [{"start": "0.0000", "end": "1.0000", "step": "0.0100"}],
     "strike_type": "greater",
     "floor_strike": 114999.99,
+    "exchange_index": 2,
 }
 
 

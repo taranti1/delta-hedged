@@ -3,7 +3,9 @@
     python -m dh.live.tools backfill  [--live-config config/live.yaml]
         test the CF Benchmarks passthrough call used for the fair-value warm-up
     python -m dh.live.tools orders    [--live-config ...]
-        list resting orders on the account (after a kill: must be empty)
+        list resting orders of venue.subaccount (after a kill: must be empty)
+    python -m dh.live.tools balance   [--live-config ...]
+        balance of venue.subaccount on every venue.exchange_indexes shard vs the start-up requirement
     python -m dh.live.tools ledger    --log data/live_logs/<session>.jsonl [--data data/live]
         P&L attribution of a session from its JSON log (net c/contract CI, markouts)
     python -m dh.live.tools replay    --log <session log> [--data data/live] [--config config/m1.yaml]
@@ -73,9 +75,39 @@ async def cmd_orders(lcfg: Any, rest: Any, out: Any = print) -> int:
     rows = [o async for o in rest.iter_orders(**kw)]
     for o in rows:
         out(f"{o.get('ticker')} {o.get('book_side')} {o.get('yes_price_dollars')} rem={o.get('remaining_count_fp')} "
-            f"coid={o.get('client_order_id')} oid={o.get('order_id')}")
-    out(f"{len(rows)} resting orders")
+            f"shard={o.get('exchange_index')} coid={o.get('client_order_id')} oid={o.get('order_id')}")
+    out(f"{len(rows)} resting orders (subaccount {lcfg.venue.sub})")
     return 0 if not rows else 1
+
+
+async def cmd_balance(lcfg: Any, rest: Any, out: Any = print, scfg: Any = None) -> int:
+    """GET /portfolio/balance?subaccount=<n>&exchange_index=<shard> for every configured shard vs
+    the live start-up requirement (worst-case total loss of config/m1.yaml + margin)."""
+    from dh.live.startup import required_balance_usd
+    from dh.live.venue_kalshi import balance_dollars
+
+    if scfg is None:
+        from dh.strategy.config import load_config
+
+        scfg = load_config(REPO_ROOT / "config" / "m1.yaml")
+    from dh.live.venue_kalshi import KalshiVenue
+
+    need = required_balance_usd(scfg.risk, lcfg.venue.min_balance_margin_dollars)
+    try:  # the runner's own computation: available + positions at cost + resting collateral
+        venue = KalshiVenue(rest, sink=lambda ev: None, cfg=lcfg.venue)
+    except ValueError as exc:
+        out(f"refused: {exc}")
+        return 2
+    bad = 0
+    for sh, f in sorted((await venue.fetch_shard_funds()).items()):
+        usd = f["funds"]
+        ok = usd is not None and usd >= need
+        bad += not ok
+        avail = balance_dollars(f["body"])
+        out(f"subaccount {lcfg.venue.sub} shard {sh}: available {'?' if avail is None else f'${avail:.4f}'}, "
+            f"positions ${f['positions']:.4f}, resting ${f['resting']:.4f} -> funds "
+            f"{'?' if usd is None else f'${usd:.4f}'} (required ${need:.2f}) {'OK' if ok else '<-- TOO LOW'}")
+    return 0 if bad == 0 else 1
 
 
 def cmd_ledger(log: str, data: str, out: Any = print) -> int:
@@ -155,7 +187,7 @@ def _session_of(log: str) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m dh.live.tools", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("backfill", "orders", "ledger", "replay", "reconcile"))
+    ap.add_argument("command", choices=("backfill", "orders", "balance", "ledger", "replay", "reconcile"))
     ap.add_argument("--live-config", default="config/live.yaml")
     ap.add_argument("--config", default="config/m1.yaml", help="strategy config (replay)")
     ap.add_argument("--log", default="", help="session JSON log (data/live_logs/<session>.jsonl)")
@@ -178,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
                 return await cmd_backfill(lcfg, rest)
             if a.command == "orders":
                 return await cmd_orders(lcfg, rest)
+            if a.command == "balance":
+                return await cmd_balance(lcfg, rest)
             return await cmd_reconcile(a.log, lcfg, rest)
         finally:
             await rest.close()

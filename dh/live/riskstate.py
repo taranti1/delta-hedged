@@ -26,9 +26,10 @@ Sources at start-up
     its realized part and the open positions' mark at that moment, the halt (reason, scope,
     the UTC day it was decided), the pause and an operator's loss-budget base;
   * live only, Kalshi REST (``derive_day_pnl``): today's fills (GET /portfolio/fills, plus
-    GET /historical/fills for the part before GET /historical/cutoff's trades_created_ts),
-    settlements, positions and the prices above. Every fill / settlement row must parse and
-    carry its time, or the start-up is refused (RiskStateError -> exit 2).
+    GET /historical/fills for the part before GET /historical/cutoff's trades_created_ts, both
+    with the explicit subaccount), settlements, positions and the prices above. Every fill /
+    settlement row of the configured series must parse and carry its time, or the start-up is
+    refused (RiskStateError -> exit 2); rows of other series are skipped and reported.
 
 The seed (dh.core.events.RiskStateSeed, the strategy's first event, recorded for replay):
     realized = min(persisted realized, REST realized)       (live; paper: persisted)
@@ -179,38 +180,39 @@ def row_in_subaccount(row: dict[str, Any], sub: int) -> bool:
     return not explicit and sa == 0 and sub != 0
 
 
-def historical_row_owner(row: dict[str, Any], sub: int) -> bool | None:
-    """GET /historical/fills takes no subaccount parameter, so a row counts only when it says
-    whose it is: True / False from an explicit subaccount field; a row without one is the
-    primary account's (sub 0) and cannot be attributed to a subaccount (None)."""
-    from dh.kalshi.normalize import subaccount_of
-
-    if row.get("subaccount") not in (None, "") or row.get("subaccount_number") not in (None, ""):
-        return subaccount_of(row) == sub
-    return True if sub == 0 else None
-
-
 def _rid(row: Any) -> str:
     if not isinstance(row, dict):
         return repr(row)[:60]
     return str(row.get("fill_id") or row.get("trade_id") or row.get("ticker") or "?")[:60]
 
 
+def row_ticker(row: Any) -> str:
+    """Market ticker of a REST Fill / Settlement row ('' if absent)."""
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("ticker") or row.get("market_ticker") or "")
+
+
+def in_series(ticker: str, series: Iterable[str] | None) -> bool:
+    """``ticker`` belongs to one of ``series`` (None / empty = no filter)."""
+    if not series:
+        return True
+    return ticker.split("-", 1)[0] in set(series)
+
+
 def parse_fill_row(row: Any, subaccount: int, *, historical: bool = False) -> Any:
     """REST Fill row -> KalshiFill, or None when it is another subaccount's. A malformed row, or
-    one without its time, raises RiskStateError (the day's P&L would be wrong)."""
+    one without its time, raises RiskStateError (the day's P&L would be wrong).
+
+    Live and historical rows are attributed alike: both reads pass ``subaccount`` explicitly
+    (GET /historical/fills takes it since openapi 3.31.0; omitted = all subaccounts), so a row
+    without a subaccount field is the requested subaccount's and a row naming another one is
+    dropped (``row_in_subaccount``). ``historical`` is kept for the caller's statistics."""
     from dh.kalshi.normalize import rest_fill_to_event
 
     if not isinstance(row, dict):
         raise RiskStateError(f"malformed fill row {_rid(row)}")
-    if historical:
-        owner = historical_row_owner(row, subaccount)
-        if owner is None:
-            raise RiskStateError(f"historical fill {_rid(row)} names no subaccount: it cannot be attributed to "
-                                 f"subaccount {subaccount} (GET /historical/fills has no subaccount filter)")
-        if not owner:
-            return None
-    elif not row_in_subaccount(row, subaccount):
+    if not row_in_subaccount(row, subaccount):
         return None
     try:
         f = rest_fill_to_event(row, 0)
@@ -278,6 +280,7 @@ class DayFlows:
     fills: int = 0
     historical_fills: int = 0
     settlements: int = 0
+    foreign: dict[str, int] = field(default_factory=dict)  # ticker outside the series -> rows skipped
 
     def midnight_positions(self, positions: dict[str, int]) -> dict[str, int]:
         """Positions held at 00:00 UTC = now - today's fills + today's settled quantities."""
@@ -290,13 +293,20 @@ class DayFlows:
 
 
 def day_flows(day_start_ns: int, fills: Iterable[Any], settlements: Iterable[Any], *, subaccount: int = 0,
-              historical_fills: Iterable[Any] = ()) -> DayFlows:
+              historical_fills: Iterable[Any] = (), series: Iterable[str] | None = None) -> DayFlows:
     """Parse and validate today's fills (live + historical, de-duplicated by fill / trade id)
-    and settlements. Rows before ``day_start_ns`` are skipped; bad rows raise RiskStateError."""
+    and settlements. Rows before ``day_start_ns`` are skipped; bad rows raise RiskStateError.
+    Rows of a market outside ``series`` (e.g. a manual trade on the subaccount) are skipped and
+    counted in ``foreign`` BEFORE they are parsed: they never refuse the start."""
     out = DayFlows(day_start_ns)
     seen: set[str] = set()
+    series = tuple(series or ())
     for hist, rows in ((False, fills), (True, historical_fills)):
         for row in rows:
+            tk = row_ticker(row)
+            if tk and not in_series(tk, series):
+                out.foreign[tk] = out.foreign.get(tk, 0) + 1
+                continue
             f = parse_fill_row(row, subaccount, historical=hist)
             if f is None:
                 continue
@@ -313,6 +323,10 @@ def day_flows(day_start_ns: int, fills: Iterable[Any], settlements: Iterable[Any
             out.fills += 1
             out.historical_fills += int(hist)
     for row in settlements:
+        tk = row_ticker(row)
+        if tk and not in_series(tk, series):
+            out.foreign[tk] = out.foreign.get(tk, 0) + 1
+            continue
         s = parse_settlement_row(row, subaccount)
         if s is None:
             continue
@@ -346,6 +360,7 @@ class DayPnl:
     midnight_px: dict[str, int] = field(default_factory=dict)
     price_src: dict[str, str] = field(default_factory=dict)  # "open:<t>" / "midnight:<t>" -> where the price came from
     fallbacks: list[str] = field(default_factory=list)  # prices that did not exist: worst case used
+    foreign: dict[str, int] = field(default_factory=dict)  # fill/settlement rows outside the series (skipped)
 
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
@@ -359,7 +374,7 @@ def day_pnl_from_flows(fl: DayFlows, positions: dict[str, int], *, open_px: dict
     """Value today's flows and positions (module docstring). ``open_px`` / ``midnight_px``:
     {ticker: px}; a missing price falls back to the worst case and is listed in ``fallbacks``."""
     out = DayPnl(fl.day_start_ns, fills=fl.fills, historical_fills=fl.historical_fills, settlements=fl.settlements,
-                 price_src=dict(price_src or {}))
+                 price_src=dict(price_src or {}), foreign=dict(fl.foreign))
     open_px = open_px or {}
     midnight_px = midnight_px or {}
     open_micros = mid_micros = 0
@@ -394,9 +409,10 @@ def day_pnl_from_flows(fl: DayFlows, positions: dict[str, int], *, open_px: dict
 
 def day_pnl_from_rows(day_start_ns: int, fills: Iterable[Any], settlements: Iterable[Any], positions: dict[str, int],
                       *, subaccount: int = 0, historical_fills: Iterable[Any] = (), open_px: dict[str, int] | None = None,
-                      midnight_px: dict[str, int] | None = None) -> DayPnl:
+                      midnight_px: dict[str, int] | None = None, series: Iterable[str] | None = None) -> DayPnl:
     """Pure form of ``derive_day_pnl`` (tests feed rows and prices directly)."""
-    fl = day_flows(day_start_ns, fills, settlements, subaccount=subaccount, historical_fills=historical_fills)
+    fl = day_flows(day_start_ns, fills, settlements, subaccount=subaccount, historical_fills=historical_fills,
+                   series=series)
     return day_pnl_from_flows(fl, positions, open_px=open_px, midnight_px=midnight_px)
 
 
@@ -530,10 +546,13 @@ async def historical_cutoff(rest: Any) -> dict[str, int]:
     return out
 
 
-async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int], *, subaccount: int = 0) -> DayPnl:
+async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int], *, subaccount: int = 0,
+                         series: Iterable[str] | None = None) -> DayPnl:
     """Today's P&L from Kalshi (module docstring): the historical cutoff, today's fills (live
-    and, before the cutoff, historical), settlements, then the prices of the open positions and
-    of the positions held at midnight. Any failure raises RiskStateError."""
+    and, before the cutoff, historical: both with the explicit ``subaccount``), settlements,
+    then the prices of the open positions and of the positions held at midnight. Fill and
+    settlement rows outside ``series`` are skipped (``DayPnl.foreign``); pass the positions
+    of ``series`` only. Any failure raises RiskStateError."""
     try:
         cut = await historical_cutoff(rest)
         trades_cut = cut["trades_created_ts"]
@@ -541,9 +560,10 @@ async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int]
         fills = [f async for f in rest.iter_fills(min_ts=min_s, subaccount=subaccount)]
         hist: list[Any] = []
         if trades_cut > day_start_ns:  # part of today is only in the historical set
-            hist = [f async for f in rest.iter_historical_fills(min_ts=min_s, max_ts=-(-trades_cut // NS_PER_S))]
+            hist = [f async for f in rest.iter_historical_fills(min_ts=min_s, max_ts=-(-trades_cut // NS_PER_S),
+                                                                subaccount=subaccount)]
         settles = [s async for s in rest.iter_settlements(min_ts=min_s, subaccount=subaccount)]
-        fl = day_flows(day_start_ns, fills, settles, subaccount=subaccount, historical_fills=hist)
+        fl = day_flows(day_start_ns, fills, settles, subaccount=subaccount, historical_fills=hist, series=series)
         open_px, src = await open_marks(rest, positions)
         mid_px: dict[str, int] = {}
         for tk in fl.midnight_positions(positions):
@@ -726,5 +746,6 @@ class RiskBook:
 
 __all__ = ["DAY_NS", "DayFlows", "DayPnl", "RiskBook", "RiskState", "RiskStateError", "RiskStateStore", "SeedDecision",
            "base_reason", "day_flows", "day_pnl_from_flows", "day_pnl_from_rows", "day_start", "decide_seed",
-           "derive_day_pnl", "fsync_dir", "historical_cutoff", "last_trade_px", "make_seed", "mark_px", "open_marks",
-           "parse_fill_row", "parse_settlement_row", "payout_px", "row_in_subaccount", "state_from_decision", "sticky"]
+           "derive_day_pnl", "fsync_dir", "historical_cutoff", "in_series", "last_trade_px", "make_seed", "mark_px",
+           "open_marks", "parse_fill_row", "parse_settlement_row", "payout_px", "row_in_subaccount", "row_ticker",
+           "state_from_decision", "sticky"]

@@ -2,8 +2,12 @@
 
 Runs as a SEPARATE process (scripts/watchdog.py) with its own Kalshi API session (optionally
 its own API key), so it keeps working when the runner crashes, hangs or loses its event loop.
-It only ever calls ``DELETE /portfolio/events/orders?subaccount=<n>`` (cancel all, with the
-subaccount explicit: omitted means ALL subaccounts): it never places orders.
+It never places orders. On a trigger it first TRIGGERS the runner's order groups named in its
+last heartbeat (``PUT /portfolio/order_groups/{id}/trigger?subaccount=<n>&exchange_index=<s>``:
+the fastest scoped kill, no documented trailing tail; only groups of the configured
+subaccount), then calls ``DELETE /portfolio/events/orders?subaccount=<n>`` (cancel all, with
+the subaccount explicit: omitted means ALL subaccounts). During an EXCHANGE pause both are
+rejected (Kalshi blocks cancels too): it keeps retrying; ``cancel_order_on_pause`` protects.
 
 State machine (poll every ``poll_s``):
   DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping); it then
@@ -50,6 +54,7 @@ from dh.live.monitor import cancel_all_marker_path, read_heartbeat, write_json_a
 log = logging.getLogger("dh.live.watchdog")
 
 CancelAllFn = Callable[[], Awaitable[bool]]
+TriggerFn = Callable[[list[dict[str, Any]]], Awaitable[int]]
 
 
 @dataclass
@@ -68,6 +73,7 @@ class WatchdogState:
     attempts: int = 0
     failures: int = 0
     foreign: int = 0  # heartbeats from other writers ignored
+    groups: list[dict[str, Any]] = field(default_factory=list)  # the watched runner's order groups (heartbeat)
     events: list[tuple[int, str]] = field(default_factory=list)  # (ns, message), bounded
 
 
@@ -85,9 +91,11 @@ class Watchdog:
         arm_on_start: bool = False,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         marker_path: str | Path | None = None,
+        trigger_groups: TriggerFn | None = None,
     ) -> None:
         self.path = Path(heartbeat_path)
         self.cancel_all = cancel_all
+        self.trigger_groups = trigger_groups
         self.cfg = cfg or WatchdogCfg()
         self._clock = clock_ns
         self._sleep = sleep
@@ -115,7 +123,8 @@ class Watchdog:
         st.last_state = str(hb.get("state", "running"))
         st.stopping_seen_ns = 0
         st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or 10.0)
-        self._note(note, pid=hb.get("pid"), session=hb.get("session"))
+        st.groups = _groups_of(hb)
+        self._note(note, pid=hb.get("pid"), session=hb.get("session"), groups=len(st.groups))
 
     async def step(self) -> str:
         """One poll; returns the resulting state."""
@@ -146,6 +155,8 @@ class Watchdog:
             st.last_hb_ns = max(st.last_hb_ns, t or 0)
             st.last_state = hstate
             st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or st.shutdown_timeout_s)
+            if "order_groups" in hb:  # the runner deletes its groups at shutdown: follow the heartbeat
+                st.groups = _groups_of(hb)
             if hstate == "stopping":
                 st.stopping_seen_ns = st.stopping_seen_ns or now
             else:
@@ -195,6 +206,13 @@ class Watchdog:
         st = self.st
         st.attempts += 1
         st.last_attempt_ns = now
+        triggered = 0
+        if self.trigger_groups is not None and st.groups:
+            try:  # first, fastest scoped kill: the runner's own order groups
+                triggered = int(await self.trigger_groups(list(st.groups)))
+                self._note("order groups triggered", n=triggered, of=len(st.groups))
+            except Exception as exc:  # noqa: BLE001 - the cancel-all below still runs
+                self._note("order-group trigger raised", error=f"{type(exc).__name__}: {exc}"[:200])
         try:
             ok = bool(await self.cancel_all())
         except Exception as exc:  # noqa: BLE001 - keep trying
@@ -209,7 +227,8 @@ class Watchdog:
             self._note("cancel-all FAILED (will retry)", failures=st.failures)
         try:
             write_json_atomic(self.marker, {"t": now, "ok": ok, "by": "watchdog", "pid": os.getpid(),
-                                            "watched": list(st.armed) if st.armed else None})
+                                            "watched": list(st.armed) if st.armed else None,
+                                            "groups_triggered": triggered})
         except OSError as exc:
             self._note("cancel-all marker write failed", error=str(exc)[:200])
 
@@ -222,16 +241,60 @@ class Watchdog:
             await self._sleep(self.cfg.poll_s)
 
 
-def rest_cancel_all(rest: Any, subaccount: int | None = None) -> CancelAllFn:
+def _groups_of(hb: dict[str, Any]) -> list[dict[str, Any]]:
+    out = []
+    for g in hb.get("order_groups") or []:
+        if isinstance(g, dict) and g.get("id"):
+            out.append({"id": str(g["id"]), "exchange_index": g.get("exchange_index"), "subaccount": g.get("subaccount"),
+                        "logical": g.get("logical")})
+    return out
+
+
+def rest_cancel_all(rest: Any, subaccount: int) -> CancelAllFn:
     """cancel_all for Watchdog on top of KalshiRest: True only on a definite 2xx. The
-    subaccount is always explicit (None -> 0, the primary): Kalshi reads an omitted
+    subaccount is REQUIRED and always sent (0 = the primary): Kalshi reads an omitted
     subaccount as ALL subaccounts."""
     from dh.kalshi.rest import UnknownOutcome
 
-    sub = int(subaccount) if subaccount is not None else 0
+    if subaccount is None or isinstance(subaccount, bool):
+        raise ValueError("rest_cancel_all needs an explicit subaccount (omitted = ALL subaccounts)")
+    sub = int(subaccount)
 
     async def _cancel() -> bool:
         res = await rest.cancel_all_orders(subaccount=sub)
         return not isinstance(res, UnknownOutcome)
 
     return _cancel
+
+
+def rest_trigger_groups(rest: Any, subaccount: int) -> TriggerFn:
+    """trigger_groups for Watchdog: ``PUT /portfolio/order_groups/{id}/trigger`` with the
+    explicit subaccount and the group's exchange shard, for every group the runner's heartbeat
+    names ON THIS SUBACCOUNT (a group naming another subaccount, or no shard, is skipped: never
+    act on another system's subaccount). Returns the number triggered (2xx)."""
+    from dh.kalshi.normalize import shard_value
+    from dh.kalshi.rest import UnknownOutcome
+
+    if subaccount is None or isinstance(subaccount, bool):
+        raise ValueError("rest_trigger_groups needs an explicit subaccount")
+    sub = int(subaccount)
+
+    async def _trigger(groups: list[dict[str, Any]]) -> int:
+        n = 0
+        for g in groups:
+            sh = shard_value(g.get("exchange_index"))
+            gs = g.get("subaccount")
+            if sh is None or gs is None or int(gs) != sub:
+                log.warning("watchdog: order group %s skipped (subaccount %s, shard %s; configured subaccount %d)",
+                            g.get("id"), gs, g.get("exchange_index"), sub)
+                continue
+            try:
+                res = await rest.trigger_order_group(str(g["id"]), subaccount=sub, exchange_index=sh)
+            except Exception as exc:  # noqa: BLE001 - 404 (deleted), 429, network: the cancel-all follows
+                log.warning("watchdog: trigger of order group %s failed: %s", g.get("id"), exc)
+                continue
+            if not isinstance(res, UnknownOutcome):
+                n += 1
+        return n
+
+    return _trigger

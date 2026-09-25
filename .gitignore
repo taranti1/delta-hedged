@@ -24,6 +24,8 @@ config/live.yaml
 # Recorder / process logs, pid files and the recorder's single-instance lock.
 data/logs/
 data/recorder.lock
+# macOS runtime dir of the live runner / watchdog: kill file, heartbeat, locks, watchdog marker.
+data/run/
 
 # Claude Code agent worktrees
 .claude/

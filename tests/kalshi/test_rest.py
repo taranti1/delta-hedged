@@ -182,7 +182,7 @@ async def test_order_endpoint_shapes_and_write_costs():
     await k.decrease_order("o1", reduce_to=250, market_ticker="T")
     await k.amend_order("o1", {"ticker": "T", "side": "bid", "price": "0.4600", "count": "3.00"})
     await k.batch_create_orders([{"ticker": "T"}] * 5)
-    assert await k.cancel_all_orders() == {}
+    assert await k.cancel_all_orders(subaccount=0) == {}
     await k.create_order_group(1500)
     await k.update_order_group_limit("g1", 250)
     await k.reset_order_group("g1")
@@ -191,7 +191,7 @@ async def test_order_endpoint_shapes_and_write_costs():
     assert orjson.loads(c[1]["data"]) == {"reduce_to": "2.50", "market_ticker": "T"}
     assert c[2]["url"].endswith("/portfolio/events/orders/o1/amend")
     assert c[3]["url"].endswith("/portfolio/events/orders/batched") and len(orjson.loads(c[3]["data"])["orders"]) == 5
-    assert (c[4]["method"], c[4]["url"]) == ("DELETE", BASE + "/portfolio/events/orders")
+    assert (c[4]["method"], c[4]["url"], c[4]["params"]) == ("DELETE", BASE + "/portfolio/events/orders", [("subaccount", "0")])
     assert orjson.loads(c[5]["data"]) == {"contracts_limit_fp": "15.00"}
     assert (c[6]["method"], orjson.loads(c[6]["data"])) == ("PUT", {"contracts_limit_fp": "2.50"})
     # write bucket: cancel 2 + decrease 10 + amend 10 + batch 5x10 + cancel-all 2 + group create/limit/reset 3x10

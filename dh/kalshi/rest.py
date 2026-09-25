@@ -86,6 +86,13 @@ class ReadOnlyViolation(KalshiError):
     """A write (non-GET) was attempted on a client created with ``read_only=True``."""
 
 
+class UnscopedWriteError(NotSentError):
+    """A write that does not name, explicitly, the subaccount this client is bound to
+    (``write_subaccount``) and an exchange shard: refused BEFORE it is signed or sent (a
+    definite not-sent outcome). On a shared account an omitted subaccount means "all
+    subaccounts" (cancel-all, GET orders/fills) or the primary account (everything else)."""
+
+
 class KalshiPaginationError(KalshiError):
     """Cursor pagination misbehaved (repeated cursor, page limit exceeded)."""
 
@@ -235,11 +242,16 @@ class KalshiRest:
         cf_history_path: str = DEFAULT_CF_HISTORY_PATH,
         trust_env: bool = True,
         read_only: bool = False,
+        write_subaccount: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         # read_only: every non-GET/HEAD request raises ReadOnlyViolation BEFORE anything is
         # signed or sent (recorder, smoke checks and research tools never write).
         self.read_only = read_only
+        # write_subaccount: every write must carry subaccount == this (query or body, per item
+        # of a batch) and an exchange_index (all but cancel-all, which has none), else it raises
+        # UnscopedWriteError before anything is signed or sent (the live runner and watchdog)
+        self.write_subaccount = None if write_subaccount is None else int(write_subaccount)
         self.signer = signer
         self.limiter = limiter
         self.on_raw = on_raw
@@ -379,6 +391,9 @@ class KalshiRest:
         """Non-idempotent request, never retried. See module docstring for outcomes."""
         if self.read_only:
             raise ReadOnlyViolation(f"{method} {path} refused: this client is read-only")
+        problem = self.write_scope_problem(method, path, params, json_body)
+        if problem:
+            raise UnscopedWriteError(f"{method} {path} refused before sending: {problem}")
         try:
             resp = await self._send(method, path, params, json_body, stream, self.cfg.write_timeout_s, n_items)
         except NotSentError:
@@ -396,6 +411,50 @@ class KalshiRest:
             self.stats["unknown_outcomes"] += 1
             return UnknownOutcome(method, path, json_body, "unparseable success body", resp.status)
         return parsed if isinstance(parsed, dict) else {}
+
+    def write_scope_problem(self, method: str, path: str, params: Params, json_body: Any) -> str:
+        """'' if the write names ``write_subaccount`` (and a shard) explicitly, else why not.
+
+        Scope = the query parameters plus the body's ``subaccount`` / ``exchange_index``; a batch
+        (body ``{"orders": [...]}``) needs both on EVERY item. ``exchange_index`` is required on
+        every write except cancel-all (DELETE /portfolio/events/orders spans every shard); -1
+        (documented "require auto-routing by ticker") counts as explicit."""
+        sub = self.write_subaccount
+        if sub is None:
+            return ""
+        need_shard = not (method.upper() == "DELETE" and path == "/portfolio/events/orders")
+        scopes: list[tuple[str, dict[str, Any]]]
+        if isinstance(json_body, dict) and isinstance(json_body.get("orders"), list):
+            items = json_body["orders"]
+            if not items:
+                return "empty batch"
+            scopes = [(f"orders[{i}]", it if isinstance(it, dict) else {}) for i, it in enumerate(items)]
+        else:
+            merged = _params_dict(params)
+            if isinstance(json_body, dict):
+                merged.update({k: json_body[k] for k in ("subaccount", "exchange_index") if k in json_body})
+            scopes = [("request", merged)]
+        for where, d in scopes:
+            v = d.get("subaccount")
+            if v in (None, "") or isinstance(v, (bool, list)):
+                return f"{where}: no explicit subaccount (this client writes only for subaccount {sub})"
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return f"{where}: unparseable subaccount {v!r}"
+            if iv != sub:
+                return f"{where}: subaccount {iv} is not this client's subaccount {sub}"
+            if need_shard:
+                s = d.get("exchange_index")
+                if s in (None, "") or isinstance(s, (bool, list)):
+                    return f"{where}: no explicit exchange_index"
+                try:
+                    si = int(s)
+                except (TypeError, ValueError):
+                    return f"{where}: unparseable exchange_index {s!r}"
+                if si < -1:
+                    return f"{where}: invalid exchange_index {si}"
+        return ""
 
     async def paginate(
         self,
@@ -770,6 +829,8 @@ class KalshiRest:
         )
 
     def iter_historical_fills(self, *, limit: int = 1000, **filters: Any) -> AsyncIterator[dict[str, Any]]:
+        """GET /historical/fills (ticker, min_ts, max_ts, subaccount). openapi 3.31.0: an omitted
+        ``subaccount`` means ALL subaccounts; pass it explicitly."""
         return self.paginate("/historical/fills", {"limit": limit, **filters}, "fills", stream="kalshi.rest.portfolio")
 
     def iter_historical_orders(self, *, limit: int = 1000, **filters: Any) -> AsyncIterator[dict[str, Any]]:
@@ -800,6 +861,11 @@ class KalshiRest:
             stream="kalshi.rest.incentives",
             cursor_field="next_cursor",
         )
+
+    async def get_api_keys(self) -> dict[str, Any]:
+        """GET /api_keys -> {'api_keys': [{api_key_id, name, scopes, subaccount?}]} (a key's
+        ``subaccount`` restricts it to that subaccount; null = unrestricted)."""
+        return await self.get("/api_keys", stream="kalshi.rest.account")
 
     async def get_account_limits(self) -> dict[str, Any]:
         """GET /account/limits -> usage_tier, read/write BucketLimit, grants."""
@@ -999,9 +1065,13 @@ class KalshiRest:
             "DELETE", "/portfolio/events/orders/batched", json_body={"orders": orders}, n_items=max(1, len(orders))
         )
 
-    async def cancel_all_orders(self, *, subaccount: int | None = None) -> dict[str, Any] | UnknownOutcome:
-        """DELETE /portfolio/events/orders (all resting event-market orders; 204 -> {})."""
-        return await self.write("DELETE", "/portfolio/events/orders", params=build_params(subaccount=subaccount))
+    async def cancel_all_orders(self, *, subaccount: int) -> dict[str, Any] | UnknownOutcome:
+        """DELETE /portfolio/events/orders?subaccount=<n> (all resting event-market orders of that
+        subaccount on every shard; 204 -> {}). ``subaccount`` is REQUIRED: omitted, Kalshi cancels
+        the orders of ALL subaccounts (openapi 3.31.0), i.e. another system's on a shared account."""
+        if subaccount is None or isinstance(subaccount, bool):
+            raise ValueError("cancel_all_orders needs an explicit subaccount (omitted = ALL subaccounts)")
+        return await self.write("DELETE", "/portfolio/events/orders", params=build_params(subaccount=int(subaccount)))
 
     # ------------------------------------------------------------------ order groups
     async def create_order_group(

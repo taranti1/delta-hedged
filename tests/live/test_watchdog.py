@@ -102,7 +102,7 @@ async def test_arm_on_start_acts_on_stale_file(tmp_path):
     clock = FakeClock()
     write_heartbeat(tmp_path / "hb.json", {"mode": "live", "state": "running"}, now_ns=clock() - 60 * NS_PER_S)
     rest = FakeRest()
-    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest), WatchdogCfg(), clock_ns=clock, arm_on_start=True)
+    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, 0), WatchdogCfg(), clock_ns=clock, arm_on_start=True)
     assert await w.step() == "TRIGGERED" and rest.names() == ["cancel_all_orders"]
 
 
@@ -199,7 +199,9 @@ async def test_cancel_all_marker_and_explicit_primary_subaccount(tmp_path):
 
     clock = FakeClock()
     rest = FakeRest()
-    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, None), WatchdogCfg(), clock_ns=clock)
+    with pytest.raises(ValueError, match="explicit subaccount"):
+        rest_cancel_all(rest, None)  # type: ignore[arg-type] - None would mean ALL subaccounts on the wire
+    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, 0), WatchdogCfg(), clock_ns=clock)
     hb(tmp_path, clock, 100)
     await w.step()
     clock.advance(3 * NS_PER_S)
@@ -225,7 +227,7 @@ async def test_arm_on_start_waits_when_there_is_no_live_heartbeat(tmp_path, kind
     elif kind == "unreadable":
         p.write_text("{not json")
     rest = FakeRest()
-    w = Watchdog(p, rest_cancel_all(rest), WatchdogCfg(stale_s=2.0), clock_ns=clock, arm_on_start=True)
+    w = Watchdog(p, rest_cancel_all(rest, 0), WatchdogCfg(stale_s=2.0), clock_ns=clock, arm_on_start=True)
     assert await w.step() == "DISARMED" and rest.calls == []
     clock.advance(10 * NS_PER_S)
     assert await w.step() == "DISARMED" and rest.calls == []
@@ -241,7 +243,7 @@ async def test_arm_on_start_locks_onto_a_fresh_live_heartbeat_and_names_it_in_th
     clock = FakeClock()
     hb(tmp_path, clock, 100, session="live-a")
     rest = FakeRest()
-    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest), WatchdogCfg(stale_s=2.0), clock_ns=clock,
+    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, 0), WatchdogCfg(stale_s=2.0), clock_ns=clock,
                  arm_on_start=True)
     assert await w.step() == "ARMED" and w.st.armed == (100, "live-a") and rest.calls == []
     for _ in range(12):  # the live runner died; a paper runner writing the same file cannot keep it quiet
@@ -258,6 +260,6 @@ async def test_arm_on_start_triggers_on_a_stale_stopping_heartbeat(tmp_path):
     write_heartbeat(tmp_path / "hb.json", {"mode": "live", "state": "stopping", "pid": 9, "session": "live-s"},
                     now_ns=clock() - 30 * NS_PER_S)
     rest = FakeRest()
-    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest), WatchdogCfg(stale_s=2.0), clock_ns=clock,
+    w = Watchdog(tmp_path / "hb.json", rest_cancel_all(rest, 0), WatchdogCfg(stale_s=2.0), clock_ns=clock,
                  arm_on_start=True)
     assert await w.step() == "TRIGGERED" and w.st.armed == (9, "live-s") and rest.names() == ["cancel_all_orders"]

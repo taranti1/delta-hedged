@@ -22,7 +22,6 @@ from dh.live.riskstate import (
     day_pnl_from_rows,
     decide_seed,
     derive_day_pnl,
-    historical_row_owner,
     make_seed,
     mark_px,
     row_in_subaccount,
@@ -130,11 +129,26 @@ def test_subaccount_rows():
     rows = [fill_row("f1", "o1", TK, side="bid", px="0.5000", count="1.00", created_ns=T0),
             fill_row("f2", "o2", TK, side="bid", px="0.5000", count="1.00", created_ns=T0, subaccount=5)]
     assert day_pnl_from_rows(DAY0, rows, [], {}).fills == 1
-    # /historical/fills has no subaccount filter: only rows that say whose they are count
-    assert historical_row_owner({}, 0) is True and historical_row_owner({"subaccount_number": 3}, 3) is True
-    assert historical_row_owner({"subaccount_number": 3}, 0) is False and historical_row_owner({}, 3) is None
-    with pytest.raises(RiskStateError, match="cannot be attributed"):
-        day_pnl_from_rows(DAY0, [], [], {}, subaccount=3, historical_fills=[fill_row("h1", "o1", TK, created_ns=T0)])
+    # GET /historical/fills takes the explicit subaccount (openapi 3.31.0): its rows are attributed
+    # like the live ones (no field = the requested subaccount; another number = dropped)
+    hist = [fill_row("h1", "o1", TK, created_ns=T0), fill_row("h2", "o2", TK, created_ns=T0, subaccount=5),
+            fill_row("h3", "o3", TK, created_ns=T0, subaccount=3)]
+    d = day_pnl_from_rows(DAY0, [], [], {}, subaccount=3, historical_fills=hist)
+    assert d.fills == 2 and d.historical_fills == 2
+
+
+def test_rows_outside_the_series_are_skipped_not_fatal():
+    """A dedicated subaccount may still see a manual trade in another market: its fill and
+    settlement rows are skipped (reported), even malformed ones, instead of refusing the start."""
+    other = "KXNHLGAME-26SEP22FLACAR-FLA"
+    fills = [fill_row("f1", "o1", TK, side="bid", px="0.5000", count="1.00", created_ns=T0),
+             fill_row("x1", "ox", other, side="bid", px="0.5000", count="1.00", created_ns=T0) | {"created_time": None}]
+    settles = [settle_row(other, "yes", yes="3.00") | {"settled_time": None}]
+    d = day_pnl_from_rows(DAY0, fills, settles, {}, series=("KXBTCD",))
+    assert d.fills == 1 and d.settlements == 0 and d.foreign == {other: 2}
+    assert d.pnl_usd == pytest.approx(-0.5)
+    with pytest.raises(RiskStateError):  # without the series filter the malformed row still refuses
+        day_pnl_from_rows(DAY0, fills, settles, {})
 
 
 def test_mark_px_rules():
@@ -166,7 +180,8 @@ async def test_derive_day_pnl_uses_the_cutoff_prices_and_explicit_subaccount():
     rest.trades = [trade_row("t2", TK2, px="0.9000", created_ns=DAY0 + 60 * NS_PER_S)]  # after midnight: ignored
     d = await derive_day_pnl(rest, DAY0, {TK: 400}, subaccount=0)
     assert rest.of("iter_fills")[0][1] == {"min_ts": DAY0 // NS_PER_S, "subaccount": 0}
-    assert rest.of("iter_historical_fills")[0][1] == {"min_ts": DAY0 // NS_PER_S, "max_ts": cut // NS_PER_S}
+    assert rest.of("iter_historical_fills")[0][1] == {"min_ts": DAY0 // NS_PER_S, "max_ts": cut // NS_PER_S,
+                                                      "subaccount": 0}
     assert rest.of("iter_settlements")[0][1] == {"min_ts": DAY0 // NS_PER_S, "subaccount": 0}
     assert d.fills == 3 and d.historical_fills == 0  # 'early' counted once (from the live page)
     assert d.open_px == {TK: 4800} and d.positions_midnight == {TK2: 100} and d.midnight_px == {TK2: 5100}

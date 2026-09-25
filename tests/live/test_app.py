@@ -143,10 +143,14 @@ async def test_live_session_end_to_end(tmp_path):
     await app.close()
     assert code == 0 and runner.shutdown_ok
     names = rest.names()
-    # start-up: clean-slate cancel-all VERIFIED (resting list), THEN positions, today's fills and
-    # settlements (risk seed), order group before any order
-    assert (names.index("cancel_all_orders") < names.index("iter_orders") < names.index("get_all_positions")
-            < names.index("iter_fills") < names.index("iter_settlements") < names.index("create_order_group"))
+    # start-up: the shard's funds (read-only: balance, positions, resting orders of shard 2) BEFORE
+    # any write, then the clean-slate cancel-all VERIFIED (resting list), THEN positions, today's
+    # fills and settlements (risk seed), order group before any order
+    ca = names.index("cancel_all_orders")
+    assert names.index("get_balance") < ca
+    after = names[ca:]
+    assert (after.index("iter_orders") < after.index("get_all_positions") < after.index("iter_fills")
+            < after.index("iter_settlements") < after.index("create_order_group"))
     assert all(k.get("subaccount") == 0 for n, _, k in rest.calls if n in ("cancel_all_orders", "iter_orders", "iter_fills",
                                                                          "get_all_positions", "iter_settlements"))
     first_order = min(names.index(n) for n in ("create_order", "batch_create_orders") if n in names)

@@ -1,7 +1,8 @@
 """Start-up helpers shared by live and paper mode (all offline-testable with fake REST).
 
-    status  = await exchange_status(rest)
-    sel     = await discover_universe(rest, ("KXBTCD",), fee_engine, now_ns, horizon_s)
+    status  = await exchange_status(rest, shards=(2,))       # the shards' own trading status
+    sel     = await discover_universe(rest, ("KXBTCD",), fee_engine, now_ns, horizon_s, exchange_indexes=(2,))
+    closures, notes = schedule_closures(await rest.get_exchange_schedule(), start_ns, end_ns)
     result  = await backfill_fair_value(rest, fv_model, now_ns, BackfillCfg())
     sim     = build_paper_sim(PaperCfg(), sel.specs, fee_engine)
 
@@ -37,13 +38,208 @@ TRADABLE_STATUSES = ("", "active", "open", "initialized")
 
 
 # ============================================================================ exchange
-async def exchange_status(rest: Any) -> dict[str, Any]:
-    """GET /exchange/status -> {'exchange_active', 'trading_active', ...} (booleans coerced)."""
-    body = await rest.get_exchange_status()
+def shard_status(body: Any, shards: Iterable[int] = ()) -> dict[str, Any]:
+    """ExchangeStatus -> the status that applies to ``shards``.
+
+    openapi 3.31.0: the top-level ``exchange_active`` / ``trading_active`` describe the DEFAULT
+    shard (0); ``exchange_index_statuses`` (absent when the breakdown is unavailable) has one
+    entry per shard. For each of ``shards`` its entry is used, else the top level (noted in
+    ``source``); the result is active only if every shard is. ``exchange_active`` false is an
+    exchange pause (cancels are rejected too); ``trading_active`` false alone is a trading pause
+    (cancels still work)."""
     out = dict(body or {})
-    out["exchange_active"] = bool(out.get("exchange_active", False))
-    out["trading_active"] = bool(out.get("trading_active", False))
+    top_ex = bool(out.get("exchange_active", False))
+    top_tr = bool(out.get("trading_active", False))
+    per: dict[int, dict[str, Any]] = {}
+    for e in out.get("exchange_index_statuses") or []:
+        if isinstance(e, dict):
+            try:
+                per[int(e.get("exchange_index"))] = e
+            except (TypeError, ValueError):
+                continue
+    ex, tr = True, True
+    src: dict[str, str] = {}
+    shards = sorted(set(shards))
+    for sh in shards:
+        e = per.get(sh)
+        if e is not None:
+            ex = ex and bool(e.get("exchange_active", False))
+            tr = tr and bool(e.get("trading_active", False))
+            src[str(sh)] = "exchange_index_statuses"
+        else:
+            ex, tr = ex and top_ex, tr and top_tr
+            src[str(sh)] = "top_level (no per-shard entry)"
+    if not shards:
+        ex, tr = top_ex, top_tr
+    out["exchange_active"] = ex
+    out["trading_active"] = ex and tr
+    out["shards"] = shards
+    out["source"] = src
     return out
+
+
+async def exchange_status(rest: Any, shards: Iterable[int] = ()) -> dict[str, Any]:
+    """GET /exchange/status -> ``shard_status`` for ``shards`` (booleans coerced)."""
+    return shard_status(await rest.get_exchange_status(), shards)
+
+
+def required_balance_usd(risk: Any, margin_usd: float) -> float:
+    """Collateral each traded shard must hold: the strategy's worst-case total loss (the larger
+    of ``risk.max_total_worst_loss`` and the daily-loss halt, config/m1.yaml) plus a margin."""
+    worst = max(float(getattr(risk, "max_total_worst_loss", 0.0) or 0.0), float(getattr(risk, "daily_loss_halt", 0.0) or 0.0))
+    return worst + max(0.0, float(margin_usd))
+
+
+async def verify_key_restriction(rest: Any, key_id: str, subaccount: int,
+                                 balance_bodies: Iterable[Any] = ()) -> tuple[bool, str]:
+    """Is the runner's API key restricted to ``subaccount`` (``venue.key_restricted_to_subaccount``
+    makes a private WS message without a subaccount field count as ours, so it must be true)?
+
+    1. GET /api_keys: our key's ``subaccount`` (null = unrestricted) must equal ``subaccount``;
+    2. if the key is not listed or the call fails: GET /portfolio/balance's ``balance_breakdown``
+       is "omitted only when using a subaccount-restricted API key" (openapi 3.31.0), so every
+       balance read of the start-up must lack it.
+    Returns (ok, evidence); key ids are never logged."""
+    note = ""
+    try:
+        body = await rest.get_api_keys()
+        for k in (body or {}).get("api_keys") or []:
+            if isinstance(k, dict) and key_id and str(k.get("api_key_id")) == key_id:
+                s = k.get("subaccount")
+                if s is None:
+                    return False, "GET /api_keys: the runner key is NOT restricted to a subaccount"
+                if int(s) != int(subaccount):
+                    return False, f"GET /api_keys: the runner key is restricted to subaccount {s}, not {subaccount}"
+                return True, f"GET /api_keys: the runner key is restricted to subaccount {s}"
+        note = "GET /api_keys does not list the runner key"
+    except Exception as exc:  # noqa: BLE001 - a restricted key may not list keys: use the balance evidence
+        note = f"GET /api_keys failed ({type(exc).__name__})"
+    bodies = [b for b in balance_bodies if isinstance(b, dict)]
+    if bodies and all("balance_breakdown" not in b for b in bodies):
+        return True, f"{note}; GET /portfolio/balance omits balance_breakdown (a subaccount-restricted key)"
+    return False, f"{note}; GET /portfolio/balance carries balance_breakdown (an unrestricted key?)"
+
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+SCHEDULE_TZ = "America/New_York"  # Schedule.standard_hours: "All times are expressed in ET"
+
+
+def _hhmm(v: Any, *, close: bool = False) -> int | None:
+    """'HH:MM' (ET) -> minutes after midnight; a closing time of 23:59 / 24:00 = end of day."""
+    try:
+        h, m = str(v).strip().split(":")[:2]
+        mins = int(h) * 60 + int(m)
+    except (TypeError, ValueError):
+        return None
+    if close and mins >= 23 * 60 + 59:
+        return 24 * 60
+    return mins if 0 <= mins <= 24 * 60 else None
+
+
+def _merge(iv: list[tuple[int, int]], gap_ns: int = 0) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(iv):
+        if out and a <= out[-1][1] + gap_ns:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def schedule_closures(body: Any, start_ns: int, end_ns: int, *, min_gap_s: float = 120.0,
+                      tz_name: str = SCHEDULE_TZ) -> tuple[list[tuple[int, int, str]], list[str]]:
+    """GET /exchange/schedule -> the intervals in [start_ns, end_ns) when trading is scheduled to
+    be unavailable: (start ns, end ns, why), merged and sorted, plus notes.
+
+    * ``maintenance_windows`` (start_datetime / end_datetime) are taken as given;
+    * ``standard_hours``: each WeeklySchedule, within its own [start_time, end_time), lists the
+      ET trading sessions per weekday; the time between sessions (sessions closer than
+      ``min_gap_s`` are joined, so a 23:59 close / 00:00 open is continuous) is a closure. This
+      is how the weekly Thursday 03:00-05:00 ET trading pause is expected to appear.
+    A standard-hours reading that would close more than half of the next day is implausible for
+    24/7 crypto markets: it is ignored (noted); the live status poll stays authoritative."""
+    import datetime as dt
+
+    from dh.kalshi.wire import opt_iso_to_ns
+
+    sched = body.get("schedule", body) if isinstance(body, dict) else {}
+    notes: list[str] = []
+    maint: list[tuple[int, int]] = []
+    for w in sched.get("maintenance_windows") or []:
+        if not isinstance(w, dict):
+            continue
+        try:
+            a, b = opt_iso_to_ns(w.get("start_datetime")), opt_iso_to_ns(w.get("end_datetime"))
+        except (TypeError, ValueError):
+            notes.append(f"unparseable maintenance window {w!r:.120}")
+            continue
+        if a and b and b > a and b > start_ns and a < end_ns:
+            maint.append((a, b))
+    std: list[tuple[int, int]] = []
+    weeks = [w for w in sched.get("standard_hours") or [] if isinstance(w, dict)]
+    if weeks:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(tz_name)
+        except Exception as exc:  # noqa: BLE001 - no tz database: maintenance windows only
+            notes.append(f"standard_hours ignored: no time zone {tz_name} ({type(exc).__name__})")
+            weeks = []
+        gap = int(min_gap_s * 1e9)
+        for wk in weeks:
+            try:
+                ws = opt_iso_to_ns(wk.get("start_time")) or 0
+                we = opt_iso_to_ns(wk.get("end_time")) or 2**62
+            except (TypeError, ValueError):
+                notes.append("standard_hours entry with unparseable start/end ignored")
+                continue
+            lo, hi = max(ws, start_ns), min(we, end_ns)
+            if lo >= hi:
+                continue
+            d0 = dt.datetime.fromtimestamp(lo / 1e9, tz).date() - dt.timedelta(days=1)
+            d1 = dt.datetime.fromtimestamp(hi / 1e9, tz).date() + dt.timedelta(days=1)
+            opens: list[tuple[int, int]] = []
+            d = d0
+            while d <= d1:
+                for sess in wk.get(_WEEKDAYS[d.weekday()]) or []:
+                    if not isinstance(sess, dict):
+                        continue
+                    o, c = _hhmm(sess.get("open_time")), _hhmm(sess.get("close_time"), close=True)
+                    if o is None or c is None or c <= o:
+                        continue
+                    base = dt.datetime(d.year, d.month, d.day, tzinfo=tz)
+                    a = int((base + dt.timedelta(minutes=o)).timestamp() * 1e9)
+                    b = int((base + dt.timedelta(minutes=c)).timestamp() * 1e9)
+                    opens.append((a, b))
+                d += dt.timedelta(days=1)
+            cur = lo
+            for a, b in _merge(opens, gap):
+                if b <= cur:
+                    continue
+                if a > cur + gap:
+                    std.append((cur, min(a, hi)))
+                cur = max(cur, b)
+                if cur >= hi:
+                    break
+            if cur < hi:
+                std.append((cur, hi))
+        day = [(max(a, start_ns), min(b, start_ns + 86_400 * 10**9)) for a, b in std]
+        closed = sum(max(0, b - a) for a, b in day)
+        if closed > 43_200 * 10**9:
+            notes.append(f"standard_hours ignored: would close {closed / 3.6e12:.1f} h of the next 24 h")
+            std = []
+    merged = _merge(maint + [(a, b) for a, b in std if b > a])
+    res = [(a, b, "maintenance" if any(ma < b and mb > a for ma, mb in maint) else "standard_hours")
+           for a, b in merged]
+    return res, notes
+
+
+def closure_at(closures: Iterable[tuple[int, int, str]], now_ns: int, lead_ns: int = 0) -> tuple[int, int, str] | None:
+    """The scheduled closure in force at ``now_ns`` or starting within ``lead_ns`` (None)."""
+    for a, b, why in closures:
+        if a - lead_ns <= now_ns < b:
+            return a, b, why
+    return None
 
 
 # ============================================================================ specs <-> json
@@ -65,7 +261,7 @@ def spec_signature(spec: MarketSpec) -> tuple:
     the KalshiFeeUpdate event (strategy and runner follow it), so it must not make a re-discovered
     market look changed (which would block it for the session)."""
     return (spec.strike_type, spec.floor_strike, spec.cap_strike, spec.close_ts, spec.expiration_ts,
-            spec.price_ranges, spec.base_fee, spec.settlement)
+            spec.price_ranges, spec.base_fee, spec.settlement, spec.exchange_index)
 
 
 # ============================================================================ universe
@@ -85,14 +281,18 @@ def select_specs(
     series: Iterable[str] = (),
     exclude_events: Iterable[str] = (),
     known: dict[str, MarketSpec] | None = None,
+    exchange_indexes: Iterable[int] | None = None,
 ) -> UniverseSelection:
     """Markets to trade: in ``series``, not closed, expiring within ``now + horizon_s``, with
-    clean rules text (metadata.BLOCKING_FLAGS), an open status, not paused, and not in an
-    excluded event. Markets with an unresolved / unsupported fee type ARE included: the
-    MarketMaker keeps them untradable itself (it never assumes a fee schedule).
-    ``known`` markets are not returned again; their spec changes are reported in ``changed``."""
+    clean rules text (metadata.BLOCKING_FLAGS), an open status, not paused, not in an excluded
+    event, and on a KNOWN exchange shard (in ``exchange_indexes`` when given: the shards the
+    runner has funded and creates order groups on). Markets with an unresolved / unsupported
+    fee type ARE included: the MarketMaker keeps them untradable itself (it never assumes a
+    fee schedule). ``known`` markets are not returned again; their spec changes (a shard move
+    included) are reported in ``changed``."""
     series_set = set(series)
     excluded = set(exclude_events)
+    shards = None if exchange_indexes is None else {int(x) for x in exchange_indexes}
     known = known or {}
     horizon_ns = int(horizon_s * NS_PER_S)
     out: list[MarketSpec] = []
@@ -115,6 +315,12 @@ def select_specs(
             continue
         if spec.event_ticker in excluded:
             skipped[t] = "event already holds a position at start-up"
+            continue
+        if spec.exchange_index is None:
+            skipped[t] = "exchange shard unknown (no exchange_index on market/event/series): not traded"
+            continue
+        if shards is not None and spec.exchange_index not in shards:
+            skipped[t] = f"exchange shard {spec.exchange_index} not in venue.exchange_indexes {sorted(shards)}"
             continue
         flags = registry.blocking_flags(t)
         if flags:
@@ -142,11 +348,18 @@ async def discover_universe(
     *,
     exclude_events: Iterable[str] = (),
     known: dict[str, MarketSpec] | None = None,
+    exchange_indexes: Iterable[int] | None = None,
 ) -> UniverseSelection:
     """REST discovery (dh.kalshi.metadata.discover_markets on open events) + select_specs."""
     series = tuple(series)
     reg = await discover_markets(rest, series, status="open", fee_engine=fee_engine)
-    return select_specs(reg, now_ns, horizon_s, series=series, exclude_events=exclude_events, known=known)
+    return select_specs(reg, now_ns, horizon_s, series=series, exclude_events=exclude_events, known=known,
+                        exchange_indexes=exchange_indexes)
+
+
+def series_of_ticker(ticker: str) -> str:
+    """Series of a market ticker (``KXBTCD-26SEP2513-T84000.00`` -> ``KXBTCD``)."""
+    return parse_market_ticker(ticker).series
 
 
 def events_with_positions(positions: dict[str, int]) -> set[str]:

@@ -106,5 +106,8 @@ Every fix above has a unit test built on the REAL captured frame (public market 
 * No `chronyc`/`timedatectl`/`adjtimex`: the recorder's clock sampler uses a query-only
   `sntp` exchange (`src: "sntp"`); this Mac measured +35 ms drifting to +50 ms within an
   hour (local clock behind NTP, +/- ~20 ms). Exchange-latency numbers from this host are biased by that offset.
+  The live runner's clock gate trusts that `sntp` sample on macOS (docs/RUNBOOK.md 1.1a).
+* No `/run`: the live runner's kill file / heartbeat / locks default to `data/run/` here.
 * No GNU `timeout`; long-running jobs use `caffeinate -i` (idle-sleep prevention).
-* A launchd agent for the recorder is provided but not installed: `deploy/launchd/`.
+* launchd agents for the recorder and the live watchdog are provided but not installed:
+  `deploy/launchd/`.

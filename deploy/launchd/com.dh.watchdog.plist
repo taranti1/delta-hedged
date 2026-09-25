@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Dead-man watchdog (scripts/watchdog.py) as a per-user launchd agent on this Mac.
+  NOT installed by default: see deploy/launchd/README.md (launchctl bootstrap gui/$(id -u) ...).
+  It must run whenever a LIVE runner may run (the runner itself stays manual: never a launchd
+  job). --arm-on-start: a watchdog restarted while the runner died meanwhile still triggers the
+  runner's order groups and cancels subaccount venue.subaccount's orders. It reads the same
+  config/live.yaml as the runner (kill file / heartbeat under data/run on macOS) and its
+  credentials from the environment: KALSHI_WATCHDOG_KEY_ID / KALSHI_WATCHDOG_PRIVATE_KEY_PATH
+  (a key restricted to the runner's subaccount), put in System 1's own env file named by
+  config/kalshi.yaml auth.env_file (launchd agents do not inherit the shell environment).
+  caffeinate -i keeps the Mac from idle-sleeping while it runs (not on lid close).
+  Paths are absolute for this host (/Users/thomast/Desktop/delta-hedged).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dh.watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>/Users/thomast/Desktop/delta-hedged/.venv/bin/python</string>
+    <string>/Users/thomast/Desktop/delta-hedged/scripts/watchdog.py</string>
+    <string>--live-config</string>
+    <string>/Users/thomast/Desktop/delta-hedged/config/live.yaml</string>
+    <string>--arm-on-start</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/thomast/Desktop/delta-hedged</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- always restart: the dead-man switch must not stay down (exit 2 = a config refusal, e.g.
+       venue.shared_account with subaccount 0: fix the config, launchd keeps retrying) -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>10</integer>
+  <!-- Interactive: never throttled like Background agents (a late watchdog is useless) -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/thomast/Desktop/delta-hedged/data/logs/watchdog.launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/thomast/Desktop/delta-hedged/data/logs/watchdog.launchd.out</string>
+</dict>
+</plist>

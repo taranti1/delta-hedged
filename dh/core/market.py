@@ -71,6 +71,10 @@ class MarketSpec:
     # override is cleared. '' = same as fee_type (no override known at construction)
     base_fee_type: str = ""
     base_fee_multiplier: float | None = None
+    # Kalshi exchange shard (openapi Market/EventData/Series ``exchange_index``; all KXBTC* markets
+    # are on shard 2 since 2026-08-24). None = unknown: the live runner never trades such a market
+    # (order groups, collateral and every order write are per shard).
+    exchange_index: int | None = None
 
     @property
     def base_fee(self) -> tuple[str, float]:

@@ -52,7 +52,7 @@ rate_limits: # conservative defaults, replaced by GET /account/limits at start-u
   write: { refill_rate: 50, bucket_capacity: 50 }
   # Fraction of the ACCOUNT's budget this process may use (budgets are per account, shared by
   # every key/process/FIX session of the account). 1.0 = all of it. Use e.g. 0.2 when another
-  # system trades on the same account.
+  # system trades on the same account (a live runner with venue.shared_account refuses > 0.5).
   account_share: 1.0
 
 fees:

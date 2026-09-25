@@ -317,6 +317,31 @@ def subaccount_of(m: dict) -> int:
         return -1  # unparseable: never matches a configured subaccount, so it is dropped
 
 
+def shard_value(v: Any) -> int | None:
+    """An ``exchange_index`` value as a non-negative int, None if absent or not an integer."""
+    if isinstance(v, bool) or v in (None, ""):
+        return None
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(v, float) and v != i:
+        return None
+    return i if i >= 0 else None
+
+
+def exchange_index_of(market: dict | None, event: dict | None = None, series: dict | None = None) -> int | None:
+    """Exchange shard of a market: Market.exchange_index, else its EventData's, else its
+    Series' (openapi 3.31.0: all three carry it; a series' events and markets share its shard).
+    None when none of them says (the live runner then refuses to trade the market)."""
+    for src in (market, event, series):
+        if isinstance(src, dict):
+            s = shard_value(src.get("exchange_index"))
+            if s is not None:
+                return s
+    return None
+
+
 def _fill(msg: dict, m: dict, recv_ns: int, _yp: bool) -> list[Event]:
     has_pos = m.get("post_position_fp") not in (None, "")
     return [
@@ -833,6 +858,7 @@ def rest_market_to_spec(
 
     Times: open_time, close_time, expected_expiration_time (fallback close_time) -> ns.
     Tick grid: market.price_ranges (authoritative; price_level_structure is only a label).
+    Exchange shard: market > event > series ``exchange_index`` (None when absent).
     Fees: event fee_type_override/fee_multiplier_override > series fee_type/fee_multiplier >
     market fields; unresolved -> fee_type ''. Settlement: explicit arg, else BRTI/60 obs for
     KXBTC* series, else UnsupportedMarket. Raises UnsupportedMarket for unsupported strike
@@ -860,6 +886,7 @@ def rest_market_to_spec(
     base_type, base_mult, _bsrc = resolve_fee_fields(series, None, market)  # without event override
     floor = market.get("floor_strike")
     cap = market.get("cap_strike")
+    shard = exchange_index_of(market, event, series)
     try:
         return MarketSpec(
             ticker=ticker,
@@ -878,6 +905,7 @@ def rest_market_to_spec(
             title=str(market.get("title") or market.get("yes_sub_title") or ""),
             base_fee_type=base_type,
             base_fee_multiplier=float(base_mult) if base_mult is not None else None,
+            exchange_index=shard,
         )
     except ValueError as exc:  # MarketSpec validation (e.g. strike missing)
         raise UnsupportedMarket(str(exc)) from exc

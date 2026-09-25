@@ -11,3 +11,8 @@ paths:
 metrics:
   host: 0.0.0.0              # inside the container; compose publishes it on host 127.0.0.1 only
   port: 9108
+venue:                       # the deployment of docs/RUNBOOK.md 1.2: subaccount 1 of a shared account
+  subaccount: 1
+  shared_account: true
+  key_restricted_to_subaccount: true
+  exchange_indexes: [2]
