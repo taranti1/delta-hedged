@@ -245,7 +245,11 @@ with informed flow on the same price path. E1 on the recording path recovers the
   changing `quoting` limits.
 * **Flow calibration from recordings** counts recorder downtime inside the window as exposure
   without trades (rates biased low); fit across outages only after checking the session records.
-  |z| segments use a fixed 40 % vol (calibrate_flow convention), not the strategy's live sigma.
+  |z| segments use a fixed 40 % vol (calibrate_flow convention), not the strategy's live sigma, and
+  exposure |z| is evaluated at each 60 s cell start, so in the final minute (where |z| moves fast)
+  some orders land in segments with no exposure. The gamma-Poisson prior (`--flow-prior-s`, 1800 s)
+  dominates segments with less exposure than that: on short windows the fit under-predicts busy
+  segments even in sample (the synthetic demo's 1-hour window: predicted/realized 0.63 in sample).
 * **E2 perp basis** needs recorded perps; the synthetic demo has none. The BRTI replica is costly
   on deep books (`--no-replica`).
 * **Chunked windows** (separate runs per day) reset strategy state (positions, limits) at chunk

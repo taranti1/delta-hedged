@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                          "fill model; default: the strategy config's flow parameters")
     ap.add_argument("--flow-split", type=float, default=0.7, help="flow: chronological train fraction")
     ap.add_argument("--walk-forward-days", type=int, default=0, help="flow: walk-forward by day (> 0) instead")
+    ap.add_argument("--flow-prior-s", type=float, default=1800.0,
+                    help="flow: gamma-Poisson prior exposure (s) shrinking thin segments toward the pooled rate")
     ap.add_argument("--log-level", default="WARNING")
     a = ap.parse_args(argv)
     logging.basicConfig(level=a.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -194,7 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "flow":
             from dh.research.flow_recording import fit_flow
 
-            res = fit_flow(root, t0, t1, o, universe=uni, train_frac=a.flow_split, walk_forward_days=a.walk_forward_days)
+            res = fit_flow(root, t0, t1, o, universe=uni, train_frac=a.flow_split, walk_forward_days=a.walk_forward_days,
+                           prior_s=a.flow_prior_s)
             print(res.metrics.to_string(index=False))
             print(f"flow_segments.json: fitted on data through {fmt_ns((res.all_end_ms or 0) * 1_000_000)} "
                   "(use for replays that start later)")
