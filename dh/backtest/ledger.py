@@ -33,6 +33,9 @@ from dh.core.events import HedgeFill, IndexTick, KalshiFill, Settlement
 from dh.core.units import MICROS, NS_PER_S, PX_SCALE, QTY_SCALE
 
 MARKOUT_H_S = (0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0)
+# columns of attribute() (also used for an empty ledger, so summary() works with no fills)
+ATTRIBUTION_COLUMNS = ("ts", "ticker", "event", "side", "px", "contracts", "fee", "is_taker", "F", "tau_s",
+                       "gross_edge_c", "settle", "to_settle_c", "hedge_cost", "hedge_pnl", "net", "net_c_per_ct")
 
 
 @dataclass
@@ -162,7 +165,7 @@ class Ledger:
             for h, v in f.markouts.items():
                 r[f"mo_{h:g}s_c"] = 100 * v
             rows.append(r)
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=None if rows else list(ATTRIBUTION_COLUMNS))
 
     def _mark(self, t: int) -> float | None:
         i = bisect.bisect_right(self.mark_ts, t) - 1

@@ -1,0 +1,11 @@
+# Live-runner overrides for the Docker deployment (deploy/docker-compose.yml). Keys not set
+# here take their defaults from dh.live.config; config/live.example.yaml documents every key.
+mode: paper                  # live needs mode: live here AND the CLI flag (docs/RUNBOOK.md)
+paths:
+  data_root: /data/live      # on the host's /data volume, beside the recorder's /data/raw
+  log_dir: /data/live_logs
+  kill_file: /run/dh/KILL    # shared with the watchdog container
+  heartbeat_file: /run/dh/heartbeat.json
+metrics:
+  host: 0.0.0.0              # inside the container; compose publishes it on host 127.0.0.1 only
+  port: 9108

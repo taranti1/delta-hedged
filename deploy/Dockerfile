@@ -8,5 +8,5 @@ COPY dh ./dh
 COPY config ./config
 COPY scripts ./scripts
 RUN pip install --no-cache-dir .
-# secrets are mounted at runtime: /secrets/kalshi_key_id, /secrets/kalshi_private_key.pem
+# secrets are mounted at runtime under /secrets (see deploy/docker-compose.yml), never baked in
 ENTRYPOINT ["python"]

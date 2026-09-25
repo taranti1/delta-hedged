@@ -1,21 +1,38 @@
 # One VM (AWS us-east-1 recommended). Roles are separate processes so a crash in one never
 # stops capture, and the watchdog can always cancel orders.
+#
+# Secrets live on the host, outside the repo:
+#   /secrets/dh.env                            KALSHI_KEY_ID=...  KALSHI_WATCHDOG_KEY_ID=...
+#   /secrets/kalshi_private_key.pem            trading key (recorder + strategy)
+#   /secrets/kalshi_watchdog_private_key.pem   separate key for the watchdog (docs/RUNBOOK.md)
+x-secrets: &secrets
+  env_file: ["/secrets/dh.env"]
+  environment:
+    KALSHI_PRIVATE_KEY_PATH: /secrets/kalshi_private_key.pem
+    KALSHI_WATCHDOG_PRIVATE_KEY_PATH: /secrets/kalshi_watchdog_private_key.pem
 services:
   recorder:
     build: {context: .., dockerfile: deploy/Dockerfile}
     command: ["scripts/record.py", "--config", "config/feeds.yaml", "--root", "/data/raw"]
     volumes: ["/data:/data", "/secrets:/secrets:ro"]
+    <<: *secrets
     restart: always
   strategy:
     build: {context: .., dockerfile: deploy/Dockerfile}
-    command: ["scripts/run_live.py", "--config", "config/m1.yaml", "--mode", "paper"]
+    # paper by default; live needs mode: live in the live config AND
+    # --i-understand-this-sends-real-orders here (docs/RUNBOOK.md)
+    command: ["scripts/run_live.py", "--config", "config/m1.yaml", "--live-config", "config/live.docker.yaml",
+              "--mode", "paper"]
     volumes: ["/data:/data", "/secrets:/secrets:ro", "/run/dh:/run/dh"]
+    <<: *secrets
     restart: "no"          # never auto-restart a trading process: a human decides
-    ports: ["127.0.0.1:9108:9108"]   # metrics
+    ports: ["127.0.0.1:9108:9108"]   # metrics (the container binds 0.0.0.0, the host only loopback)
   watchdog:
     build: {context: .., dockerfile: deploy/Dockerfile}
-    command: ["scripts/watchdog.py", "--heartbeat", "/run/dh/heartbeat.json", "--max-age-s", "2"]
+    command: ["scripts/watchdog.py", "--live-config", "config/live.docker.yaml", "--heartbeat",
+              "/run/dh/heartbeat.json", "--max-age-s", "2"]
     volumes: ["/secrets:/secrets:ro", "/run/dh:/run/dh"]
+    <<: *secrets
     restart: always
   prometheus:
     image: prom/prometheus:latest

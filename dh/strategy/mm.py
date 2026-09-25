@@ -41,6 +41,7 @@ from dh.core.events import (
     ExtBookSnapshot,
     FeedStatus,
     HedgeFill,
+    HedgeOrderUpdate,
     IndexTick,
     KalshiBookDelta,
     KalshiBookSnapshot,
@@ -144,6 +145,11 @@ class MarketMaker:
             self._resolve_fee(t, s)
         self.om = OrderManager()
         self.queue = QueueEstimator("realistic", level_qty=self._level_qty, book_includes_own=book_includes_own)
+        # live book (contains our orders): an order joins the queue when our own positive book
+        # delta shows it; if that delta beat the ack it is remembered here (coid -> ts)
+        self.book_includes_own = book_includes_own
+        self._own_delta_seen: dict[str, int] = {}
+        self._queue_pending_since: dict[str, int] = {}
         self.flow = FillIntensityModel(cfg.fill, dict(flow_segments or {}))
         self.adverse = AdverseSelectionModel(cfg.adverse, dict(as_coefs or {}))
         self.risk = RiskEngine(cfg.risk)
@@ -268,6 +274,12 @@ class MarketMaker:
                 if not b.apply_delta(ev):
                     out += self._cancel_market(ev.ts, ev.ticker, "book_invalid")
                 else:
+                    own = ev.own_client_order_id
+                    if own and self.book_includes_own and ev.delta > 0:
+                        if own in self.queue.orders:
+                            self._queue_pending_since.pop(own, None)  # activated by this delta
+                        else:
+                            self._own_delta_seen[own] = ev.ts  # our delta beat the ack
                     self.queue.on_book_delta(ev)
         elif isinstance(ev, KalshiTrade):
             if ev.ticker in self.books:
@@ -305,6 +317,14 @@ class MarketMaker:
                     self.hedge_pending.pop(ev.client_order_id, None)
                 else:
                     self.hedge_pending[ev.client_order_id] = left
+        elif isinstance(ev, HedgeOrderUpdate):
+            if ev.status in ("rejected", "canceled"):
+                # the unfilled rest will never fill (fills already delivered were applied by
+                # HedgeFill; a filled order clears itself when its HedgeFills sum to the target)
+                self.hedge_pending.pop(ev.client_order_id, None)
+                if ev.status == "rejected":
+                    out.append(Log("hedge_rejected", {"coid": ev.client_order_id, "venue": ev.venue,
+                                                      "reason": ev.reason}))
         elif isinstance(ev, (Settlement, KalshiMarketLifecycle)):
             out += self._on_settlement(ev)
         elif isinstance(ev, Timer):
@@ -349,7 +369,13 @@ class MarketMaker:
             if k == "accepted":
                 w = self.om.order(oe.client_order_id)
                 if w is not None and w.remaining_qty > 0 and oe.client_order_id not in self.queue.orders:
-                    self.queue.add_order(oe.client_order_id, w.ticker, w.book_side, w.px, w.remaining_qty, oe.ts)
+                    # live: until our own book delta shows the order, the displayed level may not
+                    # contain it, so joining now would count our own size ahead of us
+                    pending = self.book_includes_own and self._own_delta_seen.pop(oe.client_order_id, None) is None
+                    self.queue.add_order(oe.client_order_id, w.ticker, w.book_side, w.px, w.remaining_qty, oe.ts,
+                                         pending=pending)
+                    if pending:
+                        self._queue_pending_since[oe.client_order_id] = oe.ts
             elif k in ("fill", "orphan_fill"):
                 self.stats.fills += 1
                 if oe.client_order_id in self.queue.orders:
@@ -359,6 +385,8 @@ class MarketMaker:
                                         "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
                                         "F": None if fv is None else round(fv.F, 6)}))
             elif k in ("filled", "canceled", "rejected"):
+                self._queue_pending_since.pop(oe.client_order_id, None)
+                self._own_delta_seen.pop(oe.client_order_id, None)
                 if oe.client_order_id in self.queue.orders:
                     self.queue.remove_order(oe.client_order_id)
             elif k == "cancel_ready":
@@ -483,9 +511,28 @@ class MarketMaker:
         return out
 
     # ================================================================== timer / cycle
+    OWN_DELTA_TIMEOUT_NS = 2 * NS_PER_S
+
+    def _expire_queue_pending(self, now: int) -> None:
+        """Live fallback: an order whose own book delta was never seen joins behind the WHOLE
+        displayed level after OWN_DELTA_TIMEOUT_NS (the level may or may not show our order;
+        overstating the queue ahead is the safe error). Stale early-delta records are dropped."""
+        for coid, t in list(self._queue_pending_since.items()):
+            if now - t >= self.OWN_DELTA_TIMEOUT_NS:
+                del self._queue_pending_since[coid]
+                o = self.queue.orders.get(coid)
+                if o is not None and o.pending:
+                    self.queue.activate(coid, queue_ahead=int(self._level_qty(*o.level)))
+                    self.stats.bump("queue_own_delta_timeout")
+        for coid, t in list(self._own_delta_seen.items()):
+            if now - t >= 30 * NS_PER_S:
+                del self._own_delta_seen[coid]
+
     def _on_timer(self, now: int) -> list[Action]:
         out: list[Action] = []
         self.om.on_event(Timer(ts=now))  # ack/change timeouts -> unknown-outcome handling
+        if self._queue_pending_since or self._own_delta_seen:
+            self._expire_queue_pending(now)
         if self.use_order_group and not self.group_created:
             self.group_created = True
             lim = int(self.cfg.risk.order_group_limit_contracts * QTY_SCALE)
