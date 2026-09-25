@@ -1,0 +1,11 @@
+synthetic,policy,model,target,n_oos,toxic_rate,auc,log_loss,brier,r2_oos_vs_train_mean,corr
+True,B,base_rate,toxic(fair value moved against the fill within 10 s),106,0.358491,0.5,0.661951,0.233953,,
+True,B,logistic,toxic(fair value moved against the fill within 10 s),106,0.358491,0.508514,0.84104,0.268217,,
+True,B,gbm_cls,toxic(fair value moved against the fill within 10 s),106,0.358491,0.53096,0.677473,0.241276,,
+True,B,ridge,net 10s markout (c),106,,,,,0.785045,0.899243
+True,B,gbm_reg,net 10s markout (c),106,,,,,0.0141146,0.392438
+True,C,base_rate,toxic(fair value moved against the fill within 10 s),100,0.33,0.5,0.638811,0.223037,,
+True,C,logistic,toxic(fair value moved against the fill within 10 s),100,0.33,0.495251,0.848528,0.25873,,
+True,C,gbm_cls,toxic(fair value moved against the fill within 10 s),100,0.33,0.596563,0.641201,0.224443,,
+True,C,ridge,net 10s markout (c),100,,,,,0.389384,0.620346
+True,C,gbm_reg,net 10s markout (c),100,,,,,0.355509,0.634146
