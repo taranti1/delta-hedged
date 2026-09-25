@@ -61,6 +61,8 @@ The recorder currently runs on a Mac (Apple silicon, macOS 26, uv-managed CPytho
   `enabled: false` in `config/feeds.yaml`.
 
 ### 1.2 Kalshi account and API keys
+**Subaccount setup** (System 1 on its own subaccount next to the live System 2; restricted keys, funding, the System 2 transfer declaration): docs/ACCOUNT_SETUP.md with `scripts/account_setup.py`.
+
 1. Use a **dedicated account or subaccount** for the bot. Cancel-all, the ghost-order sweep and
    the position reconciliation act on every order/position of that (sub)account: manual
    trading there will be cancelled and will halt the bot. **M1 runs on the PRIMARY account**
