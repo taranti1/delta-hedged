@@ -107,13 +107,56 @@ LEGACY_STATE_PATH = REPO / "data" / "logs" / "account_setup_state.json"  # befor
 ADMIN_CONFIG = REPO / "config" / "kalshi.admin.yaml"
 DELTA_TOL = Decimal("0.01")  # a balance delta "equals" the amount within 1 cent, never more
 PROBE_MAX_DOLLARS = Decimal("5")  # shard-transfer --probe-dollars cap
-TRANSFER_LIST_SKEW_S = 120  # a listed transfer counts if created at most this long before the first attempt
+# a listed transfer counts only if created at most this long before the first attempt (clock skew
+# between this host and Kalshi; review NEW-4: was 120 s, which let an EARLIER identical transfer match)
+TRANSFER_LIST_SKEW_S = 5
 
 
 def default_state_path(env: str = "prod") -> Path:
     """The per-user state file (``DH_ACCOUNT_SETUP_STATE`` overrides it)."""
     p = os.environ.get(STATE_ENV_VAR, "")
-    return Path(p).expanduser() if p else STATE_DIR / f"state.{env}.json"
+    return Path(p).expanduser() if p else canonical_state_path(env)
+
+
+def canonical_state_path(env: str = "prod") -> Path:
+    """The per-user state file WITHOUT any override (the one idempotency normally rests on)."""
+    return STATE_DIR / f"state.{env}.json"
+
+
+STATE_COMMANDS = ("transfer", "shard-transfer", "forget-pending")  # commands whose idempotency rests on the state
+
+
+def state_override_problem(chosen: Path, canonical: Path) -> str:
+    """Review NEW-6: a --state-file / DH_ACCOUNT_SETUP_STATE override must not bypass idempotency.
+    '' when ``chosen`` is the canonical per-user file, or holds every pending and completed record
+    of it; else the refusal (the unresolved / finished transfers the override would not see)."""
+    try:
+        if chosen.expanduser().resolve() == canonical.expanduser().resolve() or not canonical.exists():
+            return ""
+    except OSError:
+        return ""
+    try:
+        base = State(canonical)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return f"the per-user state file {canonical} is unreadable ({type(exc).__name__}): fix it before using another one"
+    try:
+        other = State(chosen) if chosen.exists() else None
+    except (OSError, ValueError, RuntimeError) as exc:
+        return f"the state file {chosen} is unreadable ({type(exc).__name__})"
+    have_p = set(other.pending) if other else set()
+    have_c = {str(c.get("id")) for c in other.completed} if other else set()
+    miss_p = [i for i in base.pending if i not in have_p]
+    miss_c = [str(c.get("id")) for c in base.completed if str(c.get("id")) not in have_c]
+    if not miss_p and not miss_c:
+        return ""
+    parts = []
+    if miss_p:
+        parts.append(f"UNRESOLVED transfer(s) {miss_p}")
+    if miss_c:
+        parts.append(f"{len(miss_c)} completed transfer(s)")
+    return (f"the state file {chosen} does not hold the {' and '.join(parts)} of the per-user state {canonical}: "
+            "with it this tool could re-send a transfer whose client_transfer_id is saved there, or repeat a "
+            "completed one without --again. Use the per-user file, or pass --i-know-state-file if this is deliberate")
 
 
 STATE_PATH = default_state_path()
@@ -549,29 +592,45 @@ def near(a: Decimal, b: Decimal) -> bool:
 @dataclass
 class Evidence:
     """What the balances and the transfer list say about one same-shard transfer since its FIRST
-    attempt: ``balance`` applied (source -amount AND destination +amount, within 1 cent) / none
-    (both unchanged) / mixed (anything else) / unreadable; ``listed`` True / False / None (the
-    list could not be read)."""
+    attempt: ``balance`` applied (source -amount AND destination +amount on the transfer's own
+    route, within 1 cent) / none (both unchanged) / mixed (anything else) / unreadable; ``listed``
+    True / False / None (the list could not be read): a row of GET /portfolio/subaccounts/transfers
+    with the same route and amount, created at most TRANSFER_LIST_SKEW_S before the first attempt,
+    after every earlier identical completed transfer, and NOT claimed by another record
+    (``transfer_id``: the row this record claims; review NEW-4)."""
 
     balance: str
     listed: bool | None
     d_from: Decimal | None = None
     d_to: Decimal | None = None
     detail: str = ""
+    transfer_id: str = ""  # the listed transfer this evidence claims ('' = none / list unreadable)
+    candidates: int = 0  # unclaimed listed rows that match (more than one: ambiguous)
 
     @property
     def verdict(self) -> str:
-        """applied | not_seen (nothing moved, nothing listed) | conflict | unresolved."""
+        """applied | not_seen (nothing moved, nothing listed) | conflict | unresolved.
+
+        ``applied`` needs the EXACT balance deltas on the route (review NEW-4: a listed row plus
+        unrelated balance movement is never enough) and, when the list is readable, exactly one
+        unclaimed matching row (never a row another record already claimed)."""
         if self.balance == "applied":
-            return "applied"
+            if self.listed is None:
+                return "applied"  # the list could not be read: the exact deltas on the route decide
+            return "applied" if self.listed and self.candidates == 1 else "unresolved"
         if self.balance == "none":
             return "conflict" if self.listed else "not_seen"
-        if self.listed and self.balance in ("mixed", "unreadable"):
-            return "applied"  # Kalshi's own transfer history lists it (the balances moved by more than it)
         return "unresolved"
 
 
-async def transfer_evidence(ctx: Ctx, e: dict[str, Any], amount: Decimal) -> Evidence:
+def claimed_transfer_ids(st: State | None) -> set[str]:
+    """Listed transfer ids already claimed by a completed record (review NEW-4)."""
+    if st is None:
+        return set()
+    return {str(c.get("claimed_transfer_id")) for c in st.completed if c.get("claimed_transfer_id")}
+
+
+async def transfer_evidence(ctx: Ctx, e: dict[str, Any], amount: Decimal, st: State | None = None) -> Evidence:
     p = e["params"]
     frm, to, idx = int(p["from_subaccount"]), int(p["to_subaccount"]), int(p["exchange_index"])
     first = rows_from_json(e.get("first_rows"))
@@ -592,16 +651,28 @@ async def transfer_evidence(ctx: Ctx, e: dict[str, Any], amount: Decimal) -> Evi
                 balance = "mixed"
             detail = f"since the first attempt: subaccount {frm} {d_from:+}, subaccount {to} {d_to:+} (shard {idx})"
     listed: bool | None = None
+    tid, n_cand = "", 0
     try:
         since = int(_parse_iso(e.get("first_attempt_at") or e.get("created_at")).timestamp()) - TRANSFER_LIST_SKEW_S
+        # never a row created before an earlier identical transfer completed (that one's own row)
+        for c in (st.completed if st is not None else []):
+            if c.get("kind") == e.get("kind") and c.get("params") == e.get("params") and c.get("completed_at"):
+                since = max(since, int(_parse_iso(c["completed_at"]).timestamp()) + 1)
+        claimed = claimed_transfer_ids(st)
         cents = to_cents(amount)
         rows = await read_sub_transfers(ctx)
-        listed = any(int(t.get("from_subaccount", -1)) == frm and int(t.get("to_subaccount", -1)) == to
-                     and int(t.get("amount_cents", -1)) == cents and int(t.get("exchange_index", 0)) == idx
-                     and int(t.get("created_ts") or 0) >= since for t in rows)
+        cand = [t for t in rows if int(t.get("from_subaccount", -1)) == frm and int(t.get("to_subaccount", -1)) == to
+                and int(t.get("amount_cents", -1)) == cents and int(t.get("exchange_index", 0)) == idx
+                and int(t.get("created_ts") or 0) >= since and str(t.get("transfer_id") or "") not in claimed]
+        n_cand = len(cand)
+        listed = n_cand > 0
+        if n_cand == 1:
+            tid = str(cand[0].get("transfer_id") or "")
+        elif n_cand > 1:
+            detail += f"; {n_cand} unclaimed identical transfers listed (ambiguous)"
     except (KalshiHTTPError, TransportError, KeyError, ValueError, TypeError) as exc:
         detail += f"; GET /portfolio/subaccounts/transfers failed: {type(exc).__name__}"
-    return Evidence(balance, listed, d_from, d_to, detail)
+    return Evidence(balance, listed, d_from, d_to, detail, tid, n_cand)
 
 
 async def own_key_restriction(ctx: Ctx) -> tuple[str, int | None]:
@@ -1132,7 +1203,7 @@ async def cmd_transfer(ctx: Ctx, args: argparse.Namespace) -> int:
                 f"{retry.get('first_attempt_at') or retry.get('created_at')}): the same client_transfer_id is sent again, "
                 "so Kalshi applies it at most once; whatever it answers, the outcome is decided from the balances since "
                 "the FIRST attempt and the transfer list.")
-        ev = await transfer_evidence(ctx, retry, amount)
+        ev = await transfer_evidence(ctx, retry, amount, st)
         if ev.verdict == "applied":  # nothing to send: an earlier attempt applied it
             ctx.out(f"Evidence: the transfer is ALREADY APPLIED ({ev.detail}; listed: {ev.listed}). Nothing is sent.")
             log_event(ctx, command="transfer", event="evidence", client_transfer_id=retry["id"], outcome="before retry",
@@ -1192,12 +1263,12 @@ async def cmd_transfer(ctx: Ctx, args: argparse.Namespace) -> int:
     # waits for the balances / the transfer list to show the move.
     what = {"ok": "HTTP 200 (applied per Kalshi)", "unknown": f"outcome unknown ({oc.detail})",
             "rejected": f"HTTP {oc.status} on a retry", "not_sent": "the retry never connected"}.get(oc.kind, oc.kind)
-    ev = await transfer_evidence(ctx, entry, amount)
-    for _ in range(2):  # balances may trail the transfer by a moment
-        if ev.verdict != "not_seen":
+    ev = await transfer_evidence(ctx, entry, amount, st)
+    for _ in range(2):  # balances (or the transfer list) may trail the transfer by a moment
+        if ev.verdict != "not_seen" and not (ev.balance == "applied" and ev.verdict != "applied"):
             break
         await ctx.sleep(1.0)
-        ev = await transfer_evidence(ctx, entry, amount)
+        ev = await transfer_evidence(ctx, entry, amount, st)
     entry["last_outcome"] = what
     entry["evidence"] = {"balance": ev.balance, "listed": ev.listed, "detail": ev.detail, "at": ctx.now().isoformat()}
     st.save()
@@ -1240,9 +1311,13 @@ async def complete_transfer(ctx: Ctx, st: State, cid: str, amount: Decimal, ev: 
             f"{to} shard {idx}: {usd(after.get((to, idx), Decimal(0)), 4)}")
     if ev.balance not in ("applied", "unreadable"):
         ctx.out(f"CHECK: the balances did not move by exactly {usd(amount)} ({ev.detail}).")
+    if ev.transfer_id and ev.transfer_id in claimed_transfer_ids(st):  # belt and braces (review NEW-4)
+        raise RuntimeError(f"listed transfer {ev.transfer_id} is already claimed by another record")
     record: dict[str, Any] = {**entry, "id": cid, "completed_at": ctx.now().isoformat(),
                               "result": "applied" if attempts <= 1 and answered == "ok" else f"applied_after_retry:{answered}",
-                              "evidence": {"balance": ev.balance, "listed": ev.listed, "detail": ev.detail}}
+                              "claimed_transfer_id": ev.transfer_id or None,
+                              "evidence": {"balance": ev.balance, "listed": ev.listed, "detail": ev.detail,
+                                           "transfer_id": ev.transfer_id}}
     record.pop("key", None)
     if frm == 0:
         if not entry.get("first_pre"):
@@ -1362,9 +1437,19 @@ async def _finish_shard_transfer(ctx: Ctx, st: State, local_id: str, timeout_s: 
     record.pop("rows_before", None)
     if fsub == 0 and e.get("pre") and result != "not_moved":
         post = await read_unscoped(ctx)
-        # the ACTUAL withdrawal from subaccount 0 (all shards) is what System 2's unscoped read saw
         sub0 = sum((d for (s, _), d in changes.items() if s == 0), Decimal(0))
-        decl_amount = -sub0 if sub0 < 0 else amount
+        if result == "mismatch":
+            # review NEW-6: exactly what left subaccount 0 PER THE TRANSFER RECORD (Kalshi's listed
+            # amount, else the requested one), never the subaccount-0 balance change, which also
+            # carries unrelated movements (a System 2 settlement). Both are shown.
+            decl_amount = listed if listed is not None else amount
+            ctx.out(f"Declaration amount: {usd(decl_amount)} per the transfer record ({'listed by Kalshi' if listed is not None else 'requested; Kalshi listed none'}); "
+                    f"the observed subaccount-0 balance change was {sub0:+} (all shards; includes unrelated movements, "
+                    "NOT used for the declaration).")
+            record["declaration_basis"] = {"transfer_record": str(decl_amount), "observed_subaccount0_change": str(sub0)}
+        else:
+            # the ACTUAL withdrawal from subaccount 0 (all shards) is what System 2's unscoped read saw
+            decl_amount = -sub0 if sub0 < 0 else amount
         record["declaration"] = build_declaration(
             ctx, decl_amount, Reading.from_json(e["pre"]), post,
             f"dh account_setup: subaccount {fsub} shard {fshard} -> subaccount {tsub} shard {tshard} {usd(amount)} "
@@ -1566,7 +1651,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--system2-root", default=str(SYSTEM2_ROOT), help="System 2 checkout (for the printed command and the ledger check)")
     p.add_argument("--state-file", default=None,
                    help=f"state file (default: ${STATE_ENV_VAR}, else {STATE_DIR}/state.<env>.json: one per user, "
-                        "shared by every checkout)")
+                        "shared by every checkout). Another file than the per-user one is refused for transfer / "
+                        "shard-transfer / forget-pending when it lacks a record of the per-user file")
+    p.add_argument("--i-know-state-file", action="store_true",
+                   help=f"accept a --state-file / ${STATE_ENV_VAR} that lacks records of the per-user state file")
     sub = p.add_subparsers(dest="command")
     s = sub.add_parser("status", help="read-only overview and checklist (default)")
     s.add_argument("--subaccount", type=int, default=1, help="System 1's subaccount (default 1)")
@@ -1666,6 +1754,7 @@ async def run(
     state_path: Path | None = None,
     legacy_state_path: Path | None = None,
     key_id: str = "",
+    canonical_state: Path | None = None,
 ) -> int:
     args = parse_args(argv)
     own = rest is None
@@ -1679,15 +1768,22 @@ async def run(
     else:
         ctx_kw.update(base_url=getattr(rest, "base_url", ""), key_id=key_id, config_source="(injected)")
     ctx = Ctx(rest=rest, system2_root=Path(args.system2_root).expanduser(), **ctx_kw)
+    overridden = False
     if args.state_file:
         ctx.state_path = Path(args.state_file).expanduser()
+        overridden = True
     elif state_path is None:  # the per-user file of this Kalshi environment; the old per-checkout file is checked
         ctx.state_path = default_state_path(ctx.env)
         ctx.legacy_state_path = LEGACY_STATE_PATH
+        overridden = bool(os.environ.get(STATE_ENV_VAR, ""))
     for name, val in (("ask", ask), ("ps", ps), ("now", now), ("sleep", sleep), ("out", out),
                       ("log_path", log_path), ("state_path", state_path), ("legacy_state_path", legacy_state_path)):
         if val is not None:
             setattr(ctx, name, val)
+    if overridden and args.command in STATE_COMMANDS and not args.i_know_state_file:
+        why = state_override_problem(ctx.state_path, canonical_state or canonical_state_path(ctx.env))
+        if why:
+            return refuse(ctx, args.command, why)
     try:
         return await COMMANDS[args.command](ctx, args)
     except UsageError as exc:

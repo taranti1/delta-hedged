@@ -287,7 +287,10 @@ async def test_a_foreign_fill_never_reaches_the_strategy_even_with_the_restricte
     assert got == ["t3", "t4"]
     assert not [e for e in s.events if isinstance(e, KalshiOrderUpdate)]
     assert s.om.position(TK) == 200
-    assert r.metrics.get("dh_foreign_order_events_total", type="KalshiFill", source="ws") == 2.0
+    # the System 2 fill is dropped as foreign; OUR-looking fill without a client id of an unknown order
+    # is PARKED (review NEW-1: it may have beaten our create's response), never dropped silently
+    assert r.metrics.get("dh_foreign_order_events_total", type="KalshiFill", source="ws") == 1.0
+    assert "o-unknown" in r._parked  # noqa: SLF001
     # a REST back-fill (REST fills carry no client_order_id): only known order ids of this session
     tf = t + 50 * NS_PER_MS  # after the session started (a REST row carries ms)
     r.push_side("fills", {"rows": [fill_row("f-9", "o-sys2", TK, created_ns=tf), fill_row("f-10", "o-1", TK, created_ns=tf)],
@@ -340,7 +343,7 @@ async def test_watchdog_writes_its_own_beat_and_marks_its_exit(tmp_path):
 
 def test_watchdog_beat_problems():
     now = T0
-    good = {"t": now, "pid": 1, "subaccount": 1, "state": "ARMED", "armed": [42, "s"]}
+    good = {"t": now, "pid": 1, "subaccount": 1, "state": "ARMED", "armed": [42, "s"], "api_ok": True, "api_ok_ns": now}
     assert watchdog_beat_problem(good, now_ns=now, subaccount=1, max_age_s=10, runner=(42, "s")) == ""
     assert "no watchdog beat" in watchdog_beat_problem(None, now_ns=now, subaccount=1, max_age_s=10)
     assert "old" in watchdog_beat_problem(good, now_ns=now + 11 * NS_PER_S, subaccount=1, max_age_s=10)
@@ -363,7 +366,7 @@ async def test_live_start_requires_a_fresh_watchdog_beat_for_its_subaccount(tmp_
     if beat != "missing":
         t = now - (60 * NS_PER_S if beat == "stale" else 0)
         write_heartbeat(wd, {"pid": 9, "subaccount": 0 if beat == "other_subaccount" else 1, "state": "DISARMED",
-                             "armed": None}, now_ns=t)
+                             "armed": None, "api_ok": True, "api_ok_ns": t}, now_ns=t)
     app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
     if beat != "fresh":
         assert await app.run(duration_s=0.5) == 2
@@ -379,16 +382,18 @@ async def test_runner_gates_new_orders_while_the_watchdog_is_not_protecting_it()
     """The beat goes stale (or names another subaccount, or is not armed on this runner once it
     has been running a while): gate 'watchdog' + the strategy is told (kalshi.reconcile stale)."""
     s = RecordingStrategy()
-    beat = {"t": time.time_ns(), "pid": 1, "subaccount": 0, "state": "ARMED", "armed": None}
+    beat = {"t": time.time_ns(), "pid": 1, "subaccount": 0, "state": "ARMED", "armed": None, "api_ok": True,
+            "api_ok_ns": time.time_ns()}
+    alive = {"on": False}
     c = replace(cfg(), watchdog=WatchdogCfg(runner_max_age_s=0.3))
-    r, _, _ = live_runner(s, config=c, watchdog_reader=lambda: dict(beat))
+    r, _, _ = live_runner(s, config=c, watchdog_reader=lambda: dict(beat, t=time.time_ns()) if alive["on"] else dict(beat))
 
     async def probe():
         await asyncio.sleep(0.1)
         assert WATCHDOG_REASON not in r.gate.reasons  # fresh
         await asyncio.sleep(0.6)  # the beat is not refreshed: stale after 0.3 s
         assert WATCHDOG_REASON in r.gate.reasons
-        beat["t"] = time.time_ns() + 10**12  # "fresh" again (far future: stays fresh), armed on this runner
+        alive["on"] = True  # fresh again (re-stamped on every read), armed on this runner
         beat["armed"] = [os.getpid(), r.session_id]
         await asyncio.sleep(0.4)
         assert WATCHDOG_REASON not in r.gate.reasons

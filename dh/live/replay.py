@@ -106,7 +106,9 @@ class UniverseReplay:
         session's series (runner.own_series_ok) dropped; fills / order updates whose
         client_order_id lacks the session's own prefix and whose order id is not known
         (runner.own_order_ok, the known ids built from the same events in the same order)
-        dropped; order-group ids translated to the logical id (other groups dropped); WS
+        dropped (live PARKED those without a client id; a parked event released later was
+        recorded on events.live with the order's client_order_id at its release time, so it is
+        delivered here from there: review NEW-1); order-group ids translated to the logical id (other groups dropped); WS
         market_position snapshots dropped (the runner fed only checked ones, recorded on
         events.live with source 'ws_checked' / 'rest'); a fill whose trade/fill id was already
         delivered dropped (a REST back-fill that beat the WS message)."""

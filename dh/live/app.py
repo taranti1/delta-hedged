@@ -234,6 +234,10 @@ class WsFillProbe:
         self.runner.verify_live("ws_fill_subaccount_field", ok, present=present, value=value, subaccount=self.sub,
                                 key_restricted=self.restricted, exchange_index=msg.get("exchange_index"),
                                 ticker=msg.get("market_ticker"))
+        # review NEW-1: fillPayload.client_order_id is optional; without it a fill that beats our
+        # create's response is parked until the order id is known (logged once, informational)
+        self.runner.verify_live("ws_fill_client_order_id", bool(coid), present=bool(coid),
+                                order_id=msg.get("order_id"), ticker=msg.get("market_ticker"))
 
 
 class InstanceLock:
@@ -397,7 +401,9 @@ class LiveApp:
             wd_path = watchdog_beat_path(hb)
             watchdog_reader = watchdog_reader_for(wd_path, lcfg.venue.sub, self.clock)
             problem = watchdog_beat_problem(watchdog_reader(), now_ns=self.clock(), subaccount=lcfg.venue.sub,
-                                            max_age_s=lcfg.watchdog.runner_max_age_s)
+                                            max_age_s=lcfg.watchdog.runner_max_age_s,
+                                            api_max_age_s=lcfg.watchdog.api_max_age_s,
+                                            max_future_s=lcfg.watchdog.max_future_s)
             if problem:
                 raise StartupError(f"{problem} ({wd_path}): start the watchdog for subaccount {lcfg.venue.sub} first "
                                    "(RUNBOOK 5.2 step 2; macOS: the launchd agent, deploy/launchd/README.md)")

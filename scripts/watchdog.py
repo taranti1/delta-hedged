@@ -27,7 +27,12 @@ finds a marker about itself, written after it started, halts). A clean runner sh
 While it runs it writes its OWN liveness file <heartbeat>.watchdog every watchdog.beat_interval_s
 (pid, subaccount, state, the runner it is armed on, last poll; EXITED when it stops): the live
 runner refuses to start without a fresh one for its subaccount and blocks new orders while it
-is stale (watchdog.runner_max_age_s), names another subaccount, or is not armed on it.
+is stale (watchdog.runner_max_age_s) or stamped in the future (watchdog.max_future_s), names
+another subaccount, or is not armed on it. The beat also proves CAPABILITY: at start and every
+watchdog.api_probe_interval_s the watchdog reads GET /portfolio/orders?subaccount=<n>&
+status=resting&limit=1 with its own key; ``api_ok`` false, or a last success older than
+watchdog.api_max_age_s, counts as "not protecting" for the runner (start refused, gate closed).
+A runner heartbeat stamped in the future is treated like a stale one (the watchdog fires).
 
 Refusals (exit 2; launchd retries): no live config file (no fallback to the example), a
 venue section that does not state venue.subaccount and venue.shared_account explicitly,
@@ -64,7 +69,13 @@ sys.path.insert(0, str(REPO))
 
 from dh.live.config import LiveConfig, load_live_config, venue_scope_problems  # noqa: E402
 from dh.live.monitor import read_heartbeat, watchdog_beat_path  # noqa: E402
-from dh.live.watchdog import Watchdog, rest_cancel_all, rest_scoped_cancel_all, rest_trigger_groups  # noqa: E402
+from dh.live.watchdog import (  # noqa: E402
+    Watchdog,
+    rest_api_probe,
+    rest_cancel_all,
+    rest_scoped_cancel_all,
+    rest_trigger_groups,
+)
 
 log = logging.getLogger("watchdog")
 
@@ -163,7 +174,7 @@ async def amain(args: argparse.Namespace, rest: Any = None) -> int:
 
             wcfg = replace(wcfg, stale_s=float(args.max_age_s))
         wd = Watchdog(hb, cancel, wcfg, arm_on_start=args.arm_on_start, trigger_groups=trigger, subaccount=sub,
-                      bulk=bulk)
+                      bulk=bulk, api_probe=rest_api_probe(rest, sub))
         if args.once:
             st = await wd.step()
             log.info("state %s", st)

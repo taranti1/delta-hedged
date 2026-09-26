@@ -18,7 +18,18 @@ It only ever locks onto a heartbeat that names ITS configured subaccount (review
 writes its own liveness file ``<heartbeat>.watchdog`` (pid, subaccount, state, armed runner,
 last poll) every ``beat_interval_s`` while it runs (``EXITED`` when it stops): the live runner
 refuses to start without a fresh one for its subaccount and blocks new orders while it is
-stale, names another subaccount, or is not armed on it (review M3).
+stale, names another subaccount, or is not armed on it (review M3). Liveness is not capability
+(review NEW-2): at start and every ``api_probe_interval_s`` it runs a read-only authenticated
+probe with its OWN key (``rest_api_probe``: GET /portfolio/orders?subaccount=<n>&status=resting&
+limit=1); the beat carries ``api_ok``, ``api_ok_ns`` (last success; a successful cancel-all
+counts too), ``api_error`` and ``step_ok`` (false after 3 failed polls in a row), and the runner
+treats a watchdog whose key cannot be shown to work as not protecting.
+
+Timestamps (review NEW-3): a runner heartbeat stamped more than ``max_future_s`` in the FUTURE
+is untrusted: it neither arms the watchdog nor refreshes the watched runner's liveness, so an
+armed watchdog fires exactly as for a stale heartbeat (fail-safe: a clock step between the two
+processes costs a cancel-all, never a silent dead-man switch). The same absolute-age rule
+applies to the watchdog's own beat as read by the runner.
 
 State machine (poll every ``poll_s``):
   DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping); it then
@@ -66,6 +77,8 @@ log = logging.getLogger("dh.live.watchdog")
 
 CancelAllFn = Callable[[], Awaitable[bool]]
 TriggerFn = Callable[[list[dict[str, Any]]], Awaitable[int]]
+ProbeFn = Callable[[], Awaitable[Any]]  # raises when the key cannot reach the API
+STEP_FAILURES_REPORTED = 3  # consecutive failed polls before the beat says step_ok: false
 
 
 @dataclass
@@ -106,6 +119,7 @@ class Watchdog:
         subaccount: int | None = None,
         bulk: bool = False,
         beat_path: str | Path | None = None,
+        api_probe: ProbeFn | None = None,
     ) -> None:
         self.path = Path(heartbeat_path)
         self.cancel_all = cancel_all
@@ -124,6 +138,15 @@ class Watchdog:
         self._last_beat_ns = 0
         self._last_poll_ns = 0
         self._mismatch_noted = 0
+        # capability (review NEW-2): the authenticated read-only probe of its own key
+        self.api_probe = api_probe
+        self.api_ok = False
+        self.api_ok_ns = 0
+        self.api_error = "not probed yet" if api_probe is not None else "no API probe configured"
+        self.api_probes = 0
+        self.step_failures = 0  # consecutive failed polls
+        self.step_error = ""
+        self.future_hb = 0  # runner heartbeats stamped in the future (not trusted)
 
     def _note(self, msg: str, **kw: Any) -> None:
         now = self._clock()
@@ -161,9 +184,57 @@ class Watchdog:
             write_heartbeat(self.beat_path, {
                 "pid": os.getpid(), "subaccount": self.subaccount, "state": state or self.st.state,
                 "armed": list(self.st.armed) if self.st.armed else None, "last_poll_ns": self._last_poll_ns,
-                "heartbeat": str(self.path), "bulk_cancel": self.bulk, "stale_s": self.cfg.stale_s}, now_ns=now)
+                "heartbeat": str(self.path), "bulk_cancel": self.bulk, "stale_s": self.cfg.stale_s,
+                "api_ok": self.api_ok, "api_ok_ns": self.api_ok_ns or None, "api_error": self.api_error,
+                "step_ok": self.step_failures < STEP_FAILURES_REPORTED, "step_error": self.step_error}, now_ns=now)
         except OSError as exc:
             log.error("watchdog: cannot write its beat %s: %s", self.beat_path, exc)
+
+    async def probe_api(self) -> bool:
+        """One read-only authenticated probe with the watchdog's own key (review NEW-2); the result
+        goes into the beat (``api_ok``, ``api_ok_ns``, ``api_error``). Bounded by
+        ``api_probe_timeout_s``. A successful cancel-all also counts as proof."""
+        if self.api_probe is None:
+            return False
+        self.api_probes += 1
+        try:
+            await asyncio.wait_for(self.api_probe(), timeout=max(0.1, self.cfg.api_probe_timeout_s))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any failure: the key cannot be shown to work
+            was = self.api_ok
+            self.api_ok = False
+            self.api_error = f"{type(exc).__name__}: {exc}"[:200] or type(exc).__name__
+            if was or self.api_probes == 1:
+                self._note("API probe FAILED: the watchdog's key cannot be shown to reach the API", error=self.api_error)
+            self.write_beat(force=True)
+            return False
+        was = self.api_ok
+        self.api_ok, self.api_ok_ns, self.api_error = True, self._clock(), ""
+        if not was:
+            self._note("API probe OK (the watchdog's key reaches the API)")
+            self.write_beat(force=True)
+        return True
+
+    async def _probe_loop(self, stop: asyncio.Event | None) -> None:
+        while stop is None or not stop.is_set():
+            await self.probe_api()
+            await self._sleep(max(0.05, self.cfg.api_probe_interval_s))
+
+    def _hb_time_ok(self, t: int | None, now: int) -> bool:
+        """A runner heartbeat time that is not in the FUTURE beyond ``max_future_s`` (review NEW-3):
+        a future-stamped heartbeat (a clock step, a writer with a wrong clock) is not trusted, so
+        it never refreshes the watched runner's liveness (the watchdog then fires as for a stale
+        one) and never arms."""
+        if t is None:
+            return False
+        if now - t < -int(self.cfg.max_future_s * NS_PER_S):
+            self.future_hb += 1
+            if self.future_hb == 1 or self.future_hb % 1000 == 0:
+                self._note("runner heartbeat stamped in the FUTURE: not trusted (treated as stale)",
+                           ahead_s=round((t - now) / NS_PER_S, 3))
+            return False
+        return True
 
     def _arm(self, hb: dict[str, Any], note: str) -> None:
         st = self.st
@@ -187,7 +258,8 @@ class Watchdog:
         t = int(hb.get("t", 0)) if hb is not None else None
         mode = str(hb.get("mode", "live")) if hb is not None else st.last_mode
         hstate = str(hb.get("state", "running")) if hb is not None else st.last_state
-        fresh = t is not None and now - t <= stale_ns
+        t_ok = self._hb_time_ok(t, now)
+        fresh = t_ok and now - t <= stale_ns  # type: ignore[operator]
         ident = (hb.get("pid"), hb.get("session")) if hb is not None else None
         if hb is not None:
             st.last_mode = mode
@@ -201,7 +273,12 @@ class Watchdog:
                 why = ("no heartbeat file" if hb is None else "unreadable heartbeat" if hb.get("unparsed")
                        else f"heartbeat mode={mode} state={hstate}")
                 self._note(f"arm-on-start: {why}: DISARMED until a fresh live heartbeat")
-        ours = hb is not None and st.armed is not None and ident == st.armed
+        same = hb is not None and st.armed is not None and ident == st.armed
+        # a future-stamped heartbeat of the watched runner vouches for nothing: its liveness (and
+        # state) is not refreshed, so the ARMED branch below fires once the last trusted one is stale
+        ours = same and t_ok
+        if same and not t_ok and "order_groups" in hb:  # type: ignore[operator]
+            st.groups = _groups_of(hb)  # type: ignore[arg-type]  # still the freshest list of groups to trigger
         if ours:
             st.last_hb_ns = max(st.last_hb_ns, t or 0)
             st.last_state = hstate
@@ -212,7 +289,7 @@ class Watchdog:
                 st.stopping_seen_ns = st.stopping_seen_ns or now
             else:
                 st.stopping_seen_ns = 0
-        elif hb is not None and st.armed is not None and st.state != "DISARMED":
+        elif not same and hb is not None and st.armed is not None and st.state != "DISARMED":
             st.foreign += 1
             if st.foreign == 1 or st.foreign % 1000 == 0:
                 self._note("ignoring a heartbeat from another writer", pid=hb.get("pid"), session=hb.get("session"),
@@ -229,7 +306,10 @@ class Watchdog:
                 return st.state
             stuck = bool(st.stopping_seen_ns) and now - st.stopping_seen_ns > int(
                 (st.shutdown_timeout_s + c.stopping_grace_s) * NS_PER_S)
-            if hb is None or now - st.last_hb_ns > stale_ns or stuck:
+            age = now - st.last_hb_ns
+            # absolute age (review NEW-3): a recorded heartbeat now in the future (the watchdog's clock
+            # stepped back) is as untrusted as a stale one
+            if hb is None or age > stale_ns or age < -int(c.max_future_s * NS_PER_S) or stuck:
                 st.state = "TRIGGERED"
                 st.triggered_at_ns = now
                 st.successes = 0
@@ -272,6 +352,7 @@ class Watchdog:
         if ok:
             st.successes += 1
             st.last_success_ns = self._clock()
+            self.api_ok, self.api_ok_ns, self.api_error = True, st.last_success_ns, ""  # it did reach the API
             self._note("cancel-all OK", n=st.successes)
         else:
             st.failures += 1
@@ -286,17 +367,32 @@ class Watchdog:
     async def run(self, stop: asyncio.Event | None = None) -> None:
         """Poll until ``stop``; the own beat is written every ``beat_interval_s`` (at once on a
         state change) and set to EXITED when the loop ends."""
+        probe: asyncio.Task[Any] | None = None
         try:
+            if self.api_probe is not None:
+                await self.probe_api()  # at start, before the first beat vouches for anything
+                probe = asyncio.ensure_future(self._probe_loop_after_first(stop))
             while stop is None or not stop.is_set():
-                before = (self.st.state, self.st.armed)
+                before = (self.st.state, self.st.armed, self.step_failures >= STEP_FAILURES_REPORTED)
                 try:
                     await self.step()
-                except Exception:  # noqa: BLE001 - the watchdog must not die
-                    log.exception("watchdog step failed")
-                self.write_beat(force=(self.st.state, self.st.armed) != before)
+                    self.step_failures, self.step_error = 0, ""
+                except Exception as exc:  # noqa: BLE001 - the watchdog must not die
+                    self.step_failures += 1
+                    self.step_error = f"{type(exc).__name__}: {exc}"[:200]
+                    log.exception("watchdog step failed (%d in a row)", self.step_failures)
+                after = (self.st.state, self.st.armed, self.step_failures >= STEP_FAILURES_REPORTED)
+                self.write_beat(force=after != before)
                 await self._sleep(self.cfg.poll_s)
         finally:
+            if probe is not None:
+                probe.cancel()
+                await asyncio.gather(probe, return_exceptions=True)
             self.write_beat(state="EXITED", force=True)
+
+    async def _probe_loop_after_first(self, stop: asyncio.Event | None) -> None:
+        await self._sleep(max(0.05, self.cfg.api_probe_interval_s))
+        await self._probe_loop(stop)
 
 
 def _groups_of(hb: dict[str, Any]) -> list[dict[str, Any]]:
@@ -362,6 +458,23 @@ def rest_scoped_cancel_all(rest: Any, subaccount: int, *, rounds: int = 3, batch
         return False
 
     return _cancel
+
+
+def rest_api_probe(rest: Any, subaccount: int) -> ProbeFn:
+    """The watchdog's capability probe (review NEW-2): GET /portfolio/orders?subaccount=<n>&
+    status=resting&limit=1 with its own key: read-only, explicitly scoped to its subaccount, and
+    the same list the scoped cancel-all starts from. Raises on any failure (401/403, network)."""
+    if subaccount is None or isinstance(subaccount, bool):
+        raise ValueError("rest_api_probe needs an explicit subaccount")
+    sub = int(subaccount)
+
+    async def _probe() -> Any:
+        body = await rest.get_orders(subaccount=sub, status="resting", limit=1)
+        if not isinstance(body, dict) or not isinstance(body.get("orders", []), list):
+            raise ValueError(f"unexpected GET /portfolio/orders body: {str(body)[:120]}")
+        return body
+
+    return _probe
 
 
 def rest_trigger_groups(rest: Any, subaccount: int) -> TriggerFn:

@@ -83,6 +83,20 @@ crash-looping under launchd (TCC, credentials, config refusal) is seen: the runn
 quoting instead of trading without its dead-man switch. Check it with
 `cat data/run/heartbeat.json.watchdog` (`t` in ns, `state` ARMED while a live runner runs).
 
+**Capability, not just liveness.** At start and every `watchdog.api_probe_interval_s` (60 s) the
+watchdog reads `GET /portfolio/orders?subaccount=1&status=resting&limit=1` with its OWN key (read
+only; a successful cancel-all also counts). The beat carries `"api_ok"`, `"api_ok_ns"` (last
+success), `"api_error"` and `"step_ok"` (false after 3 failed polls in a row). The live runner
+treats `api_ok: false` (revoked or wrong watchdog key, missing permission, network down), a last
+success older than `watchdog.api_max_age_s` (180 s) or `step_ok: false` like a stale beat: start
+refused, gate `watchdog`. After installing the agent check `"api_ok": true` in the beat; if it
+is false, `api_error` says why (a `401` = the key itself is rejected).
+
+**Timestamps.** A beat stamped more than `watchdog.max_future_s` (2 s) in the future is not
+fresh for the runner, and a RUNNER heartbeat stamped in the future is not trusted by the
+watchdog: it never arms on it and it does not refresh the watched runner's liveness, so the
+watchdog fires as for a stale heartbeat (a clock step costs a cancel-all, never a silent switch).
+
 ```sh
 cd /Users/thomast/Desktop/delta-hedged
 mkdir -p data/logs data/run ~/Library/LaunchAgents
@@ -91,7 +105,7 @@ plutil -lint ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl print gui/$(id -u)/com.dh.watchdog | grep -E 'state|pid|last exit'
 tail -f data/logs/watchdog.launchd.out     # "watching .../data/run/heartbeat.json (... subaccount 1; cancel by id; beat ...)"
-cat data/run/heartbeat.json.watchdog        # its own beat: refreshed every second
+cat data/run/heartbeat.json.watchdog        # its own beat: refreshed every second; "api_ok": true
 ```
 
 Operate: `launchctl kickstart -k gui/$(id -u)/com.dh.watchdog` (restart; `--arm-on-start`

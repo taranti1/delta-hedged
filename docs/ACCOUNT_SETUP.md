@@ -29,7 +29,11 @@ You run every step yourself with `scripts/account_setup.py`. The tool:
 * keeps unresolved and finished transfers in ONE **per-user** state file, shared by every
   checkout and worktree: `~/.kalshi/dh_account_setup/state.<env>.json` (`state.prod.json`;
   override with `DH_ACCOUNT_SETUP_STATE=<path>` or `--state-file`). A second checkout therefore
-  sees the saved id and cannot silently start over. The old per-checkout file
+  sees the saved id and cannot silently start over. An override cannot bypass that: for
+  `transfer`, `shard-transfer` and `forget-pending` a state file other than the per-user one is
+  REFUSED when it lacks an unresolved or completed record of the per-user file (the tool could
+  otherwise re-send a saved `client_transfer_id` or repeat a completed transfer without
+  `--again`); `--i-know-state-file` accepts it deliberately. The old per-checkout file
   `data/logs/account_setup_state.json` is moved into it on first use; if both exist and the old
   one still holds an unresolved transfer, every command refuses until you merge it by hand.
 
@@ -248,7 +252,10 @@ those after. The result must match the amount EXACTLY (1 cent tolerance: the des
 * **Complete**: subaccount 1 on shard 2 received exactly the amount.
 * **ALARM / mismatch** (exit 1): the balances moved by anything else (e.g. 100x: a unit
   mistake) or the listed amount differs. STOP, check `status` and the Kalshi transfer history;
-  the declaration printed for System 2 uses what really left subaccount 0.
+  the declaration printed for System 2 is exactly what left subaccount 0 PER THE TRANSFER
+  RECORD (Kalshi's listed amount, else the requested one), never the subaccount-0 balance
+  change, which also carries unrelated movements such as a System 2 settlement. The tool
+  prints both numbers (and stores them as `declaration_basis`).
 * **PARTIAL**: Kalshi reports the transfer complete, but the money stopped part-way (the
   non-atomic steps). The tool shows where it went. If it sits in subaccount 0 on shard 2,
   finish with the command of case A, which the tool prints. If it is still on shard 0, nothing
@@ -266,16 +273,27 @@ Instead of case B you can move primary cash to shard 2 in the Kalshi web app
 
 **Unknown outcome** (timeout, 5xx, or any answer to a retry):
 * `transfer`: re-run the **same** command. It reuses the saved `client_transfer_id` and first
-  checks the evidence: if the balances since the FIRST attempt already show the move (or the
-  transfer list does), it records the transfer as applied without sending anything. Otherwise
+  checks the evidence: if the balances since the FIRST attempt already show the move, it
+  records the transfer as applied without sending anything. Otherwise
   it sends the same id again; whatever that retry is answered (200, 400, 409, 5xx, no
   connection), the id stays saved and the outcome comes from the evidence:
-  * **applied**: completed, with the System 2 declaration bracketed from the FIRST attempt's
-    reading (a 200 on a retry still requires the declaration);
+  * **applied**: the balance deltas since the first attempt are EXACTLY -amount on the source
+    and +amount on the destination of this transfer's own route (1 cent), and GET
+    /portfolio/subaccounts/transfers lists exactly one matching transfer (same route and
+    amount, created at most 5 s before the first attempt and after any earlier identical
+    completed transfer) that no other local record has claimed (list unreadable: the exact
+    deltas alone). The record stores the listed `transfer_id` it claims
+    (`claimed_transfer_id`), so two records never claim the same transfer and an earlier
+    identical transfer (`--again` seconds later) can never complete a later one. Completed with
+    the System 2 declaration bracketed from the FIRST attempt's reading (a 200 on a retry still
+    requires the declaration);
   * **not applied so far** (nothing moved, nothing listed): nothing to declare (a 409 without a
     balance move never asks you to declare money that did not move). Re-run later, or, once
     `status` confirms nothing moved, `forget-pending --id <id>` and send a new transfer;
-  * **inconclusive**: it stays unresolved; check `status` before anything else.
+  * **inconclusive**: it stays unresolved; check `status` before anything else. This includes a
+    listed transfer while the balances moved by anything other than exactly the amount (e.g. a
+    System 2 settlement landed in the bracket): a listed row plus unrelated movement is never
+    taken as proof, so nothing is declared to System 2 until you have checked.
   Only when the ONLY attempt was refused (4xx) or never connected is the id dropped (definitely
   not applied). Any other transfer is refused until this one is resolved.
 * `shard-transfer`: this API has no idempotency key, so the tool refuses any further transfer.
@@ -367,7 +385,8 @@ python scripts/account_setup.py status                                       # e
   * `config/live.yaml`: `venue.subaccount: 1`, `venue.shared_account: true` and
     `venue.key_restricted_to_subaccount: true`, written in the file (live mode and the watchdog
     refuse a config that leaves them out). The live start-up proves the key restriction:
-    `GET /portfolio/balance?subaccount=0` must be refused (401/403) with the runner key.
+    `GET /portfolio/balance?subaccount=0` must be refused with HTTP 403 by the runner key (a
+    401 is an authentication failure: refused as "key rejected, not proven restricted").
   * `config/kalshi.yaml`: points at `~/.kalshi/dh-sub1.env`; `rate_limits.account_share` stays
     0.2 (budgets are per account and shared).
   * The start-up balance check (reconciliation finding 4) should read
@@ -409,9 +428,12 @@ python scripts/account_setup.py status                                       # e
 | `forget-pending --id ID` | nothing (local state) | the id | none |
 
 Global options: `--config PATH`, `--demo`, `--system2-root PATH`, `--state-file PATH`
-(default `~/.kalshi/dh_account_setup/state.<env>.json`, or `$DH_ACCOUNT_SETUP_STATE`). All write commands take
+(default `~/.kalshi/dh_account_setup/state.<env>.json`, or `$DH_ACCOUNT_SETUP_STATE`; another
+file must hold every record of the per-user one, else `--i-know-state-file`). All write commands take
 `--execute`. Amounts are dollars with at most 2 decimals, at most $1,000 (typo guard).
 
 Tests: `tests/kalshi/test_account_setup.py` (fake REST client; request bodies validated
 against the openapi schemas) and `tests/kalshi/test_prelive_account_setup.py` (the pre-live
-review's retry / 400 / 409 / 200 / not-sent / over-move / probe / state-location cases).
+review's retry / 400 / 409 / 200 / not-sent / over-move / probe / state-location cases), and
+`tests/kalshi/test_rereview_account_setup.py` (the re-review: claimed transfer ids, `--again`
+within seconds plus balance noise, the mismatch declaration amount, state-file overrides).

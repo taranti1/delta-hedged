@@ -72,11 +72,13 @@ venue:
                                # (DELETE /portfolio/events/orders) is NEVER sent: orders are cancelled
                                # by id (order-group trigger, then list + batch cancel until empty)
   key_restricted_to_subaccount: true  # runner + watchdog keys are restricted to `subaccount`, PROVEN at
-                               # start-up: GET /portfolio/balance?subaccount=0 must be refused (401/403)
-                               # with the runner key. Private WS messages without a subaccount field
-                               # are then ours (Kalshi scopes the channels to the key); fills / order
-                               # updates of client_order_ids without this system's run prefix
-                               # (dhm1-) are dropped anyway (dh_foreign_order_events_total)
+                               # start-up: GET /portfolio/balance?subaccount=0 must be refused with
+                               # HTTP 403 by the runner key (a 401 = key rejected: refused, not proof).
+                               # Private WS messages without a subaccount field are then ours (Kalshi
+                               # scopes the channels to the key); fills / order updates with another
+                               # system's client_order_id (no dhm1- prefix) are dropped anyway
+                               # (dh_foreign_order_events_total); ones WITHOUT a client id of an order
+                               # not known yet are parked (unknown_order_* below), never dropped
   allow_primary_account: false # the ONLY way to trade subaccount 0 (with shared_account: false)
   exchange_indexes: [2]        # shards traded AND funded (every KXBTC* market is on shard 2); markets
                                # on an unknown / other shard are never traded; one order group per shard
@@ -117,6 +119,16 @@ venue:
   fills_backfill_margin_s: 120.0    # look-back overlap (duplicates are dropped by trade/fill id)
   fills_backfill_min_age_s: 10.0    # the periodic pass leaves younger fills to the WebSocket
   reconnect_settle_s: 2.0           # after a WS reconnect: wait, then back-fill fills + positions + orders
+  # A fill / order update WITHOUT client_order_id (optional on WS fills; REST fills never carry it)
+  # of an order id not known yet (it beat our create's response, or the create is being reconciled)
+  # is PARKED, then released as soon as the id is known (ack, reconciliation, or a read-only
+  # GET /portfolio/orders/{id} showing our dhm1- prefix on our subaccount). Proven foreign: dropped
+  # (ERROR). Still unknown after unknown_order_park_s: dropped (ERROR) and quoting paused through the
+  # reconcile path (fills, positions, orders re-read). The release is recorded (replay-exact).
+  unknown_order_park_s: 10.0
+  unknown_order_lookup_delay_s: 1.0 # first GET order after this (the create response usually wins)
+  unknown_order_lookup_retry_s: 2.0 # then every this while parked (404 / read error)
+  unknown_order_park_max: 1000      # parked events in all; beyond: the oldest order times out
   reconcile_retry_max_s: 30.0
   startup_cancel_all: true          # cancel (and verify) leftovers BEFORE reading positions; required live
   cancel_all_hold_s: 60.0           # Kalshi may cancel orders placed within 1 min of a BULK cancel-all:
@@ -187,6 +199,14 @@ watchdog:                      # scripts/watchdog.py (locks onto the live runner
                                # younger than this, and blocks new orders (gate 'watchdog', quotes
                                # pulled) while it is older, names another subaccount, or is not armed
                                # on this runner once it has been running this long
+  api_probe_interval_s: 60.0   # CAPABILITY: the watchdog reads GET /portfolio/orders?subaccount=<n>&
+  api_probe_timeout_s: 10.0    # status=resting&limit=1 with its OWN key at start and this often; its
+  api_max_age_s: 180.0         # beat carries api_ok + the last success. LIVE RUNNER: api_ok false or a
+                               # last success older than api_max_age_s = not protecting (start refused,
+                               # gate 'watchdog' closed)
+  max_future_s: 2.0            # a beat (runner side) or runner heartbeat (watchdog side) stamped more
+                               # than this in the FUTURE is not fresh: the runner gates, the watchdog
+                               # treats it like a stale heartbeat (it fires)
 
 disk:                          # free space of paths.data_root's filesystem (decimal GB; live only)
   min_free_gb_start: 10.0      # below: the live runner refuses to start (exit 2)
