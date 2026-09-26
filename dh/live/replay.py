@@ -276,10 +276,25 @@ def session_specs(info: SessionInfo) -> list[MarketSpec]:
     return list(out.values())
 
 
+def log_fill_is_new(rec: dict[str, Any], seen: set[str]) -> bool:
+    """A ``log.fill`` record not booked yet: its trade id (logged since review L1) is new, or it
+    has none (older logs). Adds the id to ``seen``. The strategy logs each fill once; this also
+    guards the P&L tools against a fill logged twice (e.g. an orphan fill and its late attach
+    in logs written before the fix)."""
+    tid = str(rec.get("trade_id") or "")
+    if not tid:
+        return True
+    if tid in seen:
+        return False
+    seen.add(tid)
+    return True
+
+
 def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
     """P&L attribution (dh.backtest.ledger.Ledger) straight from a session's JSON log, without
     re-running the strategy: ``log.fill`` (our fills: paper = simulator, live = exchange),
-    ``log.fv`` (fair values for markouts) and ``log.settle`` (settlement prices).
+    ``log.fv`` (fair values for markouts) and ``log.settle`` (settlement prices). A ``log.fill``
+    whose trade id was already booked is skipped (``log_fill_is_new``; review L1).
 
         info = load_session("data/live")
         led = ledger_from_log("data/live_logs/<session>.jsonl", session_specs(info))
@@ -290,14 +305,18 @@ def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
     from dh.core.events import KalshiFill, Settlement
 
     led = Ledger({s.ticker: s.event_ticker for s in specs}, {s.ticker: s.expiration_ts for s in specs})
+    seen: set[str] = set()
     for line in Path(log_path).read_text().splitlines():
         r = json.loads(line)
         k, t = r.get("k", ""), int(r.get("t", 0))
         if k == "log.fv":
             led.on_log(t, Log("fv", {"ticker": r["ticker"], "F": r["F"], "delta": r.get("delta", 0.0)}))
         elif k == "log.fill":
-            led.on_event(KalshiFill(t, 0, r["ticker"], "", "", str(r.get("coid", "")), r["side"], int(r["px"]),
-                                    int(r["qty"]), bool(r.get("taker", False)), int(r.get("fee", 0)), 0, False))
+            if not log_fill_is_new(r, seen):
+                continue
+            led.on_event(KalshiFill(t, 0, r["ticker"], str(r.get("trade_id") or ""), "", str(r.get("coid", "")),
+                                    r["side"], int(r["px"]), int(r["qty"]), bool(r.get("taker", False)),
+                                    int(r.get("fee", 0)), 0, False))
         elif k == "log.settle":
             px = int(r["px"])
             led.on_event(Settlement(t, 0, r["ticker"], "yes" if px > 0 else "no", None, px))

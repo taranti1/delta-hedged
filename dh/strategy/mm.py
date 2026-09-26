@@ -62,7 +62,7 @@ from dh.core.events import (
 from dh.core.market import MarketSpec
 from dh.core.strategy import IdGen
 from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
-from dh.execution.order_manager import OrderManager
+from dh.execution.order_manager import ORPHAN_ATTACHED, OrderManager
 from dh.execution.queue import QueueEstimator
 from dh.models.fairvalue import digital
 from dh.models.fvmodel import FairValueModel, load_recommended_config
@@ -402,13 +402,15 @@ class MarketMaker:
                     if pending:
                         self._queue_pending_since[oe.client_order_id] = oe.ts
             elif k in ("fill", "orphan_fill"):
-                self.stats.fills += 1
                 if oe.client_order_id in self.queue.orders:
                     self.queue.on_own_fill(oe.client_order_id, oe.qty)
+                if oe.detail == ORPHAN_ATTACHED:
+                    continue  # logged and counted once, as the orphan_fill (review L1)
+                self.stats.fills += 1
                 fv = self.fvc.get(oe.ticker)
                 out.append(Log("fill", {"ticker": oe.ticker, "coid": oe.client_order_id, "side": oe.book_side,
                                         "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
-                                        "F": None if fv is None else round(fv.F, 6)}))
+                                        "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id}))
             elif k in ("filled", "canceled", "rejected"):
                 self._queue_pending_since.pop(oe.client_order_id, None)
                 self._own_delta_seen.pop(oe.client_order_id, None)

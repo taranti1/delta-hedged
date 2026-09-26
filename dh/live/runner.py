@@ -930,6 +930,15 @@ class LiveRunner:
                   trade_id=ev.trade_id, client_order_id=coid, park_cycles=cycles, subaccount=self.subaccount)
         self._release.append((ev, "rest", coid))
 
+    ORDER_LIST_MARGIN_S = 300  # clock skew / start-up duration allowance before the session start
+
+    def _order_list_min_ts(self) -> int:
+        """``min_ts`` (Unix s) of an order-list lookup (review L2): the session start minus a
+        margin. Every order of our subaccount that can fill during the session was placed after
+        the session started (the start-up cancel-all, which runs after ``started_ns``, cleared
+        the older resting ones)."""
+        return max(0, self.started_ns // NS_PER_S - self.ORDER_LIST_MARGIN_S)
+
     async def _lookup_order(self, oid: str, delay_s: float) -> None:
         """Who owns order ``oid`` (read-only), after ``delay_s`` if the order is still parked (the
         create response usually releases it first): GET /portfolio/orders/{oid} and, when that 404s,
@@ -947,7 +956,7 @@ class LiveRunner:
             try:
                 find = getattr(self.venue, "find_order", None)
                 if find is not None:
-                    row, via = await find(oid, ticker=ticker)
+                    row, via = await find(oid, ticker=ticker, min_ts_s=self._order_list_min_ts())
                 else:
                     row = await self.venue.lookup_order(oid)
             except asyncio.CancelledError:
@@ -991,7 +1000,7 @@ class LiveRunner:
             if self._stopping:
                 return
             try:
-                _row, via = await self.venue.find_order(oid, ticker=ticker)
+                _row, via = await self.venue.find_order(oid, ticker=ticker, min_ts_s=self._order_list_min_ts())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a check only: try again later

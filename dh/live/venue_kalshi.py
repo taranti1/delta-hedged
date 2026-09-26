@@ -1265,12 +1265,19 @@ class KalshiVenue:
         self._learn_rows([o])
         return o
 
-    async def find_order(self, oid: str, *, ticker: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    async def find_order(self, oid: str, *, ticker: str = "",
+                         min_ts_s: int | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         """Who owns order ``oid`` (read-only, review F1 (b)): GET /portfolio/orders/{oid} (no
         subaccount / exchange_index parameter: it may not see an order on shard 2) and, when that
         404s and ``ticker`` is known, the LIST GET /portfolio/orders?subaccount=<ours>&ticker=<t>
-        (every page, every shard, every status) searched for the id. Returns (row or None, via)
-        with via = {"by_id": bool, "by_list": bool | None (not tried), "shard": the row's
+        (every shard) searched for the id: first ``status=resting`` (a parked fill's order is
+        usually still resting: one short page), then every status from ``min_ts_s`` on (review L2:
+        not the market's whole order history on every retry; the runner passes its session start
+        minus a margin: every order of the subaccount that can fill during the session was placed
+        after it, the start-up cancel-all having cleared the older ones). The API filters on one
+        status only, and the order of a parked fill may equally be executed or canceled (after a
+        partial fill), so the second read takes every status. Returns (row or None, via) with
+        via = {"by_id": bool, "by_list": bool | None (not tried), "shard": the row's
         exchange_index}; raises on anything but a 404 of the by-id read."""
         from dh.kalshi.normalize import shard_value
 
@@ -1280,16 +1287,19 @@ class KalshiVenue:
             via["by_id"] = True
         elif ticker:
             found = None
-            it = self.rest.iter_orders(subaccount=self.sub, ticker=ticker)
-            try:
-                async for o in it:
-                    if str(o.get("order_id") or "") == oid:
-                        found = o
-                        break
-            finally:
-                aclose = getattr(it, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+            for extra in ({"status": "resting"}, {} if min_ts_s is None else {"min_ts": int(min_ts_s)}):
+                it = self.rest.iter_orders(subaccount=self.sub, ticker=ticker, **extra)
+                try:
+                    async for o in it:
+                        if str(o.get("order_id") or "") == oid:
+                            found = o
+                            break
+                finally:
+                    aclose = getattr(it, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                if found is not None:
+                    break
             via["by_list"] = found is not None
             if found is not None:
                 self._learn_rows([found])
