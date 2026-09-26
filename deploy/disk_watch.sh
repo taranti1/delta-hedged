@@ -1,13 +1,15 @@
 #!/bin/bash
 # Pauses this repo's data collection when the shared disk runs low (the other trading system on
 # this Mac can write ~12 GB/h). Every CHECK_S seconds: if free space < PAUSE_GB, SIGSTOP the
-# recorder, the history downloader(s) and the paper loop + runner (never anything outside this
+# recorder, the history downloader(s) and the paper loop + runner of THIS repo (cwd check; never
+# the trading-strategy system, e.g. its two_leg_launcher watch or screener; never anything outside this
 # repo, never a live runner). Resume is MANUAL once space is freed:
 #   pkill -CONT -f 'scripts/record.py|download_kalshi_history|deploy/paper_loop.sh|--mode paper'
 # (processes reconnect on their own; the recording shows a gap for the paused period).
 # The recorder's own guard (config/feeds.yaml: shed < 30 GB, clean stop < 8 GB) stays in force.
 set -u
 cd "$(dirname "$0")/.." || exit 1
+REPO=$(pwd -P)
 PAUSE_GB=${PAUSE_GB:-25}
 CHECK_S=${CHECK_S:-300}
 LOG=data/logs/disk_watch.log
@@ -21,7 +23,10 @@ while true; do
       echo "$(date -u +%FT%TZ) LOW DISK ${free_gb} GB < ${PAUSE_GB} GB: pausing data collection" >> "$LOG"
       for p in $(pgrep -f "$PATTERN"); do
         cmd=$(ps -o command= -p "$p")
-        case "$cmd" in *caffeinate*|*"--mode live"*) continue;; esac
+        case "$cmd" in *caffeinate*|*"--mode live"*|*trading-strategy*|*kalshi_m1*|*two_leg*|*screener*) continue;; esac
+        # only processes running FROM THIS REPO: never the other trading system's processes
+        cwd=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+        [ "$cwd" = "$REPO" ] || continue
         kill -STOP "$p" && echo "  paused $p: ${cmd:0:100}" >> "$LOG"
       done
       osascript -e "display notification \"Paused delta-hedged data collection: ${free_gb} GB free\" with title \"Low disk\"" 2>/dev/null
