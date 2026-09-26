@@ -250,7 +250,7 @@ async def test_f1_lookup_falls_back_to_the_subaccount_list_and_reports_get_by_id
     r.push(raw[0])
     await _drain(r)
     assert [(f.trade_id, f.client_order_id) for f in _fills(s)] == [("t7", "dhm1-tok-7")]
-    assert rest.of("iter_orders")[0][1] == {"subaccount": 1, "ticker": TK}
+    assert rest.of("iter_orders")[0][1] == {"subaccount": 1, "ticker": TK, "status": "resting"}  # review L2
     assert r.metrics.get("dh_verify_live", check=VERIFY) == 0.0 and r._verified[VERIFY] is False  # noqa: SLF001
     assert _delivered(_replay(raw, rec.live())) == _delivered(s)
 

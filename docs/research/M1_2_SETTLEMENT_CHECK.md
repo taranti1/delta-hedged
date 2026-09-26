@@ -151,6 +151,10 @@ Historical settlement lags from `settlement_ts - close_time`: KXBTC15M (26,961 q
 downloaded events) median 158 s, max 348 s. So the lag is usually seconds (15M) or ~2.5 min
 (hourly) but has a long tail: design for "determination may take a day" (contract terms Rule 7.1).
 
+**Implemented** (2026-09-26): `dh/settlement/closemark.py` (the rules below), used by
+`dh/live/riskstate.py` (`mark_px`, `open_marks`, `backfill_window_prints`: start-up), `dh/strategy/mm.py`
+(`close_marks`: the strategy's own positions) and `dh/live/runner.py` (`_remark_excluded`); RUNBOOK section 8.
+
 **What `dh/live/riskstate.py` `mark_px` should do** (not edited here; `dh/live` is another
 agent's area). Today it marks a held position by: `result` present -> payout; else the YES bid
 (long) / ask (short); else, when not `active`, the last trade. After this check:

@@ -990,6 +990,7 @@ check positions (`GET /portfolio/positions?subaccount=1`, or the UI); write down
 | `dh_duplicate_fills_dropped_total`, `dh_foreign_subaccount_events_total`, `dh_cancel_resends_total` | reconciliation details | investigate if growing |
 | `dh_day_pnl_dollars` | the UTC day's real P&L incl. earlier sessions (persisted) | near -$25 (minus a reset's base) |
 | `dh_day_realized_dollars`, `dh_day_mark_dollars`, `dh_day_budget_base_dollars` | its realized part, the open positions' mark, an operator reset's base | |
+| `dh_marked_positions{scope, source}`, `dh_position_marks_total{scope, source}` | positions in closed markets awaiting their result, by mark source (`own_benchmark` = exact payout from our prints; `worst_case`; `last_trade`); marks set | `worst_case` on a large position (section 8) |
 | `dh_excluded_settlements_total` | markets of excluded events settled during the session | |
 | `dh_watchdog_cancel_alls_seen_total` | the watchdog cancelled everything after this runner started | > 0 (about this runner: it halted) |
 | `dh_lag_baseline_seconds{source}`, `dh_lag_baseline_over_cap_total{source}` | uncapped exchange-time latency baseline per source; times it exceeded the cap | over-cap growing |
@@ -1075,18 +1076,42 @@ halt):
   subaccount are skipped and logged (never a refusal), and positions there are reported, not
   valued;
 * real P&L = **realized** (today's fills cash minus fees, plus settlements, minus the value of
-  the positions held at 00:00 UTC at the last trade before midnight) + the **open positions
-  at exchange prices** (long at the YES bid, short at the YES ask, a determined market at its
-  payout, a closed one awaiting determination at its last trade);
+  the positions held at 00:00 UTC at the last trade before midnight) + the **open positions**:
+  a market with a result at its payout; an open market at exchange prices (long at the YES
+  bid, short at the YES ask); a market **past its close_time without a result yet** (the
+  minutes between the close and Kalshi's determination: KXBTC15M ~1 s, KXBTCD / KXBTC ~1.5 min,
+  rarely hours) at the **exact payout our own BRTI prints of its settlement window imply**
+  (`mark_source` `own_benchmark`: the 60 prints T-60 s .. T-1 s, averaged, rounded half up to
+  cents, compared with the strike like Kalshi does). The outcome is fixed one second before the
+  close, so this is not an estimate. At start-up the window's prints are back-filled with ONE CF
+  passthrough call (`timespan=HOUR`, the hour START); REST bid / ask are never used after the
+  close (they are the stale pre-close book, then 0 / 1.00);
+* such a closed market falls back to the **worst case** for our side (long $0, short $1;
+  `worst_case`) when a print of the window is missing or the rounded value is within $0.01 of a
+  strike (a KXBTC15M tie at the previous quarter's value included), and to the **last trade**
+  (`last_trade`, then the worst case) only when the window cannot be evaluated at all, e.g. CF
+  has not published it yet (its history can lag up to 15 min) or the call failed. Each case is
+  logged at start-up (`risk state: open <ticker> ... valued at ... (<source>: why)`, the
+  `window prints back-filled` line, `startup.info.day_pnl_rest.mark_source` /
+  `window_backfill`); a worst-case mark is corrected when the market settles during the
+  session, but a halt it caused stays, so a restart in that window is safe unless the start-up
+  log shows `worst_case` / `last_trade` for a large position near its strike;
 * the realized part is the lower of the persisted one and Kalshi's; the open positions are
   always valued afresh (a pessimistic mark persisted earlier is never locked in);
 * a price that does not exist falls back to the worst case (open long $0, short $1; long
-  held at midnight $1) and is logged: restarting in the minutes between a held market's close
-  and its determination can therefore count it pessimistically (it is corrected when the
-  market settles during the session, but a halt it caused stays): prefer restarting after the
-  determination;
+  held at midnight $1) and is logged;
 * settlement rows' `fee_cost` is not added (the spec calls it the total fees paid; the fills
   already counted them).
+
+During a session the same rules apply without a restart: the strategy re-marks its own
+positions in a closed market every cycle from the prints it received (`log.close_mark`:
+ticker, px, source, detail, the rounded value), and a position of an excluded event whose
+market was still open at start-up is re-marked at its close by the runner (`close_mark` log
+with `scope: excluded`; the strategy gets an updated `RiskStateSeed`). The WS `determined`
+message then replaces any mark with the payout. `dh_position_marks_total{scope, source}` counts
+the marks set (scope `startup` / `strategy` / `excluded`), `dh_marked_positions{scope, source}`
+shows how the positions are valued now; a `worst_case` there on a large position is the thing
+to look at (a missing print: check the BRTI feed; near the strike: wait for the result).
 
 After investigating a halt, override explicitly:
 ```sh

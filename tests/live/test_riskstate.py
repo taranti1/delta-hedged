@@ -152,14 +152,16 @@ def test_rows_outside_the_series_are_skipped_not_fatal():
 
 
 def test_mark_px_rules():
-    assert mark_px(market_row(TK, result="yes", status="determined"), 100) == (PX_SCALE, "payout (yes)")
+    assert mark_px(market_row(TK, result="yes", status="determined"), 100) == (PX_SCALE, "result_rest: payout (yes)")
     assert mark_px(market_row(TK, result="no", status="finalized"), -100)[0] == 0
     assert mark_px(market_row(TK, result="scalar", settlement_value="0.3700"), 100)[0] == 3700
-    assert mark_px(market_row(TK, bid="0.4100", ask="0.4300"), 100) == (4100, "YES bid")
-    assert mark_px(market_row(TK, bid="0.4100", ask="0.4300"), -100) == (4300, "YES ask")
-    assert mark_px(market_row(TK, bid="0.0000", status="closed", last="0.3900"), 100) == (3900, "last trade (closed)")
+    assert mark_px(market_row(TK, bid="0.4100", ask="0.4300"), 100) == (4100, "exchange_quote: YES bid")
+    assert mark_px(market_row(TK, bid="0.4100", ask="0.4300"), -100) == (4300, "exchange_quote: YES ask")
+    # closed without a result and no window evaluation: the last trade, NEVER the (stale) bid
+    p, why = mark_px(market_row(TK, bid="0.4100", status="closed", last="0.3900"), 100)
+    assert p == 3900 and why.startswith("last_trade:")
     p, why = mark_px(market_row(TK, bid="0.0000"), 100)  # active without a bid: no price
-    assert p is None and "no YES bid" in why
+    assert p is None and "no YES bid" in why and why.startswith("worst_case:")
     assert mark_px(market_row(TK, ask="1.0000"), -100)[0] is None
 
 

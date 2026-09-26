@@ -11,7 +11,8 @@ What a session leaves on disk (dh.live.runner / dh.live.app):
                             reconciliation updates, gate rejects), runner-derived events (lag /
                             reconciliation / clock FeedStatus, checked position snapshots,
                             back-filled fills, order-group updates, the updated RiskStateSeed
-                            after an excluded market settled or the watchdog's halt)
+                            after an excluded market settled or was re-marked at its close, or
+                            the watchdog's halt)
   events.paper              simulator messages (audit only: the replay regenerates them)
   meta                      session_start (configs, universe, paper simulator config, id
                             prefix, subaccount), fv_warmup (the exact benchmark points fed to
@@ -22,7 +23,9 @@ prefix), applies the recorded universe changes at their recorded times and the r
 inbound rules, and runs dh.backtest.runner.run over the recorded events (paper: with a
 simulator built from the recorded config, which regenerates the fills). events.live is merged
 LAST: a runner-derived event shares the timestamp of the item that caused it and was fed
-after it. Any difference in actions or Log records up to the last delivered ts is a bug.
+after it. Any difference in actions or Log records up to the last delivered ts is a bug; that
+includes the strategy's ``close_mark`` logs (positions in closed markets awaiting their result,
+marked from the recorded BRTI prints and lifecycle results: dh.settlement.closemark).
 """
 
 from __future__ import annotations
@@ -273,10 +276,25 @@ def session_specs(info: SessionInfo) -> list[MarketSpec]:
     return list(out.values())
 
 
+def log_fill_is_new(rec: dict[str, Any], seen: set[str]) -> bool:
+    """A ``log.fill`` record not booked yet: its trade id (logged since review L1) is new, or it
+    has none (older logs). Adds the id to ``seen``. The strategy logs each fill once; this also
+    guards the P&L tools against a fill logged twice (e.g. an orphan fill and its late attach
+    in logs written before the fix)."""
+    tid = str(rec.get("trade_id") or "")
+    if not tid:
+        return True
+    if tid in seen:
+        return False
+    seen.add(tid)
+    return True
+
+
 def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
     """P&L attribution (dh.backtest.ledger.Ledger) straight from a session's JSON log, without
     re-running the strategy: ``log.fill`` (our fills: paper = simulator, live = exchange),
-    ``log.fv`` (fair values for markouts) and ``log.settle`` (settlement prices).
+    ``log.fv`` (fair values for markouts) and ``log.settle`` (settlement prices). A ``log.fill``
+    whose trade id was already booked is skipped (``log_fill_is_new``; review L1).
 
         info = load_session("data/live")
         led = ledger_from_log("data/live_logs/<session>.jsonl", session_specs(info))
@@ -287,14 +305,18 @@ def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
     from dh.core.events import KalshiFill, Settlement
 
     led = Ledger({s.ticker: s.event_ticker for s in specs}, {s.ticker: s.expiration_ts for s in specs})
+    seen: set[str] = set()
     for line in Path(log_path).read_text().splitlines():
         r = json.loads(line)
         k, t = r.get("k", ""), int(r.get("t", 0))
         if k == "log.fv":
             led.on_log(t, Log("fv", {"ticker": r["ticker"], "F": r["F"], "delta": r.get("delta", 0.0)}))
         elif k == "log.fill":
-            led.on_event(KalshiFill(t, 0, r["ticker"], "", "", str(r.get("coid", "")), r["side"], int(r["px"]),
-                                    int(r["qty"]), bool(r.get("taker", False)), int(r.get("fee", 0)), 0, False))
+            if not log_fill_is_new(r, seen):
+                continue
+            led.on_event(KalshiFill(t, 0, r["ticker"], str(r.get("trade_id") or ""), "", str(r.get("coid", "")),
+                                    r["side"], int(r["px"]), int(r["qty"]), bool(r.get("taker", False)),
+                                    int(r.get("fee", 0)), 0, False))
         elif k == "log.settle":
             px = int(r["px"])
             led.on_event(Settlement(t, 0, r["ticker"], "yes" if px > 0 else "no", None, px))

@@ -68,6 +68,10 @@ class OrderEvent:
     """Typed notification returned by ``OrderManager.on_event`` (kind in EVENT_KINDS).
 
     qty: fill qty ('fill', 'orphan_fill'), canceled qty ('canceled'), requested qty ('rejected').
+    trade_id: the fill's trade id (else its fill id) for 'fill' / 'orphan_fill'.
+    A 'fill' with detail ORPHAN_ATTACHED is an orphan fill (already reported as 'orphan_fill',
+    already in position / cash / fees) now attached to its order: it updates the order's own
+    counters only and must not be booked again (review L1).
     """
 
     ts: int
@@ -84,6 +88,10 @@ class OrderEvent:
     is_taker: bool = False
     fee_micros: int = 0
     detail: str = ""
+    trade_id: str = ""
+
+
+ORPHAN_ATTACHED = "orphan_attached"
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,7 +364,8 @@ class OrderManager:
             key = f"oid:{f.order_id}" if f.order_id else f"coid:{f.client_order_id}"
             self._orphans.setdefault(key, []).append(f)
             out.append(OrderEvent(f.ts, "orphan_fill", f.client_order_id, t, f.order_id, None, f.book_side,
-                                  f.yes_px, f.qty, is_taker=f.is_taker, fee_micros=f.fee_micros))
+                                  f.yes_px, f.qty, is_taker=f.is_taker, fee_micros=f.fee_micros,
+                                  trade_id=f.trade_id or f.fill_id))
         else:
             out.extend(self._apply_fill(o, f))
         if f.has_post_position:
@@ -370,7 +379,10 @@ class OrderManager:
                                       detail=f"ours={self._pos[t]} exchange={f.post_position}"))
         return out
 
-    def _apply_fill(self, o: _Order, f: KalshiFill) -> list[OrderEvent]:
+    def _apply_fill(self, o: _Order, f: KalshiFill, *, attached: bool = False) -> list[OrderEvent]:
+        """Apply fill ``f`` to order ``o``'s counters (position / cash / fees were booked by
+        ``_on_fill``). ``attached``: an orphan fill joining its order late (a create ack after the
+        fill): its 'fill' event carries detail ORPHAN_ATTACHED."""
         out: list[OrderEvent] = []
         self._bind_oid(o, f.order_id, f.ts, out, attach=False)
         o.fill_sum += f.qty
@@ -384,7 +396,8 @@ class OrderManager:
         elif o.state is OrderState.REJECTED:  # the exchange is authoritative: it did reach the book
             o.state = self._working_state(o)
             out.append(self._ev("reconcile_needed", o, f.ts, detail="fill_on_rejected"))
-        out.append(self._ev("fill", o, f.ts, qty=f.qty, px=f.yes_px, is_taker=f.is_taker, fee=f.fee_micros))
+        out.append(self._ev("fill", o, f.ts, qty=f.qty, px=f.yes_px, is_taker=f.is_taker, fee=f.fee_micros,
+                            detail=ORPHAN_ATTACHED if attached else "", trade_id=f.trade_id or f.fill_id))
         if o.fill_sum > o.cap:  # more fills than the order could have: our view of cap is wrong
             o.cap = o.fill_sum
             out.append(self._ev("reconcile_needed", o, f.ts, detail="overfill"))
@@ -709,7 +722,7 @@ class OrderManager:
         for k in keys:
             fills = self._orphans.pop(k, None)
             for f in fills or ():
-                out.extend(self._apply_fill(o, f))
+                out.extend(self._apply_fill(o, f, attached=True))
 
     @staticmethod
     def _working_state(o: _Order) -> OrderState:
@@ -734,9 +747,9 @@ class OrderManager:
         return [OrderEvent(ts, "unknown_order", coid, ticker, oid, detail=detail)]
 
     def _ev(self, kind: str, o: _Order, ts: int, *, qty: int = 0, px: int | None = None, is_taker: bool = False,
-            fee: int = 0, detail: str = "") -> OrderEvent:
+            fee: int = 0, detail: str = "", trade_id: str = "") -> OrderEvent:
         return OrderEvent(ts, kind, o.coid, o.ticker, o.order_id, o.state, o.book_side, o.px if px is None else px,
-                          qty, o.filled, o.remaining, is_taker, fee, detail)
+                          qty, o.filled, o.remaining, is_taker, fee, detail, trade_id)
 
     def _snap(self, o: _Order) -> WorkingOrder:
         am = o.amend

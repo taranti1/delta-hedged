@@ -155,13 +155,16 @@ def cmd_replay(log: str, data: str, config: str, out: Any = print, extra_streams
 
 async def cmd_reconcile(log: str, lcfg: Any, rest: Any, out: Any = print) -> int:
     """Exchange fills vs the session log (count, contracts, fees per ticker)."""
+    from dh.live.replay import log_fill_is_new
+
     ours: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     t0 = None
+    seen: set[str] = set()
     for line in _resolve(log).read_text().splitlines():
         r = json.loads(line)
         if t0 is None and r.get("k") == "session_start":
             t0 = int(r["t"])
-        if r.get("k") == "log.fill":
+        if r.get("k") == "log.fill" and log_fill_is_new(r, seen):
             o = ours[r["ticker"]]
             o[0] += 1
             o[1] += int(r["qty"])

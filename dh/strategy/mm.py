@@ -62,11 +62,12 @@ from dh.core.events import (
 from dh.core.market import MarketSpec
 from dh.core.strategy import IdGen
 from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
-from dh.execution.order_manager import OrderManager
+from dh.execution.order_manager import ORPHAN_ATTACHED, OrderManager
 from dh.execution.queue import QueueEstimator
 from dh.models.fairvalue import digital
 from dh.models.fvmodel import FairValueModel, load_recommended_config
 from dh.models.tails import GAUSS, make_tail
+from dh.settlement.closemark import CloseMark, WindowOutcome, close_mark, evaluate_window
 from dh.settlement.window import SettlementTracker
 from dh.strategy.config import StrategyConfig
 from dh.strategy.fill_model import AdverseSelectionModel, FillIntensityModel, SegmentFlow
@@ -170,6 +171,12 @@ class MarketMaker:
         self.log_fv_every_ns = log_fv_every_ns
         self.last_place: dict[tuple[str, str], int] = {}
         self.settled: dict[str, int] = {}  # ticker -> settlement px
+        # positions held between a market's close and its result (dh.settlement.closemark):
+        # valued at the payout our own BRTI prints of the window imply (else worst case / last
+        # trade), never at the pre-close fair value; refreshed every cycle, logged on change
+        self.close_marks: dict[str, CloseMark] = {}
+        self._close_outcomes: dict[str, WindowOutcome] = {}  # final window evaluations
+        self.last_trade_px: dict[str, int] = {}  # ticker -> last public trade (YES px)
         self.settled_cash = 0.0
         self.event_pnl: dict[str, float] = {}
         self.last_cycle_ns = 0
@@ -212,6 +219,9 @@ class MarketMaker:
                 if t in self.settled and s.expiration_ts < before_ns and not self.om.working(t)]
         for t in drop:
             self.specs.pop(t, None)
+            self.close_marks.pop(t, None)
+            self._close_outcomes.pop(t, None)
+            self.last_trade_px.pop(t, None)
             self.books.pop(t, None)
             self.fv_hist.pop(t, None)
             self.fvc.pop(t, None)
@@ -292,6 +302,7 @@ class MarketMaker:
         elif isinstance(ev, KalshiTrade):
             if ev.ticker in self.books:
                 self.queue.on_trade(ev)
+                self.last_trade_px[ev.ticker] = int(ev.yes_px)
         elif isinstance(ev, IndexTick):
             out += self._on_index(ev)
         elif isinstance(ev, (ExtBBO, ExtBookSnapshot, ExtBookDelta)):
@@ -391,13 +402,15 @@ class MarketMaker:
                     if pending:
                         self._queue_pending_since[oe.client_order_id] = oe.ts
             elif k in ("fill", "orphan_fill"):
-                self.stats.fills += 1
                 if oe.client_order_id in self.queue.orders:
                     self.queue.on_own_fill(oe.client_order_id, oe.qty)
+                if oe.detail == ORPHAN_ATTACHED:
+                    continue  # logged and counted once, as the orphan_fill (review L1)
+                self.stats.fills += 1
                 fv = self.fvc.get(oe.ticker)
                 out.append(Log("fill", {"ticker": oe.ticker, "coid": oe.client_order_id, "side": oe.book_side,
                                         "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
-                                        "F": None if fv is None else round(fv.F, 6)}))
+                                        "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id}))
             elif k in ("filled", "canceled", "rejected"):
                 self._queue_pending_since.pop(oe.client_order_id, None)
                 self._own_delta_seen.pop(oe.client_order_id, None)
@@ -458,6 +471,8 @@ class MarketMaker:
         if t not in self.specs or t in self.settled:
             return []
         self.settled[t] = px
+        self.close_marks.pop(t, None)
+        self._close_outcomes.pop(t, None)
         q = self._contracts(t)
         pnl = self.om.settled_pnl_micros(t, px) / 1e6
         self.settled_cash += q * px / PX_SCALE
@@ -629,7 +644,9 @@ class MarketMaker:
         self.stats.cycles += 1
         health = self.risk.health(now)
         # loss limits first and every cycle, healthy or not: a cycle that halts sends no new
-        # orders (audit live m5), and losses are checked while quoting is paused too
+        # orders (audit live m5), and losses are checked while quoting is paused too; positions
+        # in closed markets awaiting their result are re-marked first
+        out += self._update_close_marks(now)
         for a in self.risk.on_equity(now, self.equity(self._spot())):
             out += self._apply_risk_action(now, a)
         if self.halted_all or not health.quoting_allowed or not self.fv.ready:
@@ -883,15 +900,48 @@ class MarketMaker:
                            post_only=not dec.urgent, reason=f"D={D:.4f} band={dec.band_btc:.4f}"),
                 Log("hedge", {"D": D, "band": dec.band_btc, "trade": dec.target_btc, "urgent": dec.urgent})]
 
+    def _update_close_marks(self, now: int) -> list[Action]:
+        """Re-mark every position in a market past its ``close_ts`` without a result yet
+        (dh.settlement.closemark): the exact payout from our BRTI prints of the window, the
+        worst case when a print is missing or the value is within $0.01 of a strike, the last
+        trade (then the worst case) when the window cannot be evaluated. A window evaluation is
+        kept once final (the tracker prunes old prints). Logs ``close_mark`` on every change."""
+        out: list[Action] = []
+        for t, spec in self.specs.items():
+            if t in self.settled or now < spec.close_ts:
+                continue
+            q = self._contracts(t)
+            if not q:
+                self.close_marks.pop(t, None)
+                continue
+            oc = self._close_outcomes.get(t)
+            if oc is None:
+                oc = evaluate_window(spec, self.tracker)
+                if oc.final:
+                    self._close_outcomes[t] = oc
+            cm = close_mark(q, oc, last_trade_px=self.last_trade_px.get(t))
+            prev = self.close_marks.get(t)
+            if prev is None or (prev.px, prev.source) != (cm.px, cm.source):
+                self.close_marks[t] = cm
+                out.append(Log("close_mark", {"ticker": t, "position": q, **cm.as_log(),
+                                              "prev_px": None if prev is None else prev.px}))
+        return out
+
     # ================================================================== reporting
     def equity(self, S: float | None = None) -> float:
-        """Cash P&L since start + mark-to-fair of open Kalshi positions + hedge mark."""
+        """Cash P&L since start + mark-to-fair of open Kalshi positions + hedge mark. A
+        position in a closed market awaiting its result is valued at its close mark
+        (``close_marks``), never at the pre-close fair value."""
         eq = self.om.cash_micros() / 1e6 - self.om.fees_micros() / 1e6 + self.settled_cash
         for t in self.specs:
             if t in self.settled:
                 continue
             qn = self._contracts(t)
             if qn:
+                cm = self.close_marks.get(t)
+                if cm is not None:
+                    eq += qn * cm.px / PX_SCALE
+                    continue
                 f = self.fvc.get(t)
                 eq += qn * (f.F if f is not None else 0.5)
         if S is not None:
