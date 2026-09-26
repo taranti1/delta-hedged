@@ -40,8 +40,10 @@ async def test_restart_after_a_loss_halts_at_the_daily_limit_in_total(tmp_path):
     now = __import__("time").time_ns()
     day0 = now - now % DAY_NS
     _store(lcfg).save(RiskState(day0, -24.99, False, "", 0, "live-earlier", "live", now - 60 * NS_PER_S))
-    rest.fills = [fill_row("f-1", "o-1", tickers[0], side="bid", px="0.6000", count="10.00", created_ns=now - 3600 * NS_PER_S),
-                  fill_row("f-2", "o-2", tickers[0], side="ask", px="0.5000", count="10.00", created_ns=now - 1800 * NS_PER_S)]
+    # both fills inside TODAY's UTC day, whatever the time of day the test runs
+    rest.fills = [fill_row("f-1", "o-1", tickers[0], side="bid", px="0.6000", count="10.00", created_ns=day0 + (now - day0) // 3),
+                  fill_row("f-2", "o-2", tickers[0], side="ask", px="0.5000", count="10.00",
+                           created_ns=day0 + 2 * (now - day0) // 3)]
     app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
     runner = await app.build()
     assert rest.of("iter_fills")[0][1] == {"min_ts": day0 // NS_PER_S, "subaccount": 0}

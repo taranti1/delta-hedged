@@ -90,34 +90,60 @@ def required_balance_usd(risk: Any, margin_usd: float) -> float:
     return worst + max(0.0, float(margin_usd))
 
 
+PROBE_SUBACCOUNT = 0  # a subaccount a key restricted to ours must NOT be able to read (the primary)
+
+
 async def verify_key_restriction(rest: Any, key_id: str, subaccount: int,
                                  balance_bodies: Iterable[Any] = ()) -> tuple[bool, str]:
     """Is the runner's API key restricted to ``subaccount`` (``venue.key_restricted_to_subaccount``
     makes a private WS message without a subaccount field count as ours, so it must be true)?
 
-    1. GET /api_keys: our key's ``subaccount`` (null = unrestricted) must equal ``subaccount``;
-    2. if the key is not listed or the call fails: GET /portfolio/balance's ``balance_breakdown``
-       is "omitted only when using a subaccount-restricted API key" (openapi 3.31.0), so every
-       balance read of the start-up must lack it.
-    Returns (ok, evidence); key ids are never logged."""
-    note = ""
+    POSITIVE proof (review M1): a read-only probe the restricted key must be REFUSED,
+    ``GET /portfolio/balance?subaccount=0`` (another subaccount's balance; Kalshi: naming any
+    other subaccount is rejected for a restricted key), must answer HTTP 401 or 403. A 2xx
+    (the key can read subaccount 0: unrestricted) refuses the start; any other failure
+    (5xx, 429, network) proves nothing and refuses too (retry the start later).
+    Secondary evidence, never a substitute: GET /api_keys, when it lists the key, must show it
+    restricted to ``subaccount`` (a listed unrestricted key or another subaccount refuses);
+    GET /api_keys failing is expected for a restricted key and only noted. The balance bodies'
+    ``balance_breakdown`` is noted, never trusted. Returns (ok, evidence); key ids are never logged."""
+    from dh.kalshi.rest import KalshiHTTPError
+
+    if int(subaccount) == PROBE_SUBACCOUNT:
+        return False, "a key restricted to subaccount 0 cannot be proven with the subaccount-0 probe"
+    notes: list[str] = []
     try:
         body = await rest.get_api_keys()
+        listed = False
         for k in (body or {}).get("api_keys") or []:
             if isinstance(k, dict) and key_id and str(k.get("api_key_id")) == key_id:
+                listed = True
                 s = k.get("subaccount")
                 if s is None:
                     return False, "GET /api_keys: the runner key is NOT restricted to a subaccount"
                 if int(s) != int(subaccount):
                     return False, f"GET /api_keys: the runner key is restricted to subaccount {s}, not {subaccount}"
-                return True, f"GET /api_keys: the runner key is restricted to subaccount {s}"
-        note = "GET /api_keys does not list the runner key"
-    except Exception as exc:  # noqa: BLE001 - a restricted key may not list keys: use the balance evidence
-        note = f"GET /api_keys failed ({type(exc).__name__})"
+                notes.append(f"GET /api_keys: restricted to subaccount {s}")
+        if not listed:
+            notes.append("GET /api_keys does not list the runner key")
+    except Exception as exc:  # noqa: BLE001 - expected for a restricted key: secondary evidence only
+        notes.append(f"GET /api_keys failed ({type(exc).__name__}{': HTTP ' + str(exc.status) if isinstance(exc, KalshiHTTPError) else ''})")
     bodies = [b for b in balance_bodies if isinstance(b, dict)]
-    if bodies and all("balance_breakdown" not in b for b in bodies):
-        return True, f"{note}; GET /portfolio/balance omits balance_breakdown (a subaccount-restricted key)"
-    return False, f"{note}; GET /portfolio/balance carries balance_breakdown (an unrestricted key?)"
+    if bodies:
+        notes.append("balance_breakdown " + ("absent" if all("balance_breakdown" not in b for b in bodies) else "PRESENT"))
+    try:
+        await rest.get_balance(subaccount=PROBE_SUBACCOUNT)
+    except KalshiHTTPError as exc:
+        if exc.status in (401, 403):
+            return True, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} refused with HTTP {exc.status} (the key "
+                          f"cannot read another subaccount); " + "; ".join(notes))
+        return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} failed with HTTP {exc.status}, not 401/403: "
+                       f"no proof the key is restricted (retry the start); " + "; ".join(notes))
+    except Exception as exc:  # noqa: BLE001 - network / transport: no proof
+        return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} failed ({type(exc).__name__}): no proof the "
+                       f"key is restricted (retry the start); " + "; ".join(notes))
+    return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} ANSWERED with the runner key: it is NOT "
+                   f"restricted to subaccount {subaccount}; " + "; ".join(notes))
 
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -125,13 +151,16 @@ SCHEDULE_TZ = "America/New_York"  # Schedule.standard_hours: "All times are expr
 
 
 def _hhmm(v: Any, *, close: bool = False) -> int | None:
-    """'HH:MM' (ET) -> minutes after midnight; a closing time of 23:59 / 24:00 = end of day."""
+    """'HH:MM' (ET) -> minutes after midnight; a CLOSING time of 00:00, 23:59 or 24:00 = the end
+    of the day (midnight of the next day): a session "05:00-00:00" runs to midnight, and one
+    written "00:00-00:00" is the whole day (review L3: a 00:00 close was dropped, leaving a
+    bogus closure)."""
     try:
         h, m = str(v).strip().split(":")[:2]
         mins = int(h) * 60 + int(m)
     except (TypeError, ValueError):
         return None
-    if close and mins >= 23 * 60 + 59:
+    if close and (mins == 0 or mins >= 23 * 60 + 59):
         return 24 * 60
     return mins if 0 <= mins <= 24 * 60 else None
 
@@ -147,17 +176,18 @@ def _merge(iv: list[tuple[int, int]], gap_ns: int = 0) -> list[tuple[int, int]]:
 
 
 def schedule_closures(body: Any, start_ns: int, end_ns: int, *, min_gap_s: float = 120.0,
-                      tz_name: str = SCHEDULE_TZ) -> tuple[list[tuple[int, int, str]], list[str]]:
+                      tz_name: str = SCHEDULE_TZ, now_ns: int | None = None) -> tuple[list[tuple[int, int, str]], list[str]]:
     """GET /exchange/schedule -> the intervals in [start_ns, end_ns) when trading is scheduled to
     be unavailable: (start ns, end ns, why), merged and sorted, plus notes.
 
     * ``maintenance_windows`` (start_datetime / end_datetime) are taken as given;
     * ``standard_hours``: each WeeklySchedule, within its own [start_time, end_time), lists the
       ET trading sessions per weekday; the time between sessions (sessions closer than
-      ``min_gap_s`` are joined, so a 23:59 close / 00:00 open is continuous) is a closure. This
-      is how the weekly Thursday 03:00-05:00 ET trading pause is expected to appear.
-    A standard-hours reading that would close more than half of the next day is implausible for
-    24/7 crypto markets: it is ignored (noted); the live status poll stays authoritative."""
+      ``min_gap_s`` are joined, so a 23:59 / 00:00 close and a 00:00 open are continuous) is a
+      closure. This is how the weekly Thursday 03:00-05:00 ET trading pause is expected to appear.
+    A standard-hours reading that would close more than half of the NEXT day (from ``now_ns``,
+    default ``start_ns``) is implausible for 24/7 crypto markets: it is ignored (noted); the
+    live status poll stays authoritative."""
     import datetime as dt
 
     from dh.kalshi.wire import opt_iso_to_ns
@@ -223,7 +253,8 @@ def schedule_closures(body: Any, start_ns: int, end_ns: int, *, min_gap_s: float
                     break
             if cur < hi:
                 std.append((cur, hi))
-        day = [(max(a, start_ns), min(b, start_ns + 86_400 * 10**9)) for a, b in std]
+        t0 = start_ns if now_ns is None else int(now_ns)
+        day = [(max(a, t0), min(b, t0 + 86_400 * 10**9)) for a, b in std]
         closed = sum(max(0, b - a) for a, b in day)
         if closed > 43_200 * 10**9:
             notes.append(f"standard_hours ignored: would close {closed / 3.6e12:.1f} h of the next 24 h")

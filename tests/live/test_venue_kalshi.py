@@ -38,6 +38,7 @@ def make(rest: FakeRest | None = None, **cfg) -> tuple[KalshiVenue, FakeRest, li
     rest = rest or FakeRest()
     clock = FakeClock()
     out: list = []
+    cfg = {"subaccount": 0, "shared_account": False, "allow_primary_account": True, **cfg}  # explicit primary (not shared)
     v = KalshiVenue(rest, sink=out.append, cfg=VenueCfg(**cfg), clock_ns=clock, monotonic=clock.mono, sleep=_nosleep)
     v.shard_of.update({TK: 2, TK2: 2})  # every KXBTC* market is on exchange shard 2
     return v, rest, out, clock

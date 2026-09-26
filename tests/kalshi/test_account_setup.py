@@ -42,6 +42,7 @@ A = _load_script()
 
 APPLY = object()  # write result: apply the effect and answer like Kalshi
 APPLY_THEN_LOSE = object()  # apply the effect, then the response is lost (timeout)
+APPLY_LATER = object()  # applied at Kalshi, response lost, the balances show it only after FakeRest.settle()
 
 
 class FakeRest:
@@ -64,9 +65,27 @@ class FakeRest:
         self.writes: list[tuple[str, str, Any, list]] = []
         self.on_write = None
         self.next_sub = 1 + max([s for s, _ in self.balances] + [0])
+        self.sub_transfers: list[dict[str, Any]] = []  # GET /portfolio/subaccounts/transfers rows (applied ones)
+        self.now_s: Any = lambda: 0  # the harness sets its clock (created_ts of listed transfers)
+        self.later: list[tuple[str, str, Any]] = []  # APPLY_LATER effects, applied by settle()
+        self.fail_gets: dict[str, int] = {}  # path -> number of GETs that raise (network down)
+        self.intra_amount = Decimal("150")  # the last intra-account transfer's amount in dollars
+
+    def settle(self) -> None:
+        """Apply the transfers answered with APPLY_LATER (Kalshi applied them, the balances show it only now)."""
+        for method, path, body in self.later:
+            self._apply(method, path, body)
+        self.later.clear()
 
     async def get(self, path: str, params=(), *, stream: str = "") -> dict[str, Any]:
         self.gets.append((path, list(params)))
+        if self.fail_gets.get(path, 0) > 0:
+            self.fail_gets[path] -= 1
+            from dh.kalshi.rest import TransportError
+
+            raise TransportError("network down")
+        if path == "/portfolio/subaccounts/transfers":
+            return {"transfers": list(reversed(self.sub_transfers))}
         if path == "/account/limits":
             return {"usage_tier": self.tier, "read": {"refill_rate": 200, "bucket_capacity": 600},
                     "write": {"refill_rate": 100, "bucket_capacity": 100}, "grants": []}
@@ -88,7 +107,8 @@ class FakeRest:
             status = self.intra_statuses.pop(0) if len(self.intra_statuses) > 1 else self.intra_statuses[0]
             return {"transfer": {"transfer_id": path.rsplit("/", 1)[1], "source": "event_contract",
                                  "destination": "event_contract", "source_exchange_shard": 0,
-                                 "destination_exchange_shard": 2, "amount": "150.0000", "status": status, "created_ts": 1}}
+                                 "destination_exchange_shard": 2, "amount": f"{self.intra_amount:.4f}", "status": status,
+                                 "created_ts": 1}}
         raise AssertionError(f"unexpected GET {path}")
 
     async def write(self, method: str, path: str, *, json_body: Any = None, params=(), stream: str = "", n_items: int = 1):
@@ -98,6 +118,9 @@ class FakeRest:
         r = self.results.pop(0) if self.results else APPLY
         if isinstance(r, Exception):
             raise r
+        if r is APPLY_LATER:  # applied at Kalshi, the response is lost AND the balances lag behind
+            self.later.append((method, path, json_body))
+            return UnknownOutcome(method, path, json_body, "ResponseLostError: timeout")
         if r is APPLY or r is APPLY_THEN_LOSE:
             res = self._apply(method, path, json_body)
             return UnknownOutcome(method, path, json_body, "ResponseLostError: timeout") if r is APPLY_THEN_LOSE else res
@@ -111,9 +134,13 @@ class FakeRest:
         if path == "/portfolio/subaccounts/transfer":
             x = body.get("exchange_index", 0)
             self._move((body["from_subaccount"], x), (body["to_subaccount"], x), Decimal(body["amount_cents"]) / 100)
+            self.sub_transfers.append({"transfer_id": f"st-{len(self.sub_transfers) + 1}", "from_subaccount": body["from_subaccount"],
+                                       "to_subaccount": body["to_subaccount"], "amount_cents": body["amount_cents"],
+                                       "exchange_index": x, "created_ts": int(self.now_s())})
             return {}
         if path == "/portfolio/intra_exchange_instance_transfer":
             amt = Decimal(body["amount"]) / 10_000
+            self.intra_amount = amt  # listed (FixedPointDollars) by GET .../intra_exchange_instance_transfers/{id}
             dst = (0, body["destination_exchange_shard"]) if self.partial else (body["destination_subaccount"], body["destination_exchange_shard"])
             self._move((body["source_subaccount"], body["source_exchange_shard"]), dst, amt)
             return {"transfer_id": "tr-0001"}
@@ -148,6 +175,7 @@ class Harness:
         self.log = tmp_path / "logs" / "account_setup.jsonl"
         self.state = tmp_path / "logs" / "account_setup_state.json"
         self.system2 = tmp_path / "system2"
+        rest.now_s = lambda: int(self.t.timestamp())
 
     def now(self) -> datetime:
         self.t += timedelta(seconds=1)
@@ -192,7 +220,7 @@ WRITE_CASES = {
     "create-subaccount": (["create-subaccount", "--exchange-index", "2"], "CREATE 2", {"balances": {(0, 0): "400"}}),
     "transfer": (["transfer", "--from", "0", "--to", "1", "--amount-dollars", "150", "--exchange-index", "0"], "150", {}),
     "shard-transfer": (["shard-transfer", "--from-subaccount", "0", "--from-shard", "0", "--to-subaccount", "1",
-                        "--to-shard", "2", "--amount-dollars", "150"], "150.00", {}),
+                        "--to-shard", "2", "--probe-dollars", "1"], "1.00", {}),  # the mandatory first (probe) step
     "set-netting": (["set-netting", "--subaccount", "1", "--off"], "netting off 1", {}),
 }
 
@@ -262,28 +290,30 @@ async def test_client_transfer_id_persisted_before_send_and_reused_on_retry(tmp_
         assert body["client_transfer_id"] in json.loads(h.state.read_text())["pending"]
 
     rest.on_write = on_write
-    rest.results = [APPLY_THEN_LOSE]  # applied at Kalshi, response lost
+    # the first attempt got a 5xx before Kalshi processed it: unknown outcome, nothing moved
+    rest.results = [UnknownOutcome("POST", "/portfolio/subaccounts/transfer", None, "HTTP 502", 502)]
     assert await h(*TRANSFER, answer="150") == 1
     cid = seen[0]
     uuid.UUID(cid)
     pend = h.state_data()["pending"]
     assert list(pend) == [cid] and pend[cid]["attempts"] == 1
-    assert "UNRESOLVED" in h.text
+    assert pend[cid]["first_rows"] and pend[cid]["first_pre"]  # the bracket of the FIRST attempt is saved
+    assert "STAYS saved" in h.text and "declare-transfer" not in h.text
 
     # a different transfer is refused while this one is unresolved
     assert await h("transfer", "--from", "0", "--to", "1", "--amount-dollars", "10", "--exchange-index", "0", "--execute",
                    answer="10") == 2
     assert len(rest.writes) == 1
 
-    # the retry sends the SAME id; Kalshi answers 409 (duplicate) = applied by the first attempt
-    rest.results = [UnknownOutcome("POST", "/portfolio/subaccounts/transfer", None, "HTTP 409", 409, {"error": {"code": "conflict"}})]
+    # the retry sends the SAME id and is applied now (200)
     h.lines.clear()
     assert await h(*TRANSFER, answer="150") == 0
     assert seen == [cid, cid]
     assert rest.balances[(1, 0)] == Decimal("150")  # moved once
     data = h.state_data()
     assert data["pending"] == {} and data["completed"][0]["id"] == cid
-    assert data["completed"][0]["result"] == "applied_earlier_409"
+    assert data["completed"][0]["result"] == "applied_after_retry:ok"
+    assert data["completed"][0]["declaration"]["after"] == pend[cid]["first_pre"]["at"]  # bracket from the FIRST attempt
     assert "RETRY of the unresolved transfer" in h.text and "declare-transfer" in h.text
 
 
@@ -413,30 +443,42 @@ SHARD = ("shard-transfer", "--from-subaccount", "0", "--from-shard", "0", "--to-
          "--amount-dollars", "150", "--execute")
 
 
+def seed_probe(h: Harness, route: str = "0:0->1:2") -> None:
+    """A completed, exact probe transfer on ``route`` (the precondition of a full shard-transfer)."""
+    h.state.parent.mkdir(parents=True, exist_ok=True)
+    data = h.state_data() if h.state.exists() else {"version": 1, "pending": {}, "completed": []}
+    data["completed"].append({"kind": "shard_transfer", "id": "shard-probe", "probe": True, "route": route,
+                              "result": "complete", "params": {"amount_dollars": "1.00"}})
+    h.state.write_text(json.dumps(data))
+
+
 async def test_shard_transfer_polls_until_complete(tmp_path: Path):
     rest = FakeRest(intra_statuses=["pending", "pending", "complete"])
     h = Harness(tmp_path, rest)
+    seed_probe(h)
     assert await h(*SHARD, answer="150") == 0
     polls = [p for p, _ in rest.gets if p == "/portfolio/intra_exchange_instance_transfers/tr-0001"]
     assert len(polls) == 3
     assert rest.balances[(1, 2)] == Decimal("150")
     assert "Complete: subaccount 1 on shard 2 received $150.00" in h.text
-    assert h.state_data()["completed"][0]["declaration"]["amount"] == "-150.00"
+    assert h.state_data()["completed"][-1]["declaration"]["amount"] == "-150.00"
 
 
 async def test_shard_transfer_partial_failure_is_reported(tmp_path: Path):
     rest = FakeRest(partial=True)  # money stops in the primary account on shard 2
     h = Harness(tmp_path, rest)
+    seed_probe(h)
     assert await h(*SHARD, answer="150") == 1
     assert "PARTIAL" in h.text and "non-atomic" in h.text
     assert "transfer --from 0 --to 1 --amount-dollars 150.00 --exchange-index 2 --execute" in h.text
-    decl = h.state_data()["completed"][0]["declaration"]
+    decl = h.state_data()["completed"][-1]["declaration"]
     assert decl["required"] is False  # the primary aggregate did not change: nothing to declare yet
 
 
 async def test_shard_transfer_timeout_stays_pending_and_resumes(tmp_path: Path):
     rest = FakeRest(intra_statuses=["pending"])
     h = Harness(tmp_path, rest)
+    seed_probe(h)
     assert await h(*SHARD, "--timeout-s", "4", "--poll-s", "2", answer="150") == 1
     pend = h.state_data()["pending"]
     assert len(pend) == 1 and next(iter(pend.values()))["transfer_id"] == "tr-0001"
@@ -452,6 +494,7 @@ async def test_shard_transfer_unknown_outcome_blocks_until_forgotten(tmp_path: P
     rest = FakeRest()
     rest.results = [UnknownOutcome("POST", "/portfolio/intra_exchange_instance_transfer", None, "ResponseLostError: timeout")]
     h = Harness(tmp_path, rest)
+    seed_probe(h)
     assert await h(*SHARD, answer="150") == 1
     (local,) = h.state_data()["pending"]
     assert await h(*TRANSFER, answer="150") == 2  # every transfer refused meanwhile
@@ -587,7 +630,7 @@ async def test_request_bodies_and_paths_match_openapi(tmp_path: Path, rsa_pem_te
                          ("PUT", "/portfolio/subaccounts/netting"), ("POST", "/api_keys/generate")}
     # units: cents for subaccount transfers, centicents for intra-account transfers
     assert sent[("POST", "/portfolio/subaccounts/transfer")]["amount_cents"] == 15_000
-    assert sent[("POST", "/portfolio/intra_exchange_instance_transfer")]["amount"] == 1_500_000
+    assert sent[("POST", "/portfolio/intra_exchange_instance_transfer")]["amount"] == 10_000  # the $1 probe
     assert sent[("POST", "/portfolio/subaccounts")] == {"exchange_index": 2}
     assert sent[("PUT", "/portfolio/subaccounts/netting")] == {"subaccount_number": 1, "enabled": False}
 

@@ -132,11 +132,14 @@ def _script():
 async def test_watchdog_script_with_injected_rest(tmp_path, flag):
     mod = _script()
     rest = FakeRest()
-    write_heartbeat(tmp_path / "hb.json", {"mode": "live", "state": "running"}, now_ns=1)  # ancient
+    write_heartbeat(tmp_path / "hb.json", {"mode": "live", "state": "running", "subaccount": 1}, now_ns=1)  # ancient
     args = argparse.Namespace(live_config=str(REPO / "config" / "live.example.yaml"), heartbeat=str(tmp_path / "hb.json"),
                               once=flag == "once", cancel_now=flag == "cancel_now", arm_on_start=True, max_age_s=0.0)
     assert await mod.amain(args, rest=rest) == 0
-    assert rest.names() == ["cancel_all_orders"]
+    # the example config is the SHARED-account deployment: the watchdog lists subaccount 1's resting
+    # orders and cancels them by id (none rest here); the bulk cancel-all is never sent
+    assert rest.names() == ["iter_orders"]
+    assert rest.of("iter_orders")[0][1] == {"status": "resting", "subaccount": 1}
 
 
 # ============================================================================ live review fixes (M7, m12)

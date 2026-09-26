@@ -139,6 +139,9 @@ class FakeRest:
         self.balances: dict[int, str] = {}  # exchange shard -> balance_dollars ('' / missing: $1000.00)
         self.user_data_ts: str | None = None  # GET /exchange/user_data_timestamp as_of_time (None: 404)
         self.api_keys: list[dict[str, Any]] = []  # GET /api_keys rows
+        # the signing key's restriction: None = unrestricted (reads any subaccount); N = a key
+        # restricted to subaccount N (a portfolio read naming another subaccount answers 403)
+        self.key_subaccount: int | None = None
         self._n = 0
         self.gate: asyncio.Event | None = None  # when set, writes wait on it (in-flight tests)
 
@@ -368,6 +371,10 @@ class FakeRest:
 
     async def get_balance(self, **kw: Any) -> Any:
         def ok() -> Any:
+            if self.key_subaccount is not None and kw.get("subaccount") is not None \
+                    and int(kw["subaccount"]) != self.key_subaccount:
+                raise http_error(403, "forbidden", "API key is restricted to a single sub-account", "GET",
+                                 "/portfolio/balance")
             usd = self.balances.get(int(kw.get("exchange_index") or 0)) or "1000.00"
             return {"balance": int(round(float(usd) * 100)), "balance_dollars": usd, "portfolio_value": 0,
                     "updated_ts": 1790300000}

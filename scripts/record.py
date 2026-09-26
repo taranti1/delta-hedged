@@ -67,6 +67,21 @@ from dh.store.recorder import EXIT_LOW_DISK, ClockSampler, DiskGuard, Recorder  
 
 log = logging.getLogger("record")
 
+# Kalshi REST budgets are per ACCOUNT, shared with the other live system and with every System 1
+# process (live runner 0.2, paper runner, watchdog, tools): the recorder takes 0.1 by default
+# (config/feeds.yaml kalshi.account_share; measured use ~1.2 tokens/s of the read budget). Keep the
+# sum over all System 1 processes <= 0.5 (docs/RUNBOOK.md 1.3).
+RECORDER_ACCOUNT_SHARE = 0.1
+
+
+def recorder_account_share(kcfg: dict[str, Any]) -> float:
+    """The recorder's share of the account's REST budget: feeds.yaml kalshi.account_share, else 0.1."""
+    v = (kcfg or {}).get("account_share")
+    share = RECORDER_ACCOUNT_SHARE if v in (None, "") else float(v)
+    if not 0.0 < share <= 1.0:
+        raise ValueError(f"kalshi.account_share must be in (0, 1], got {share}")
+    return share
+
 
 # ============================================================================ monitoring
 class Monitor:
@@ -205,12 +220,12 @@ class KalshiSource:
         self.series = self.series or list(kc.series)
         signer = kc.signer()
         # read_only: the recorder never writes (any non-GET raises before it is signed or sent)
-        self.rest = KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write, read_only=True,
-                               **kc.rest_kwargs())
+        self.rest = KalshiRest(kc.rest_url, signer, kc.limiter(account_share=recorder_account_share(self.kcfg)),
+                               on_raw=self.recorder.write, read_only=True, **kc.rest_kwargs())
         tasks: list[asyncio.Task[Any]] = []
         try:
             if signer is not None:
-                try:  # the account's real limits, scaled by rate_limits.account_share
+                try:  # the account's real limits, scaled by kalshi.account_share (recorder default 0.1)
                     await self.rest.configure_rate_limits()
                 except Exception as exc:  # noqa: BLE001 - keep the (scaled) defaults
                     log.warning("kalshi: account limits unavailable (%s): using configured defaults", exc)

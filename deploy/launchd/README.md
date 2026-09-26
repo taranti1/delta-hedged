@@ -60,14 +60,28 @@ Interactive`: never throttled) and logs to `data/logs/watchdog.launchd.out`. It 
 whenever a live runner may run (docs/RUNBOOK.md 5.2 step 2 and section 6).
 
 Before installing:
-* `config/live.yaml` exists with `venue.subaccount: 1`, `venue.shared_account: true` (the
-  watchdog then refuses to act for subaccount 0: exit 2, launchd retries every 10 s, fix the
-  config) and the macOS runtime paths (`paths.kill_file` / `paths.heartbeat_file` empty =
-  `data/run/KILL` / `data/run/heartbeat.json`).
+* `config/live.yaml` exists (the watchdog never falls back to the example config) and states
+  `venue.subaccount: 1`, `venue.shared_account: true`, `venue.key_restricted_to_subaccount:
+  true` explicitly, with the macOS runtime paths (`paths.kill_file` / `paths.heartbeat_file`
+  empty = `data/run/KILL` / `data/run/heartbeat.json`). A missing file, a venue section that
+  does not state the subaccount and the shared flag, or subaccount 0 is refused (exit 2;
+  launchd retries every 10 s: fix the config).
 * The watchdog key (restricted to subaccount 1, RUNBOOK 1.2) is in System 1's own env file:
   `KALSHI_WATCHDOG_KEY_ID=...` and `KALSHI_WATCHDOG_PRIVATE_KEY_PATH=...` in the file named by
   `config/kalshi.yaml` `auth.env_file` (a launchd agent does not inherit the shell environment;
-  never System 2's `.secrets/prod.env`).
+  never System 2's `.secrets/prod.env`). On the shared account the watchdog REFUSES to run
+  without them (exit 2) unless `watchdog.allow_runner_key: true` (a deliberate choice to sign
+  with the runner's key).
+
+**Liveness beat.** While it runs, the watchdog writes `data/run/heartbeat.json.watchdog` every
+`watchdog.beat_interval_s` (1 s): `{"t", "pid", "subaccount", "state", "armed": [runner pid,
+session], "last_poll_ns", ...}` and `"state": "EXITED"` when it stops. The live runner refuses to
+start unless that beat is fresh (`watchdog.runner_max_age_s`, 10 s) and names its subaccount, and
+while it trades it blocks new orders (gate `watchdog`, quotes pulled) when the beat goes stale,
+names another subaccount, or (after 10 s of running) is not armed on this runner. So a watchdog
+crash-looping under launchd (TCC, credentials, config refusal) is seen: the runner stops
+quoting instead of trading without its dead-man switch. Check it with
+`cat data/run/heartbeat.json.watchdog` (`t` in ns, `state` ARMED while a live runner runs).
 
 ```sh
 cd /Users/thomast/Desktop/delta-hedged
@@ -76,7 +90,8 @@ cp deploy/launchd/com.dh.watchdog.plist ~/Library/LaunchAgents/
 plutil -lint ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl print gui/$(id -u)/com.dh.watchdog | grep -E 'state|pid|last exit'
-tail -f data/logs/watchdog.launchd.out     # "watching .../data/run/heartbeat.json (... subaccount 1)"
+tail -f data/logs/watchdog.launchd.out     # "watching .../data/run/heartbeat.json (... subaccount 1; cancel by id; beat ...)"
+cat data/run/heartbeat.json.watchdog        # its own beat: refreshed every second
 ```
 
 Operate: `launchctl kickstart -k gui/$(id -u)/com.dh.watchdog` (restart; `--arm-on-start`

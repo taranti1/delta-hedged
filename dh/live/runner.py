@@ -149,6 +149,7 @@ from dh.core.events import (
     KalshiPositionSnapshot,
     KalshiTicker,
     KalshiTrade,
+    OrderAck,
     OrderReject,
     RiskStateSeed,
     Settlement,
@@ -185,10 +186,14 @@ CLOCK_SOURCES = ("chronyc", "timedatectl")  # samples from anything else cannot 
 # offset; "synchronised" there means sntp answered with an error bound within the limit
 DARWIN_CLOCK_SOURCES = (*CLOCK_SOURCES, "sntp")
 PAUSE_STREAM_REASON = "exchange_pause"  # reconcile reason + gate reason of an exchange/trading pause
-# place-reject reasons that mean trading is paused (Kalshi's codes are undocumented; never
-# 'market_inactive' / 'market_closed', which follow a market's own close)
-_PAUSE_REJECT = re.compile(r"paus|exchange[_ ](is[_ ])?(closed|inactive|unavailable|not[_ ]active)"
-                           r"|trading[_ ](is[_ ])?(closed|inactive|halted|unavailable|not[_ ]active)|outside[_ ]trading[_ ]hours")
+MARKET_PAUSE_REASON = "market_pause"  # per-market block after a market-level pause reject
+WATCHDOG_REASON = "watchdog"  # gate + reconcile reason: the watchdog is not protecting this runner
+DISK_REASON = "disk"  # gate + reconcile reason: too little free disk for the session store
+# place-reject reasons that mean the EXCHANGE / trading as a whole is paused (Kalshi's codes are
+# undocumented; never 'market_inactive' / 'market_closed', which follow a market's own close)
+_EXCHANGE_PAUSE_REJECT = re.compile(r"exchange[_ ](is[_ ])?(paused|closed|inactive|unavailable|not[_ ]active)"
+                                    r"|trading[_ ](is[_ ])?(paused|closed|inactive|halted|unavailable|not[_ ]active)"
+                                    r"|outside[_ ]trading[_ ]hours")
 
 
 def trusted_clock_sources(platform: str | None = None) -> tuple[str, ...]:
@@ -196,10 +201,24 @@ def trusted_clock_sources(platform: str | None = None) -> tuple[str, ...]:
     return DARWIN_CLOCK_SOURCES if (platform or sys.platform) == "darwin" else CLOCK_SOURCES
 
 
-def is_pause_reject(reason: str) -> bool:
-    """An order reject whose reason says the exchange / trading is paused (not a gate reject)."""
+def pause_reject_scope(reason: str) -> str:
+    """'exchange' when a reject's reason says the exchange / trading as a whole is paused (a
+    global pause), 'market' when it names a paused market or is an unqualified pause (that
+    market only; the status poll, run at once, decides the global state), '' otherwise (gate
+    rejects included)."""
     r = (reason or "").lower()
-    return not r.startswith("gate:") and bool(_PAUSE_REJECT.search(r))
+    if r.startswith("gate:"):
+        return ""
+    if "market" in r and "paus" in r:
+        return "market"
+    if _EXCHANGE_PAUSE_REJECT.search(r):
+        return "exchange"
+    return "market" if "paus" in r else ""
+
+
+def is_pause_reject(reason: str) -> bool:
+    """An order reject whose reason says trading is paused, exchange- or market-wide."""
+    return pause_reject_scope(reason) != ""
 
 
 def own_subaccount_ok(ev: Any, subaccount: int, *, key_restricted: bool = False) -> bool:
@@ -223,6 +242,34 @@ def own_series_ok(ev: Any, series: Iterable[str]) -> bool:
 def own_event_ok(ev: Any, subaccount: int, *, key_restricted: bool = False, series: Iterable[str] = ()) -> bool:
     """Both live inbound rules for own-activity events (subaccount, then series)."""
     return own_subaccount_ok(ev, subaccount, key_restricted=key_restricted) and own_series_ok(ev, series)
+
+
+ORDER_ID_TYPES = (KalshiFill, KalshiOrderUpdate)  # own-activity events that name an order
+
+
+def own_order_ok(ev: Any, id_prefix: str, known_oids: Any) -> bool:
+    """Live inbound rule (shared with dh.live.replay, review M1): a fill / order update is ours
+    only when its client_order_id starts with this runner's prefix (``<run_prefix>-``), or its
+    order id is one we know (acknowledged / updated earlier, with our prefix). Even an
+    UNRESTRICTED key (whose private channels carry the whole account, System 2 included) can
+    therefore never feed another system's fills into this runner. Empty prefix = no filter."""
+    if not id_prefix or not isinstance(ev, ORDER_ID_TYPES):
+        return True
+    coid = str(getattr(ev, "client_order_id", "") or "")
+    if coid.startswith(id_prefix):
+        return True
+    oid = str(getattr(ev, "order_id", "") or "")
+    return bool(oid) and oid in known_oids
+
+
+def note_own_order(ev: Any, known_oids: Any) -> None:
+    """Remember the order id of an event that passed ``own_order_ok`` (or an OrderAck: the
+    response to our own create), so later messages without our client_order_id (a REST fill
+    carries none) are recognised."""
+    if isinstance(ev, (*ORDER_ID_TYPES, OrderAck)):
+        oid = str(getattr(ev, "order_id", "") or "")
+        if oid:
+            known_oids.add(oid)
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +463,9 @@ class LiveRunner:
         risk_book: RiskBook | None = None,
         started_ns: int | None = None,
         clock_sampler: Callable[[], dict[str, Any]] | None = None,
+        own_id_prefix: str = "",
+        watchdog_reader: Callable[[], dict[str, Any] | None] | None = None,
+        disk_free_gb: Callable[[], float] | None = None,
     ) -> None:
         if mode not in ("paper", "live"):
             raise ValueError(f"mode {mode!r}")
@@ -460,10 +510,25 @@ class LiveRunner:
         self._pause_reject_until = 0
         self._last_status: dict[str, Any] = {}
         self.closures: list[tuple[int, int, str]] = []
+        self._market_pause_until: dict[str, int] = {}  # ticker -> end of its market-level pause block (event ns)
         # collateral: the per-shard balance must cover this (set by the app: worst case + margin)
         self.balance_required_usd = 0.0
         self.balances: dict[int, float] = {}
         self._last_ws_fill_exch_ns = 0  # exchange time of the latest fill delivered by the WebSocket
+        self._last_ws_fill_by_ticker: dict[str, int] = {}  # ticker -> exchange time of its latest WS fill
+        self._pos_defer: dict[str, tuple[int, int]] = {}  # ticker -> (deferrals, first deferral ns) of a suspicion
+        # own-activity filter (review M1): client_order_id prefix of this runner ('' = off) and the
+        # order ids known to be ours (acknowledged / updated with our prefix)
+        self.own_id_prefix = str(own_id_prefix or "")
+        self.known_oids = SeenIds()
+        self._foreign_logged = 0
+        # the watchdog's liveness (review M3): reader of its beat file, the current problem
+        self._watchdog_reader = watchdog_reader
+        self._watchdog_problem = ""
+        self._running_since_ns = 0
+        # free disk of the session store (live): measurement function, current problem
+        self._disk_free_gb = disk_free_gb
+        self._disk_problem = ""
         self._verified: dict[str, bool] = {}  # one-time verify_live checks already logged
         self._clock_alarm_logged = 0.0  # monotonic s of the last clock-alarm warning (rate-limited)
         if self.venue is not None and hasattr(self.venue, "register_markets"):
@@ -694,15 +759,36 @@ class LiveRunner:
         else:
             self._on_event(item)
 
+    def _foreign_order_event(self, ev: Any, source: str) -> None:
+        """An own-activity event of an order that is not ours (review M1): dropped, counted and
+        alarmed (another system's fills must never move this runner's inventory)."""
+        self.metrics.inc("dh_foreign_order_events_total", type=type(ev).__name__, source=source)
+        self._foreign_logged += 1
+        if self._foreign_logged == 1 or self._foreign_logged % 100 == 0:
+            log.error("DROPPED %s of an order that is not ours (client_order_id %r, order %s, %s; %d so far): does "
+                      "this key see another system's activity?", type(ev).__name__,
+                      getattr(ev, "client_order_id", ""), getattr(ev, "order_id", ""), getattr(ev, "ticker", ""),
+                      self._foreign_logged)
+        self.jlog("foreign_order_event", ev.ts, type=type(ev).__name__, source=source,
+                  client_order_id=getattr(ev, "client_order_id", ""), order_id=getattr(ev, "order_id", ""),
+                  ticker=getattr(ev, "ticker", ""), n=self._foreign_logged)
+
     def _on_event(self, ev: Event) -> None:
         live = self.mode == "live"
+        if live and not own_order_ok(ev, self.own_id_prefix, self.known_oids):
+            self._foreign_order_event(ev, "ws" if not isinstance(ev, KalshiOrderUpdate) else "ws_or_venue")
+            return
+        if live:
+            note_own_order(ev, self.known_oids)
         if live and isinstance(ev, KalshiFill) and self.fills_seen.seen(ev):
             # delivered already (a REST back-fill beat the WS message, or a duplicate)
             self.metrics.inc("dh_duplicate_fills_dropped_total")
             self.jlog("fill_duplicate_dropped", ev.ts, ticker=ev.ticker, trade_id=ev.trade_id, order_id=ev.order_id)
             return
         if live and isinstance(ev, KalshiFill):  # a WebSocket fill (back-filled ones are injected)
-            self._last_ws_fill_exch_ns = max(self._last_ws_fill_exch_ns, int(ev.ts_exch or ev.ts))
+            te = int(ev.ts_exch or ev.ts)
+            self._last_ws_fill_exch_ns = max(self._last_ws_fill_exch_ns, te)
+            self._last_ws_fill_by_ticker[ev.ticker] = max(self._last_ws_fill_by_ticker.get(ev.ticker, 0), te)
         self._last_event_ts = ev.ts
         max_lag = self.cfg.loop.max_lag_s
         lag_after: str = ""
@@ -825,9 +911,12 @@ class LiveRunner:
             self._on_excluded_settlement(ev.ts, ev.ticker, int(ev.settlement_px), "determined")
         elif isinstance(ev, RiskStateSeed):
             self.riskbook.note_seed(ev)
-        elif isinstance(ev, OrderReject) and self.mode == "live" and ev.request in ("create", "amend") \
-                and is_pause_reject(ev.reason):
-            self._pause_reject(ev.ts, ev.ticker, ev.reason)
+        elif isinstance(ev, OrderReject) and self.mode == "live" and ev.request in ("create", "amend"):
+            scope = pause_reject_scope(ev.reason)
+            if scope == "exchange":
+                self._pause_reject(ev.ts, ev.ticker, ev.reason)
+            elif scope == "market":
+                self._market_pause_reject(ev.ts, ev.ticker, ev.reason)
 
     def _on_excluded_settlement(self, ts: int, ticker: str, payout: int, how: str) -> None:
         """A market of an event excluded from this session (a position held at start-up) was
@@ -869,6 +958,8 @@ class LiveRunner:
         if self._hold_until and ts >= self._hold_until:
             self._hold_until = 0
             self.push_side("hold_end")
+        if self._market_pause_until:
+            self._market_pause_expire(ts)
         mono_ns = int(self._mono() * NS_PER_S)
         if self.kill_file is not None and mono_ns >= self._next_kill_check:
             self._next_kill_check = mono_ns + int(self.cfg.loop.kill_check_interval_s * NS_PER_S)
@@ -918,9 +1009,11 @@ class LiveRunner:
         if mine:
             self._watchdog_halt(ts, t)
             return
-        until = t + int(self.cfg.venue.cancel_all_hold_s * NS_PER_S)
-        log.error("the watchdog cancelled every order while watching another runner (%s): holding new orders, "
-                  "reconciling", watched)
+        # only a BULK cancel-all has a one-minute tail to wait out (a shared account's watchdog
+        # cancels by id)
+        until = t + int(self.cfg.venue.cancel_all_hold_s * NS_PER_S) if self._bulk_cancel_allowed() else 0
+        log.error("the watchdog cancelled every order while watching another runner (%s): %sreconciling", watched,
+                  "holding new orders, " if until > ts else "")
         self.jlog("watchdog_cancel_all_seen", ts, marker_t=t, hold_until=until, watched=watched, halt=False)
         if until > ts:
             self.hold(until, "watchdog_cancel_all")
@@ -1050,9 +1143,15 @@ class LiveRunner:
         while len(d) > 50_000:
             d.pop(next(iter(d)))
 
+    def _bulk_cancel_allowed(self) -> bool:
+        return bool(getattr(self.venue, "bulk_cancel_allowed", False)) if self.venue is not None else False
+
     def _note_global_cancel_all(self, ts: int) -> None:
-        """A REST cancel-all is going out: Kalshi may cancel orders placed during the next
-        minute, so new orders are held (the gate; a halt closes it anyway)."""
+        """A BULK REST cancel-all is going out: Kalshi may cancel orders placed during the next
+        minute, so new orders are held (the gate; a halt closes it anyway). A shared account
+        never sends it (the venue cancels by id), so there is no tail to wait out."""
+        if not self._bulk_cancel_allowed():
+            return
         hold = self.cfg.venue.cancel_all_hold_s
         if hold > 0:
             until = self._clock() + int(hold * NS_PER_S)
@@ -1328,6 +1427,8 @@ class LiveRunner:
         """A GET /exchange/status poll, already reduced to our shards (startup.shard_status)."""
         st = dict(p.get("status") or {})
         self._last_status = st
+        if self._pause.pop("unreadable", None) is not None:
+            self.jlog("exchange_status", ts, note="readable again")
         ex, tr = bool(st.get("exchange_active")), bool(st.get("trading_active"))
         self.metrics.set("dh_exchange_active", 1.0 if ex else 0.0)
         self.metrics.set("dh_trading_active", 1.0 if tr else 0.0)
@@ -1345,6 +1446,16 @@ class LiveRunner:
                 self.jlog("exchange_status", ts, exchange_active=ex, trading_active=tr, shards=st.get("shards"),
                           source=st.get("source"), resume=st.get("exchange_estimated_resume_time"))
             self._pause["status"] = detail
+        self._pause_eval(ts)
+
+    def _on_exchange_status_unreadable(self, ts: int, p: dict[str, Any]) -> None:
+        """``venue.exchange_status_max_failures`` status polls in a row failed (review L3): fail
+        closed, i.e. the exchange_pause gate closes with its own reason until a poll succeeds."""
+        detail = f"exchange status unreadable ({int(p.get('failures', 0))} polls in a row: {str(p.get('error', ''))[:120]})"
+        if self._pause.get("unreadable") is None:
+            log.error("%s: new orders blocked (fail closed) until a poll succeeds", detail)
+            self.jlog("exchange_status_unreadable", ts, failures=p.get("failures"), error=str(p.get("error", ""))[:200])
+        self._pause["unreadable"] = detail
         self._pause_eval(ts)
 
     def _on_exchange_schedule(self, ts: int, p: dict[str, Any]) -> None:
@@ -1365,12 +1476,34 @@ class LiveRunner:
         told in queue order, after this reject)."""
         hold = int(self.cfg.venue.pause_reject_hold_s * NS_PER_S)
         self._pause_reject_until = max(self._pause_reject_until, ts + hold)
-        self.metrics.inc("dh_pause_rejects_total")
+        self.metrics.inc("dh_pause_rejects_total", scope="exchange")
         self.jlog("pause_reject", ts, ticker=ticker, reason=reason[:200], hold_until=self._pause_reject_until)
         if self.gate.close(PAUSE_STREAM_REASON, ts):
             self.jlog("gate", ts, action="close", reason=PAUSE_STREAM_REASON, why=f"place rejected: {reason[:120]}")
         self._status_now.set()
         self.push_side("call", self._pause_eval)
+
+    def _market_pause_reject(self, ts: int, ticker: str, reason: str) -> None:
+        """A place / amend rejected because ONE MARKET is paused (review L3): block new orders in
+        that market only, for ``pause_reject_hold_s`` (its quotes are cancelled), and poll the
+        exchange status at once (an exchange-wide pause is decided there)."""
+        if not ticker:
+            return
+        until = ts + int(self.cfg.venue.pause_reject_hold_s * NS_PER_S)
+        self._market_pause_until[ticker] = max(self._market_pause_until.get(ticker, 0), until)
+        self.metrics.inc("dh_pause_rejects_total", scope="market")
+        self.jlog("pause_reject", ts, ticker=ticker, reason=reason[:200], scope="market", hold_until=until)
+        if self.gate.tickers.get(ticker) is None:
+            self._block([ticker], MARKET_PAUSE_REASON, ts)
+        self._status_now.set()
+
+    def _market_pause_expire(self, ts: int) -> None:
+        for t, until in list(self._market_pause_until.items()):
+            if ts >= until:
+                self._market_pause_until.pop(t, None)
+                if self.gate.tickers.get(t) == MARKET_PAUSE_REASON:
+                    self.gate.tickers.pop(t, None)
+                    self.jlog("block", ts, tickers=[t], reason=MARKET_PAUSE_REASON, action="lifted")
 
     def _pause_eval(self, ts: int) -> None:
         """Combine the pause sources (status poll, schedule, place rejects) into the gate and the
@@ -1477,7 +1610,7 @@ class LiveRunner:
             if a is not None:
                 self.metrics.set("dh_balance_dollars", float(a), exchange_index=str(sh))
             if usd is None:
-                low.append(f"shard {sh}: balance unreadable")
+                low.append(f"shard {sh}: balance unreadable" + (f" ({p['error']})" if p.get("error") else ""))
                 continue
             self.balances[sh] = float(usd)
             self.metrics.set("dh_shard_funds_dollars", float(usd), exchange_index=str(sh))
@@ -1491,6 +1624,50 @@ class LiveRunner:
         elif got and self.gate.open("balance"):
             self.jlog("gate", ts, action="open", reason="balance", balances={str(k): v for k, v in self.balances.items()},
                       required_usd=need)
+
+    def _guard_gate(self, ts: int, reason: str, problem: str, *, critical: bool = False) -> None:
+        """A runner-level protection (watchdog alive, free disk) is missing (``problem``) or back
+        (''): the gate ``reason`` closes / opens, and the strategy is told through
+        ``kalshi.reconcile`` (stale: it pulls its quotes; resynced once every reason is clear)."""
+        if problem:
+            if self.gate.close(reason, ts):
+                (log.critical if critical else log.error)("%s: %s: new orders blocked, quotes pulled", reason.upper(), problem)
+                self.jlog("gate", ts, action="close", reason=reason, why=problem)
+                self.meta("gate", ts, action="close", reason=reason, why=problem)
+            self._recon_begin(reason, ts)
+        else:
+            if self.gate.open(reason):
+                log.warning("%s: OK again: new orders allowed", reason)
+                self.jlog("gate", ts, action="open", reason=reason)
+                self.meta("gate", ts, action="open", reason=reason)
+            self._recon_end(reason, ts)
+
+    def _on_watchdog(self, ts: int, p: dict[str, Any]) -> None:
+        """The watchdog's beat (``<heartbeat>.watchdog``, review M3): stale, missing, another
+        subaccount's, or not armed on this runner -> gate 'watchdog' closed and quotes pulled."""
+        problem = str(p.get("problem") or "")
+        self._watchdog_problem = problem
+        self.metrics.set("dh_watchdog_ok", 0.0 if problem else 1.0)
+        self._guard_gate(ts, WATCHDOG_REASON, problem, critical=True)
+
+    def _on_disk(self, ts: int, p: dict[str, Any]) -> None:
+        """Free space of the session store's filesystem: below ``disk.min_free_gb_gate`` (or
+        unmeasurable) -> gate 'disk' closed and quotes pulled, until it is back above the
+        threshold + ``disk.resume_margin_gb``."""
+        d = self.cfg.disk
+        free = p.get("free_gb")
+        self.metrics.set("dh_disk_free_gb", float(free) if isinstance(free, (int, float)) else -1.0)
+        closed = DISK_REASON in self.gate.reasons
+        if not isinstance(free, (int, float)):
+            problem = f"free disk space unmeasurable ({str(p.get('error') or '?')[:120]})"
+        elif free < d.min_free_gb_gate:
+            problem = f"{free:.1f} GB free on the data root's disk < {d.min_free_gb_gate:g} GB"
+        elif closed and free < d.min_free_gb_gate + d.resume_margin_gb:
+            problem = f"{free:.1f} GB free: not yet back above {d.min_free_gb_gate + d.resume_margin_gb:g} GB"
+        else:
+            problem = ""
+        self._disk_problem = problem
+        self._guard_gate(ts, DISK_REASON, problem)
 
     # ================================================================== side channel
     def _on_side(self, item: Side) -> None:
@@ -1511,6 +1688,12 @@ class LiveRunner:
             self._check_positions(item.ts, dict(p.get("positions") or {}), as_of_ns=p.get("as_of_ns"))
         elif k == "exchange_status":
             self._on_exchange_status(item.ts, dict(item.payload or {}))
+        elif k == "exchange_status_unreadable":
+            self._on_exchange_status_unreadable(item.ts, dict(item.payload or {}))
+        elif k == "watchdog":
+            self._on_watchdog(item.ts, dict(item.payload or {}))
+        elif k == "disk":
+            self._on_disk(item.ts, dict(item.payload or {}))
         elif k == "exchange_schedule":
             self._on_exchange_schedule(item.ts, dict(item.payload or {}))
         elif k == "balance":
@@ -1636,8 +1819,6 @@ class LiveRunner:
         clock running. ``partial``: ``exch`` holds only the markets it names (a WS
         market_position message): it can raise or clear a suspicion, never confirm one (the
         positions loop runs a confirming read at once)."""
-        stale_read = (not partial and as_of_ns is not None and int(as_of_ns) > 0
-                      and int(as_of_ns) < self._last_ws_fill_exch_ns)
         settled = getattr(self.strategy, "settled", {}) or {}
         src = "ws_checked" if partial else "rest"
         ours_nonzero = set() if partial else {t for t in self.universe if self._position_of(t)}
@@ -1656,20 +1837,23 @@ class LiveRunner:
             s = self._pos_suspect.get(t)
             if s is None or s[0] != d:
                 self._pos_suspect[t] = (d, ts)
+                self._pos_defer.pop(t, None)
                 self.metrics.inc("dh_position_suspects_total")
                 self.jlog("position_suspect", ts, ticker=t, exchange=ex, ours=ours, diff=d, source=src)
                 self._positions_now.set()  # confirm soon (fills first, then positions)
             elif ts - s[1] >= confirm_ns and (partial or not self._fills_cover(s[1])):
                 self._positions_now.set()  # old enough, but not yet checked against a fills read
-            elif ts - s[1] >= confirm_ns and stale_read:
-                # Kalshi's portfolio data predates the last WebSocket fill: this snapshot may simply
-                # not include it yet -> read again soon instead of halting on it
+            elif ts - s[1] >= confirm_ns and self._defer_confirm(t, s[1], as_of_ns, ts):
+                # Kalshi's portfolio data predates the last WebSocket fill OF THIS MARKET: the
+                # snapshot may simply not include it yet -> read again soon instead of halting
+                n, _ = self._pos_defer[t]
                 self.metrics.inc("dh_position_reads_stale_total")
                 self.jlog("position_confirm_deferred", ts, ticker=t, exchange=ex, ours=ours, as_of_ns=int(as_of_ns or 0),
-                          last_ws_fill_ns=self._last_ws_fill_exch_ns)
+                          last_ws_fill_ns=self._last_ws_fill_by_ticker.get(t, 0), deferrals=n, first_seen_ns=s[1])
                 self._positions_now.set()
             elif ts - s[1] >= confirm_ns:
                 self._pos_suspect.pop(t, None)
+                self._pos_defer.pop(t, None)
                 self.metrics.inc("dh_position_mismatches_total")
                 log.error("POSITION MISMATCH %s exchange=%d ours=%d", t, ex, ours)
                 self.jlog("position_mismatch", ts, ticker=t, exchange=ex, ours=ours, source=src)
@@ -1677,6 +1861,32 @@ class LiveRunner:
         if not partial:
             for t in [t for t in self._pos_suspect if t not in cands]:
                 self._pos_suspect.pop(t, None)
+                self._pos_defer.pop(t, None)
+        for t in [t for t in self._pos_defer if t not in self._pos_suspect]:
+            self._pos_defer.pop(t, None)
+
+    def _defer_confirm(self, ticker: str, first_seen: int, as_of_ns: int | None, ts: int) -> bool:
+        """Should this positions read NOT confirm the (old enough) difference in ``ticker``?
+        (review M4) A read whose user-data timestamp is older than the last WebSocket fill OF
+        THIS MARKET may not include that fill: it is deferred (read again), at most
+        ``venue.position_defer_max`` times and ``venue.position_defer_max_s`` after the
+        difference was first seen. After that cap only a read NEWER than the first sight of the
+        difference may confirm it (an older one cannot show what was already wrong then), and
+        after twice the time any read confirms (a user-data timestamp stuck in the past)."""
+        if as_of_ns is None or int(as_of_ns) <= 0:
+            return False
+        as_of = int(as_of_ns)
+        vc = self.cfg.venue
+        cap_ns = int(max(0.0, vc.position_defer_max_s) * NS_PER_S)
+        n, since = self._pos_defer.get(ticker, (0, ts))
+        capped = n >= max(0, int(vc.position_defer_max)) or ts - first_seen >= cap_ns
+        if not capped:
+            if as_of >= self._last_ws_fill_by_ticker.get(ticker, 0):
+                return False
+        elif as_of > first_seen or ts - first_seen >= 2 * cap_ns:
+            return False
+        self._pos_defer[ticker] = (n + 1, since)
+        return True
 
     def _check_resting(self, ts: int, rows: list[dict[str, Any]], *, force: bool = False) -> None:
         """Order reconciliation against GET /portfolio/orders?status=resting:
@@ -1789,6 +1999,14 @@ class LiveRunner:
             if min_age_ns and (not ev.ts_exch or ts - ev.ts_exch < min_age_ns):
                 continue
             ev = dataclasses.replace(ev, trade_id=tid or fid, fill_id=fid, subaccount=self.subaccount)
+            if self.mode == "live" and not own_order_ok(ev, self.own_id_prefix, self.known_oids):
+                # a REST fill names no client_order_id: only fills of order ids we know are ours
+                if ev.ts_exch and ev.ts_exch < self.started_ns:  # an earlier session's fill (restart)
+                    self.metrics.inc("dh_fills_before_session_skipped_total")
+                    continue
+                self._foreign_order_event(ev, "rest")
+                continue
+            note_own_order(ev, self.known_oids)
             self.jlog("fill_backfilled", ts, ticker=ev.ticker, trade_id=ev.trade_id, order_id=ev.order_id, qty=ev.qty)
             self._pre_event(ev)
             self._inject(ev)
@@ -2173,6 +2391,7 @@ class LiveRunner:
         rest = v.rest
         sched_iv = float(vc.exchange_schedule_interval_s)
         next_sched = self._mono() + sched_iv if sched_iv > 0 else float("inf")  # the app read it at start-up
+        failures = 0
         while not self._stopping:
             try:
                 await asyncio.wait_for(self._status_now.wait(), timeout=iv)
@@ -2183,18 +2402,23 @@ class LiveRunner:
                 return
             try:
                 body = await rest.get_exchange_status()
+                failures = 0
                 self.push_side("exchange_status", {"status": shard_status(body, vc.exchange_indexes)})
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - an exchange pause can fail reads too: keep polling
+                failures += 1
                 self.metrics.inc("dh_exchange_status_errors_total")
-                self.jlog("exchange_status_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300])
+                err = f"{type(exc).__name__}: {exc}"[:300]
+                self.jlog("exchange_status_error", self._clock(), error=err, failures=failures)
+                if failures >= max(1, int(vc.exchange_status_max_failures)):  # fail closed (review L3)
+                    self.push_side("exchange_status_unreadable", {"failures": failures, "error": err})
             if self._mono() >= next_sched:
                 next_sched = self._mono() + sched_iv
                 try:
                     body = await rest.get_exchange_schedule()
                     now = self._clock()
-                    closures, notes = schedule_closures(body, now - DAY_NS, now + 8 * DAY_NS)
+                    closures, notes = schedule_closures(body, now - DAY_NS, now + 8 * DAY_NS, now_ns=now)
                     self.push_side("exchange_schedule", {"closures": closures, "notes": notes})
                 except asyncio.CancelledError:
                     raise
@@ -2205,11 +2429,14 @@ class LiveRunner:
     async def _balance_loop(self) -> None:
         """The funds of every configured shard (``KalshiVenue.fetch_shard_funds``: balance,
         positions at cost, resting-order collateral, all with subaccount and exchange_index)
-        every ``balance_interval_s`` -> ``_on_balance`` (a failed read changes nothing)."""
+        every ``balance_interval_s`` -> ``_on_balance``. A failed read changes nothing, but
+        ``venue.balance_max_failures`` failures in a row close the gate (fail closed, review L2)."""
         v = self.venue
-        iv = self.cfg.venue.balance_interval_s
+        vc = self.cfg.venue
+        iv = vc.balance_interval_s
         if v is None or iv <= 0:
             return
+        failures = 0
         while not self._stopping:
             await asyncio.sleep(iv)
             if self._stopping:
@@ -2219,11 +2446,59 @@ class LiveRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                failures += 1
                 self.metrics.inc("dh_balance_errors_total")
-                self.jlog("balance_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300])
+                self.jlog("balance_error", self._clock(), error=f"{type(exc).__name__}: {exc}"[:300], failures=failures)
+                if failures >= max(1, int(vc.balance_max_failures)):
+                    self.push_side("balance", {"balances": {int(sh): None for sh in vc.exchange_indexes},
+                                               "error": f"{failures} balance reads in a row failed"})
                 continue
+            failures = 0
             self.push_side("balance", {"balances": {sh: f["funds"] for sh, f in funds.items()},
                                        "available": {sh: f["available"] for sh, f in funds.items()}})
+
+    async def _watchdog_loop(self) -> None:
+        """The watchdog's beat file, read every second (review M3): the problem (stale, missing,
+        another subaccount, not armed on this runner once it has been running
+        ``watchdog.runner_max_age_s``) goes through the queue to ``_on_watchdog`` when it changes."""
+        from dh.live.monitor import watchdog_beat_problem
+
+        reader = self._watchdog_reader
+        if reader is None:
+            return
+        wc = self.cfg.watchdog
+        last: str | None = None
+        step = max(0.05, min(1.0, wc.runner_max_age_s / 4))
+        while not self._stopping:
+            now = self._clock()
+            runner = None
+            if self._running_since_ns and now - self._running_since_ns > wc.runner_max_age_s * NS_PER_S:
+                runner = (os.getpid(), self.session_id)
+            try:
+                p = watchdog_beat_problem(reader(), now_ns=now, subaccount=self.subaccount,
+                                          max_age_s=wc.runner_max_age_s, runner=runner)
+            except Exception as exc:  # noqa: BLE001 - an unreadable beat vouches for nothing
+                p = f"watchdog beat unreadable ({type(exc).__name__}: {exc})"[:200]
+            if p != last:
+                last = p
+                self.push_side("watchdog", {"problem": p})
+            await asyncio.sleep(step)
+
+    async def _disk_loop(self) -> None:
+        """Free space of the session store's filesystem every ``disk.check_interval_s`` ->
+        ``_on_disk`` (gate 'disk' below ``disk.min_free_gb_gate``)."""
+        fn = self._disk_free_gb
+        if fn is None:
+            return
+        iv = max(0.05, float(self.cfg.disk.check_interval_s))
+        while not self._stopping:
+            try:
+                free: float | None = float(await asyncio.to_thread(fn))
+                err = ""
+            except Exception as exc:  # noqa: BLE001 - unmeasurable: fail closed
+                free, err = None, f"{type(exc).__name__}: {exc}"[:200]
+            self.push_side("disk", {"free_gb": free, "error": err})
+            await asyncio.sleep(iv)
 
     async def _risk_state_loop(self) -> None:
         iv = self.cfg.loop.risk_state_interval_s
@@ -2408,7 +2683,8 @@ class LiveRunner:
         m.set("dh_pump_timers", float(st.timers))
         m.set("dh_pump_sim_events", float(st.sim_events))
         m.set("dh_gate_closed", 1.0 if self.gate.closed else 0.0)
-        for r in ("lag", "reconciling", "cancel_all_hold", "clock", PAUSE_STREAM_REASON, "balance"):
+        for r in ("lag", "reconciling", "cancel_all_hold", "clock", PAUSE_STREAM_REASON, "balance", WATCHDOG_REASON,
+                  DISK_REASON):
             m.set("dh_gate_reason", 1.0 if r in self.gate.reasons else 0.0, reason=r)
         m.set("dh_blocked_markets", float(len(self.gate.tickers)))
         m.set("dh_universe_markets", float(len(self.universe)))
@@ -2461,13 +2737,15 @@ class LiveRunner:
                 "reconciling": sorted(self._recon), "stuck_cancels": list(getattr(self.venue, "stuck_orders", []) or []),
                 "halts": [h.reason for h in self._halts], "stopping": self._stopping,
                 "exchange_pause": dict(self._pause), "balances": {str(k): v for k, v in self.balances.items()},
-                "kill_latched": getattr(self.venue, "kill_latched", "") or ""}
+                "kill_latched": getattr(self.venue, "kill_latched", "") or "",
+                "watchdog": self._watchdog_problem or "ok", "disk": self._disk_problem or "ok"}
 
     # ================================================================== lifecycle
     async def run(self, *, duration_s: float | None = None) -> int:
         """Run until stop is requested (signal, kill file, error) or ``duration_s``."""
         self._stop_evt = asyncio.Event()
         loop = asyncio.get_running_loop()
+        self._running_since_ns = self._clock()
         self._consumer_beat = self._mono()
         self._consumer_task = asyncio.create_task(self._consume(), name="runner:consumer")
         self._consumer_task.add_done_callback(self._consumer_done)
@@ -2488,6 +2766,8 @@ class LiveRunner:
             ("runner:exchange", v is not None and vc.exchange_status_interval_s > 0, self._exchange_loop),
             ("runner:balance", v is not None and vc.balance_interval_s > 0 and hasattr(v, "fetch_shard_funds"),
              self._balance_loop),
+            ("runner:watchdog", self.mode == "live" and self._watchdog_reader is not None, self._watchdog_loop),
+            ("runner:disk", self.mode == "live" and self._disk_free_gb is not None, self._disk_loop),
         ]
         for name, enabled, fn in loops:
             if enabled:
@@ -2685,7 +2965,8 @@ def _action_fields(a: Action) -> dict[str, Any]:
     return d
 
 
-__all__ = ["CLOCK_SOURCES", "DARWIN_CLOCK_SOURCES", "LAG_STREAM", "META_STREAM", "PAPER_STREAM", "PAUSE_STREAM_REASON",
-           "RECONCILE_STREAM", "RESULT_STREAM", "LagMeter", "LiveRunner", "OrderGate", "Result", "SeenIds", "Side", "Timer",
-           "Wake", "effective_fee", "is_pause_reject", "own_event_ok", "own_series_ok", "own_subaccount_ok",
+__all__ = ["CLOCK_SOURCES", "DARWIN_CLOCK_SOURCES", "DISK_REASON", "LAG_STREAM", "MARKET_PAUSE_REASON", "META_STREAM",
+           "PAPER_STREAM", "PAUSE_STREAM_REASON", "RECONCILE_STREAM", "RESULT_STREAM", "WATCHDOG_REASON", "LagMeter",
+           "LiveRunner", "OrderGate", "Result", "SeenIds", "Side", "Timer", "Wake", "effective_fee", "is_pause_reject",
+           "note_own_order", "own_event_ok", "own_order_ok", "own_series_ok", "own_subaccount_ok", "pause_reject_scope",
            "trusted_clock_sources"]

@@ -159,6 +159,50 @@ def cancel_all_marker_path(heartbeat: str | Path) -> Path:
     return p.with_name(p.name + ".cancel_all")
 
 
+def watchdog_beat_path(heartbeat: str | Path) -> Path:
+    """The WATCHDOG's own liveness file, next to the runner heartbeat it watches:
+    ``<heartbeat>.watchdog`` = {"t", "pid", "subaccount", "state", "armed": [pid, session] | null,
+    "last_poll_ns", "heartbeat"} (scripts/watchdog.py writes it every watchdog.beat_interval_s).
+    A watchdog watching ANOTHER heartbeat file writes next to that file, so the live runner
+    never mistakes it for its own."""
+    p = Path(heartbeat)
+    return p.with_name(p.name + ".watchdog")
+
+
+def read_watchdog_beat(path: str | Path) -> dict[str, Any] | None:
+    """Parsed watchdog beat; None when missing or unreadable (an unreadable beat vouches for
+    nothing: the runner treats it like a missing one)."""
+    rec = read_heartbeat(path)
+    if rec is None or rec.get("unparsed"):
+        return None
+    return rec
+
+
+def watchdog_beat_problem(beat: dict[str, Any] | None, *, now_ns: int, subaccount: int, max_age_s: float,
+                          runner: tuple[int, str] | None = None) -> str:
+    """Why the watchdog cannot be trusted to protect a live runner of ``subaccount`` ('' = it
+    can): no beat, a beat older than ``max_age_s`` (the watchdog is dead, hung or crash-looping),
+    a watchdog that exited, one configured for another subaccount, or (``runner`` given: the
+    live runner's (pid, session), checked once it has been running a while) one not armed on
+    this runner."""
+    if beat is None:
+        return "no watchdog beat (is scripts/watchdog.py running on this heartbeat file?)"
+    age_s = (now_ns - int(beat.get("t", 0))) / 1e9
+    if age_s > max_age_s:
+        return f"watchdog beat {age_s:.1f}s old (> {max_age_s:g}s): the watchdog is not running"
+    if str(beat.get("state", "")).upper() == "EXITED":
+        return "the watchdog exited"
+    sub = beat.get("subaccount")
+    if sub is None or isinstance(sub, bool) or not isinstance(sub, int) or sub != int(subaccount):
+        return f"the watchdog acts for subaccount {sub!r}, this runner trades subaccount {subaccount}"
+    if runner is not None:
+        armed = beat.get("armed")
+        if not (isinstance(armed, (list, tuple)) and len(armed) == 2 and armed[0] == runner[0]
+                and str(armed[1]) == str(runner[1])):
+            return f"the watchdog is {beat.get('state', '?')} but not armed on this runner (armed: {armed!r})"
+    return ""
+
+
 def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)

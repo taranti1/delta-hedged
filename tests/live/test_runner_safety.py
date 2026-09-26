@@ -303,7 +303,7 @@ async def test_other_subaccounts_events_are_dropped():
     s = OrderingStrategy(n=0)
     from dh.live.config import VenueCfg
 
-    r, venue, rest = live_runner(s, config=cfg(subaccount=3), venue_cfg=VenueCfg(subaccount=3))
+    r, venue, rest = live_runner(s, config=cfg(subaccount=3), venue_cfg=VenueCfg(subaccount=3, shared_account=False))
     t = time.time_ns()
     r.push(KalshiFill(t, 0, TK, "t-0", "x", "manual-1", "bid", 4500, 300, True, 0, 300, subaccount=0))
     r.push(KalshiFill(t + 1, 0, TK, "t-3", "o-3", "c-3", "bid", 4500, 100, False, 0, 100, subaccount=3))
