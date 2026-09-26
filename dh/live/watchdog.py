@@ -1,13 +1,24 @@
 """Dead-man watchdog: cancel every resting order when the live runner's heartbeat stops.
 
-Runs as a SEPARATE process (scripts/watchdog.py) with its own Kalshi API session (optionally
-its own API key), so it keeps working when the runner crashes, hangs or loses its event loop.
-It never places orders. On a trigger it first TRIGGERS the runner's order groups named in its
-last heartbeat (``PUT /portfolio/order_groups/{id}/trigger?subaccount=<n>&exchange_index=<s>``:
-the fastest scoped kill, no documented trailing tail; only groups of the configured
-subaccount), then calls ``DELETE /portfolio/events/orders?subaccount=<n>`` (cancel all, with
-the subaccount explicit: omitted means ALL subaccounts). During an EXCHANGE pause both are
-rejected (Kalshi blocks cancels too): it keeps retrying; ``cancel_order_on_pause`` protects.
+Runs as a SEPARATE process (scripts/watchdog.py) with its own Kalshi API session (its own API
+key, restricted to the runner's subaccount), so it keeps working when the runner crashes, hangs
+or loses its event loop. It never places orders. On a trigger it first TRIGGERS the runner's
+order groups named in its last heartbeat (``PUT /portfolio/order_groups/{id}/trigger?
+subaccount=<n>&exchange_index=<s>``: the fastest scoped kill, no documented trailing tail; only
+groups of the configured subaccount), then cancels every resting order of the subaccount. On a
+SHARED account (``venue.shared_account``) that is ``rest_scoped_cancel_all``: GET
+/portfolio/orders?status=resting&subaccount=<n> and a batch cancel BY ID (each item with the
+subaccount and the order's shard), repeated until the list is empty; the bulk
+``DELETE /portfolio/events/orders?subaccount=<n>`` (``rest_cancel_all``) only on an account
+declared not shared (its one-minute tail's subaccount scope is unverified). During an
+EXCHANGE pause both are rejected (Kalshi blocks cancels too): it keeps retrying;
+``cancel_order_on_pause`` protects.
+
+It only ever locks onto a heartbeat that names ITS configured subaccount (review H2), and it
+writes its own liveness file ``<heartbeat>.watchdog`` (pid, subaccount, state, armed runner,
+last poll) every ``beat_interval_s`` while it runs (``EXITED`` when it stops): the live runner
+refuses to start without a fresh one for its subaccount and blocks new orders while it is
+stale, names another subaccount, or is not armed on it (review M3).
 
 State machine (poll every ``poll_s``):
   DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping); it then
@@ -49,7 +60,7 @@ from typing import Any
 
 from dh.core.units import NS_PER_S
 from dh.live.config import WatchdogCfg
-from dh.live.monitor import cancel_all_marker_path, read_heartbeat, write_json_atomic
+from dh.live.monitor import cancel_all_marker_path, read_heartbeat, watchdog_beat_path, write_heartbeat, write_json_atomic
 
 log = logging.getLogger("dh.live.watchdog")
 
@@ -92,6 +103,9 @@ class Watchdog:
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         marker_path: str | Path | None = None,
         trigger_groups: TriggerFn | None = None,
+        subaccount: int | None = None,
+        bulk: bool = False,
+        beat_path: str | Path | None = None,
     ) -> None:
         self.path = Path(heartbeat_path)
         self.cancel_all = cancel_all
@@ -103,6 +117,13 @@ class Watchdog:
         self._arm_on_start = arm_on_start  # consumed by the first poll
         self._on_event = on_event
         self.marker = Path(marker_path) if marker_path else cancel_all_marker_path(self.path)
+        # the subaccount this watchdog acts for: a runner heartbeat naming another one is never armed on
+        self.subaccount = None if subaccount is None else int(subaccount)
+        self.bulk = bool(bulk)  # cancel_all is the bulk endpoint (a non-shared account); recorded in the marker
+        self.beat_path = Path(beat_path) if beat_path else watchdog_beat_path(self.path)
+        self._last_beat_ns = 0
+        self._last_poll_ns = 0
+        self._mismatch_noted = 0
 
     def _note(self, msg: str, **kw: Any) -> None:
         now = self._clock()
@@ -114,6 +135,35 @@ class Watchdog:
 
     def _relevant(self, mode: str) -> bool:
         return mode == "live" or not self.cfg.only_live
+
+    def _sub_ok(self, hb: dict[str, Any]) -> bool:
+        """The heartbeat names this watchdog's subaccount (review H2: a runner of another
+        subaccount, or a heartbeat without one, is never armed on)."""
+        if self.subaccount is None:
+            return True
+        s = hb.get("subaccount")
+        ok = isinstance(s, int) and not isinstance(s, bool) and s == self.subaccount
+        if not ok:
+            self._mismatch_noted += 1
+            if self._mismatch_noted == 1 or self._mismatch_noted % 1000 == 0:
+                self._note("ignoring a live heartbeat of another subaccount", heartbeat_subaccount=s,
+                           configured=self.subaccount, pid=hb.get("pid"), session=hb.get("session"))
+        return ok
+
+    def write_beat(self, *, state: str | None = None, force: bool = False) -> None:
+        """This watchdog's own liveness file (``<heartbeat>.watchdog``), at most every
+        ``beat_interval_s`` unless forced (state changes, exit)."""
+        now = self._clock()
+        if not force and now - self._last_beat_ns < int(self.cfg.beat_interval_s * NS_PER_S):
+            return
+        self._last_beat_ns = now
+        try:
+            write_heartbeat(self.beat_path, {
+                "pid": os.getpid(), "subaccount": self.subaccount, "state": state or self.st.state,
+                "armed": list(self.st.armed) if self.st.armed else None, "last_poll_ns": self._last_poll_ns,
+                "heartbeat": str(self.path), "bulk_cancel": self.bulk, "stale_s": self.cfg.stale_s}, now_ns=now)
+        except OSError as exc:
+            log.error("watchdog: cannot write its beat %s: %s", self.beat_path, exc)
 
     def _arm(self, hb: dict[str, Any], note: str) -> None:
         st = self.st
@@ -129,6 +179,7 @@ class Watchdog:
     async def step(self) -> str:
         """One poll; returns the resulting state."""
         now = self._clock()
+        self._last_poll_ns = now
         c = self.cfg
         st = self.st
         stale_ns = int(c.stale_s * NS_PER_S)
@@ -143,7 +194,7 @@ class Watchdog:
         if self._arm_on_start:
             self._arm_on_start = False
             live = (hb is not None and not hb.get("unparsed") and self._relevant(mode)
-                    and hstate in ("running", "stopping"))
+                    and hstate in ("running", "stopping") and self._sub_ok(hb))
             if live:  # lock onto the live runner the file names; the ARMED branch triggers if stale
                 self._arm(hb, "armed on start: existing live heartbeat" + ("" if fresh else " (STALE)"))  # type: ignore[arg-type]
             else:
@@ -168,7 +219,7 @@ class Watchdog:
                            mode=mode, state=hstate)
         parsed = hb is not None and not hb.get("unparsed")  # an unreadable file names no runner to lock onto
         if st.state == "DISARMED":
-            if fresh and parsed and self._relevant(mode) and hstate in ("running", "stopping"):
+            if fresh and parsed and self._relevant(mode) and hstate in ("running", "stopping") and self._sub_ok(hb):  # type: ignore[arg-type]
                 self._arm(hb, "armed")  # type: ignore[arg-type]
             return st.state
         if st.state == "ARMED":
@@ -187,7 +238,7 @@ class Watchdog:
                 await self._attempt(now)
             return st.state
         # TRIGGERED
-        if parsed and fresh and self._relevant(mode) and hstate == "running":
+        if parsed and fresh and self._relevant(mode) and hstate == "running" and self._sub_ok(hb):  # type: ignore[arg-type]
             # the watched runner recovered, or a new live runner started (a restart)
             self._arm(hb, "re-armed: runner alive again" if ours else "re-armed on a new live runner")
             return st.state
@@ -228,17 +279,24 @@ class Watchdog:
         try:
             write_json_atomic(self.marker, {"t": now, "ok": ok, "by": "watchdog", "pid": os.getpid(),
                                             "watched": list(st.armed) if st.armed else None,
-                                            "groups_triggered": triggered})
+                                            "groups_triggered": triggered, "bulk": self.bulk})
         except OSError as exc:
             self._note("cancel-all marker write failed", error=str(exc)[:200])
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
-        while stop is None or not stop.is_set():
-            try:
-                await self.step()
-            except Exception:  # noqa: BLE001 - the watchdog must not die
-                log.exception("watchdog step failed")
-            await self._sleep(self.cfg.poll_s)
+        """Poll until ``stop``; the own beat is written every ``beat_interval_s`` (at once on a
+        state change) and set to EXITED when the loop ends."""
+        try:
+            while stop is None or not stop.is_set():
+                before = (self.st.state, self.st.armed)
+                try:
+                    await self.step()
+                except Exception:  # noqa: BLE001 - the watchdog must not die
+                    log.exception("watchdog step failed")
+                self.write_beat(force=(self.st.state, self.st.armed) != before)
+                await self._sleep(self.cfg.poll_s)
+        finally:
+            self.write_beat(state="EXITED", force=True)
 
 
 def _groups_of(hb: dict[str, Any]) -> list[dict[str, Any]]:
@@ -251,9 +309,10 @@ def _groups_of(hb: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def rest_cancel_all(rest: Any, subaccount: int) -> CancelAllFn:
-    """cancel_all for Watchdog on top of KalshiRest: True only on a definite 2xx. The
+    """BULK cancel_all for Watchdog on top of KalshiRest: True only on a definite 2xx. The
     subaccount is REQUIRED and always sent (0 = the primary): Kalshi reads an omitted
-    subaccount as ALL subaccounts."""
+    subaccount as ALL subaccounts. ONLY for an account declared NOT shared (the one-minute
+    tail's subaccount scope is unverified); a shared account uses ``rest_scoped_cancel_all``."""
     from dh.kalshi.rest import UnknownOutcome
 
     if subaccount is None or isinstance(subaccount, bool):
@@ -263,6 +322,44 @@ def rest_cancel_all(rest: Any, subaccount: int) -> CancelAllFn:
     async def _cancel() -> bool:
         res = await rest.cancel_all_orders(subaccount=sub)
         return not isinstance(res, UnknownOutcome)
+
+    return _cancel
+
+
+def rest_scoped_cancel_all(rest: Any, subaccount: int, *, rounds: int = 3, batch: int = 20,
+                           sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> CancelAllFn:
+    """cancel_all for Watchdog on a SHARED account (review M5): never the bulk endpoint.
+    GET /portfolio/orders?status=resting&subaccount=<n> (every page, every shard), then
+    DELETE /portfolio/events/orders/batched BY ID, every item naming the subaccount and the
+    order's own shard (-1 = auto-route by ticker when the row has none), repeated until the list
+    is empty or after ``rounds``. True only when the final list is empty."""
+    from dh.kalshi.normalize import shard_value
+
+    if subaccount is None or isinstance(subaccount, bool):
+        raise ValueError("rest_scoped_cancel_all needs an explicit subaccount")
+    sub = int(subaccount)
+
+    async def _cancel() -> bool:
+        for rnd in range(max(1, rounds) + 1):
+            rows = [o async for o in rest.iter_orders(status="resting", subaccount=sub)]
+            rows = [o for o in rows if o.get("order_id")]
+            if not rows:
+                return True
+            if rnd == max(1, rounds):
+                log.error("watchdog: %d orders of subaccount %d still resting after %d cancel rounds", len(rows), sub, rounds)
+                return False
+            items = []
+            for o in rows:
+                sh = shard_value(o.get("exchange_index"))
+                items.append({"order_id": str(o["order_id"]), "market_ticker": str(o.get("ticker") or ""),
+                              "subaccount": sub, "exchange_index": -1 if sh is None else sh})
+            for i in range(0, len(items), max(1, batch)):
+                try:
+                    await rest.batch_cancel_orders(items[i:i + max(1, batch)])
+                except Exception as exc:  # noqa: BLE001 - the next round lists what still rests
+                    log.warning("watchdog: batch cancel of %d orders failed: %s", len(items[i:i + batch]), exc)
+            await sleep(0.5 * (rnd + 1))
+        return False
 
     return _cancel
 

@@ -7,7 +7,9 @@
 
 1. For each series: fee_type / fee_multiplier (GET /series/{s}) and scheduled changes
    (GET /series/fee_changes); FAIL if our config/fees.yaml cannot price the type.
-2. For the account's fills in the window (GET /portfolio/fills, then /historical/fills):
+2. For the account's fills in the window (GET /portfolio/fills, then /historical/fills), of
+   System 1's subaccount when one is configured (--subaccount, else venue.subaccount of the
+   live config; omitted, Kalshi returns ALL subaccounts: the other system's fills too):
    resolve each market's schedule (event override > series), replay each ORDER's fills in
    time order through OrderFeeAccumulator at BOTH balance precisions ($0.01 and $0.0001) and
    compare every fill's reported fee_cost: exact net / exact trade-only / within rounding /
@@ -80,11 +82,15 @@ async def check_series(rest: KalshiRest, engine: FeeEngine, series: list[str]) -
     return problems
 
 
-async def check_fills(rest: KalshiRest, engine: FeeEngine, days: float, prefix: str, show: int) -> int:
+async def check_fills(rest: KalshiRest, engine: FeeEngine, days: float, prefix: str, show: int,
+                      subaccount: int | None = None) -> int:
     min_ts = int(time.time() - days * 86400)
-    fills = [f async for f in rest.iter_fills(min_ts=min_ts)]
+    kw: dict[str, Any] = {"min_ts": min_ts}
+    if subaccount is not None:  # explicit: omitted means ALL subaccounts (another system's fills too)
+        kw["subaccount"] = int(subaccount)
+    fills = [f async for f in rest.iter_fills(**kw)]
     try:
-        fills += [f async for f in rest.iter_historical_fills(min_ts=min_ts)]
+        fills += [f async for f in rest.iter_historical_fills(**kw)]
     except KalshiHTTPError:
         pass
     seen: set[str] = set()
@@ -94,7 +100,8 @@ async def check_fills(rest: KalshiRest, engine: FeeEngine, days: float, prefix: 
         if fid not in seen and str(f.get("ticker") or f.get("market_ticker", "")).startswith(prefix):
             seen.add(fid)
             uniq.append(f)
-    print(f"\n== fills: {len(uniq)} in the last {days:g} days (prefix {prefix!r}) ==")
+    where = "all subaccounts" if subaccount is None else f"subaccount {subaccount}"
+    print(f"\n== fills: {len(uniq)} in the last {days:g} days (prefix {prefix!r}, {where}) ==")
     if not uniq:
         return 0
     by_order: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -159,9 +166,26 @@ async def amain(args: argparse.Namespace) -> int:
         await rest.configure_rate_limits()
         print(f"rate limiter: {rest.limiter.describe()}")
         bad = await check_series(rest, engine, list(args.series))
-        bad += await check_fills(rest, engine, args.days, args.ticker_prefix, args.show)
+        bad += await check_fills(rest, engine, args.days, args.ticker_prefix, args.show, subaccount=configured_subaccount(args))
     print("\nRESULT:", "OK" if not bad else f"{bad} problem(s)")
     return 1 if bad else 0
+
+
+def configured_subaccount(args: argparse.Namespace) -> int | None:
+    """--subaccount, else the live config's venue.subaccount when it is set (None: all)."""
+    if args.subaccount is not None:
+        return int(args.subaccount)
+    from pathlib import Path
+
+    from dh.live.config import load_live_config
+
+    p = Path(args.live_config)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parents[1] / p
+    if not p.is_file():
+        return None
+    sub = load_live_config(p).venue.subaccount
+    return None if sub is None else int(sub)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -172,6 +196,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--show", type=int, default=25, help="max mismatches to print")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--config", default=None)
+    ap.add_argument("--subaccount", type=int, default=None, help="subaccount whose fills are checked (default: "
+                                                                  "venue.subaccount of --live-config)")
+    ap.add_argument("--live-config", default="config/live.yaml")
     return ap.parse_args(argv)
 
 

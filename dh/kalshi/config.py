@@ -71,14 +71,16 @@ class KalshiConfig:
             return None
         return KalshiSigner(self.key_id, Path(self.private_key_path).expanduser())
 
-    def limiter(self) -> KalshiRateLimiter:
+    def limiter(self, account_share: float | None = None) -> KalshiRateLimiter:
+        """The rate limiter at ``account_share`` (default: rate_limits.account_share)."""
         rl = self.rate_limits or {}
         kw: dict[str, Any] = {}
         if "read" in rl:
             kw["read"] = BucketLimit.from_json(rl["read"])
         if "write" in rl:
             kw["write"] = BucketLimit.from_json(rl["write"])
-        return KalshiRateLimiter(account_share=self.account_share, **kw)
+        share = self.account_share if account_share is None else float(account_share)
+        return KalshiRateLimiter(account_share=share, **kw)
 
     def fee_engine(self) -> FeeEngine:
         path = self.fees.get("config") or "config/fees.yaml"

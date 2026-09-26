@@ -4,11 +4,15 @@
   Dead-man watchdog (scripts/watchdog.py) as a per-user launchd agent on this Mac.
   NOT installed by default: see deploy/launchd/README.md (launchctl bootstrap gui/$(id -u) ...).
   It must run whenever a LIVE runner may run (the runner itself stays manual: never a launchd
-  job). --arm-on-start: a watchdog restarted while the runner died meanwhile still triggers the
-  runner's order groups and cancels subaccount venue.subaccount's orders. It reads the same
-  config/live.yaml as the runner (kill file / heartbeat under data/run on macOS) and its
-  credentials from the environment: KALSHI_WATCHDOG_KEY_ID / KALSHI_WATCHDOG_PRIVATE_KEY_PATH
-  (a key restricted to the runner's subaccount), put in System 1's own env file named by
+  job): the runner REFUSES to start without a fresh data/run/heartbeat.json.watchdog beat for its
+  subaccount (written by this agent every second) and blocks new orders while the beat is older
+  than watchdog.runner_max_age_s (10 s). --arm-on-start: a watchdog restarted while the runner
+  died meanwhile still triggers the runner's order groups and cancels subaccount
+  venue.subaccount's orders (on the shared account: by id, never the bulk cancel-all). It reads
+  the same config/live.yaml as the runner (kill file / heartbeat under data/run on macOS; no
+  fallback to the example config) and its credentials from the environment:
+  KALSHI_WATCHDOG_KEY_ID / KALSHI_WATCHDOG_PRIVATE_KEY_PATH (a key restricted to the runner's
+  subaccount; REQUIRED on a shared account), put in System 1's own env file named by
   config/kalshi.yaml auth.env_file (launchd agents do not inherit the shell environment).
   caffeinate -i keeps the Mac from idle-sleeping while it runs (not on lid close).
   Paths are absolute for this host (/Users/thomast/Desktop/delta-hedged).
@@ -42,8 +46,10 @@
 
   <key>RunAtLoad</key>
   <true/>
-  <!-- always restart: the dead-man switch must not stay down (exit 2 = a config refusal, e.g.
-       venue.shared_account with subaccount 0: fix the config, launchd keeps retrying) -->
+  <!-- always restart: the dead-man switch must not stay down (exit 2 = a refusal: no
+       config/live.yaml, venue.subaccount / venue.shared_account not stated, subaccount 0, no
+       watchdog key on the shared account: fix it, launchd keeps retrying every 10 s; meanwhile
+       the heartbeat.json.watchdog beat is missing or stale and the live runner will not trade) -->
   <key>KeepAlive</key>
   <true/>
   <key>ThrottleInterval</key>

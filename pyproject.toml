@@ -42,5 +42,6 @@ asyncio_mode = "auto"
 markers = [
   "slow: long-running research/regression tests",
   "network: requires outbound network access to exchanges (skipped by default)",
+  "real_guards: tests/live: use the live app's REAL watchdog-beat and free-disk checks (default: healthy stand-ins)",
 ]
 addopts = "-m 'not network'"

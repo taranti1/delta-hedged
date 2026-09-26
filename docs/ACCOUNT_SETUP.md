@@ -18,11 +18,20 @@ You run every step yourself with `scripts/account_setup.py`. The tool:
   Moving money back into subaccount 0 is deliberately not supported;
 * refuses a transfer out of subaccount 0 while a System 2 process runs, and checks again just
   before sending;
-* saves the transfer's idempotency key before sending, so re-running the same command after a
-  timeout cannot apply the transfer twice;
+* saves the transfer's idempotency key (and the balances read just before the FIRST attempt)
+  before sending, so re-running the same command after a timeout cannot apply the transfer
+  twice. Once a request may have left, the key is **never** dropped by the tool, whatever a
+  retry is answered (timeout, 5xx, 400, 409, 200, no connection): "applied / not applied" is
+  decided from evidence (the subaccount balance deltas since the first attempt, exactly
+  -amount / +amount within 1 cent, and `GET /portfolio/subaccounts/transfers`);
 * logs every write attempt to `data/logs/account_setup.jsonl` (git-ignored). No key material is
-  logged, and key ids are masked. Unresolved transfers are kept in
-  `data/logs/account_setup_state.json`.
+  logged, and key ids are masked;
+* keeps unresolved and finished transfers in ONE **per-user** state file, shared by every
+  checkout and worktree: `~/.kalshi/dh_account_setup/state.<env>.json` (`state.prod.json`;
+  override with `DH_ACCOUNT_SETUP_STATE=<path>` or `--state-file`). A second checkout therefore
+  sees the saved id and cannot silently start over. The old per-checkout file
+  `data/logs/account_setup_state.json` is moved into it on first use; if both exist and the old
+  one still holds an unresolved transfer, every command refuses until you merge it by hand.
 
 Exit codes: `0` done or dry run, `1` failed, outcome unknown or partial, `2` refused or bad
 arguments (nothing sent), `3` the typed confirmation did not match (nothing sent).
@@ -35,8 +44,8 @@ arguments (nothing sent), `3` the typed confirmation did not match (nothing sent
 | API tier | `GET /account/limits` (GetAccountApiLimits) | `usage_tier`; the account is **basic** today |
 | Upgrade to Advanced | `POST /account/api_usage_level/upgrade`, no body (UpgradeAccountApiUsageLevel) | self-serve, permanent grant. Criterion: at least 1 of the account's last 100 Predictions orders was created via the API (System 2's are). 403 otherwise. Costs 30 write tokens. Account-wide: budgets go from Basic read 200 / write 100 to Advanced 300 / 300 tokens/s |
 | Create subaccount | `POST /portfolio/subaccounts` `{"exchange_index": 2}` (CreateSubaccount) | Advanced tier or above. API only: the web and mobile apps do not support subaccounts. Numbers 1-63, assigned in sequence. `exchange_index` defaults to 0, and all KXBTC* markets are on shard 2. **Not idempotent**: each call creates the next number |
-| Same-shard transfer | `POST /portfolio/subaccounts/transfer` `{client_transfer_id (uuid, required), from_subaccount, to_subaccount, amount_cents, exchange_index}` (ApplySubaccountTransfer) | amounts in **cents**. `exchange_index` defaults to 0. Idempotent on `client_transfer_id`: a retry with the same id returns 409 (getting_started/subaccounts) |
-| Cross-shard transfer | `POST /portfolio/intra_exchange_instance_transfer` `{source: "event_contract", destination: "event_contract", amount, source_exchange_shard, destination_exchange_shard, source_subaccount, destination_subaccount}` (IntraExchangeInstanceTransfer) | `amount` in **centicents** ($150 = 1,500,000). Asynchronous: the response is `{transfer_id}`, and `GET /portfolio/intra_exchange_instance_transfers/{transfer_id}` reports `status` `pending` or `complete`. Across shards with subaccounts it runs in up to **three non-atomic steps**; a failed later step leaves the money in the primary account on the source or destination shard. No idempotency key |
+| Same-shard transfer | `POST /portfolio/subaccounts/transfer` `{client_transfer_id (uuid, required), from_subaccount, to_subaccount, amount_cents, exchange_index}` (ApplySubaccountTransfer) | amounts in **cents**. `exchange_index` defaults to 0. Idempotent on `client_transfer_id`: a retry with the same id returns 409 per getting_started/subaccounts, but openapi 3.31.0 lists only 200/400/401/500, so the tool never trusts the retry's status: it decides from the balances and `GET /portfolio/subaccounts/transfers` (GetSubaccountTransfers: `from_subaccount, to_subaccount, amount_cents, exchange_index, created_ts`) |
+| Cross-shard transfer | `POST /portfolio/intra_exchange_instance_transfer` `{source: "event_contract", destination: "event_contract", amount, source_exchange_shard, destination_exchange_shard, source_subaccount, destination_subaccount}` (IntraExchangeInstanceTransfer) | `amount` in **centicents** in the REQUEST ($150 = 1,500,000; $1 = 10,000), while the listed transfer's `amount` is FixedPointDollars: an unusual mix, hence the mandatory $1 probe (step 5). Asynchronous: the response is `{transfer_id}`, and `GET /portfolio/intra_exchange_instance_transfers/{transfer_id}` reports `status` `pending` or `complete`. Across shards with subaccounts it runs in up to **three non-atomic steps**; a failed later step leaves the money in the primary account on the source or destination shard. No idempotency key |
 | Balances | `GET /portfolio/subaccounts/balances` (GetSubaccountBalances) | one row per (subaccount, exchange_index), balance in dollars. Subaccount balances are local to a shard |
 | System 2's balance read | `GET /portfolio/balance` with no parameters (GetBalance) | the **primary** account's aggregate over all shards (changelog 2026-08-13). So a transfer out of subaccount 0 lowers it, and a move between shards of subaccount 0 does not (System 2 D-059) |
 | Netting | `GET` / `PUT /portfolio/subaccounts/netting` `{subaccount_number, enabled}` | per subaccount |
@@ -221,29 +230,54 @@ python scripts/account_setup.py transfer --from 0 --to 1 --amount-dollars 150 --
 ```
 
 **B. The usual case: the primary account's cash is on shard 0.** This funds shard 2 and
-subaccount 1 in one cross-shard transfer:
+subaccount 1 in one cross-shard transfer. **First step, mandatory: a $1 probe on the same
+route** (the tool refuses a full shard-transfer until a probe on that route completed
+exactly):
 ```sh
 python scripts/account_setup.py shard-transfer --from-subaccount 0 --from-shard 0 \
-  --to-subaccount 1 --to-shard 2 --amount-dollars 150              # dry run; add --execute, type: 150
+  --to-subaccount 1 --to-shard 2 --probe-dollars 1                 # dry run; add --execute, type: 1
+python scripts/account_setup.py shard-transfer --from-subaccount 0 --from-shard 0 \
+  --to-subaccount 1 --to-shard 2 --amount-dollars 149              # after the probe; add --execute, type: 149
 ```
-The tool then polls the transfer's status every 2 s for up to 180 s (`--timeout-s`) and
-compares the balances before and after:
-* **Complete**: subaccount 1 on shard 2 received $150.
+(Probe $1 + $149 = $150. Each transfer out of subaccount 0 gets its own System 2 declaration,
+step 6: declare both.) The probe sends 10,000 centicents; if Kalshi read the unit differently,
+the mistake costs $1 (or $100), not the allocation. The tool polls the transfer's status every
+2 s for up to 180 s (`--timeout-s`) and compares the balances read just before sending with
+those after. The result must match the amount EXACTLY (1 cent tolerance: the destination
++amount, the source -amount, nothing else moved) and the listed amount must equal the request:
+* **Complete**: subaccount 1 on shard 2 received exactly the amount.
+* **ALARM / mismatch** (exit 1): the balances moved by anything else (e.g. 100x: a unit
+  mistake) or the listed amount differs. STOP, check `status` and the Kalshi transfer history;
+  the declaration printed for System 2 uses what really left subaccount 0.
 * **PARTIAL**: Kalshi reports the transfer complete, but the money stopped part-way (the
   non-atomic steps). The tool shows where it went. If it sits in subaccount 0 on shard 2,
   finish with the command of case A, which the tool prints. If it is still on shard 0, nothing
   moved.
 * **Still pending** at the timeout: the transfer stays unresolved. Check later with
-  `python scripts/account_setup.py shard-transfer --resume <transfer_id>`.
+  `python scripts/account_setup.py shard-transfer --resume <transfer_id>`. `--resume` of a
+  transfer out of subaccount 0 checks again that no System 2 process runs (its final balance
+  reading closes System 2's bracket); `--i-stopped-system2` overrides as usual.
+* A transfer identical to one already completed (same route and amount) is refused unless you
+  pass `--again` (same for `transfer`).
 
 Instead of case B you can move primary cash to shard 2 in the Kalshi web app
 (kalshi.com/account/exchange-indexes) and then use case A. A move between shards of subaccount
 0 needs no System 2 declaration (D-059).
 
-**Unknown outcome** (timeout, 5xx):
-* `transfer`: re-run the **same** command. It reuses the saved `client_transfer_id`; if the
-  first attempt was applied, Kalshi answers 409 and the tool records the transfer as applied.
-  Any other transfer is refused until this one is resolved.
+**Unknown outcome** (timeout, 5xx, or any answer to a retry):
+* `transfer`: re-run the **same** command. It reuses the saved `client_transfer_id` and first
+  checks the evidence: if the balances since the FIRST attempt already show the move (or the
+  transfer list does), it records the transfer as applied without sending anything. Otherwise
+  it sends the same id again; whatever that retry is answered (200, 400, 409, 5xx, no
+  connection), the id stays saved and the outcome comes from the evidence:
+  * **applied**: completed, with the System 2 declaration bracketed from the FIRST attempt's
+    reading (a 200 on a retry still requires the declaration);
+  * **not applied so far** (nothing moved, nothing listed): nothing to declare (a 409 without a
+    balance move never asks you to declare money that did not move). Re-run later, or, once
+    `status` confirms nothing moved, `forget-pending --id <id>` and send a new transfer;
+  * **inconclusive**: it stays unresolved; check `status` before anything else.
+  Only when the ONLY attempt was refused (4xx) or never connected is the id dropped (definitely
+  not applied). Any other transfer is refused until this one is resolved.
 * `shard-transfer`: this API has no idempotency key, so the tool refuses any further transfer.
   Run `status` and look at "recent transfers". If the transfer is listed, run
   `shard-transfer --resume <id>`. If it is not, run `forget-pending --id <local id>`, which
@@ -253,7 +287,8 @@ Instead of case B you can move primary cash to shard 2 in the Kalshi web app
 
 After a transfer out of subaccount 0, the tool:
 * reads the unscoped `GET /portfolio/balance`, the read System 2's cash parity uses, just
-  before and just after the transfer;
+  before the FIRST attempt and just after the transfer is confirmed applied (so after a retry
+  the bracket still opens before the attempt that may have applied it);
 * prints the exact command below, with the real times filled in;
 * shows it again in `status` until System 2's ledger holds the row.
 
@@ -329,7 +364,10 @@ python scripts/account_setup.py status                                       # e
 * **System 2:** its next settlement check shows a zero parity residual (the declaration was
   right). Its launch preflight still finds at least $50 on each shard it trades.
 * **System 1 configuration:**
-  * `config/live.yaml`: `venue.subaccount: 1`.
+  * `config/live.yaml`: `venue.subaccount: 1`, `venue.shared_account: true` and
+    `venue.key_restricted_to_subaccount: true`, written in the file (live mode and the watchdog
+    refuse a config that leaves them out). The live start-up proves the key restriction:
+    `GET /portfolio/balance?subaccount=0` must be refused (401/403) with the runner key.
   * `config/kalshi.yaml`: points at `~/.kalshi/dh-sub1.env`; `rate_limits.account_share` stays
     0.2 (budgets are per account and shared).
   * The start-up balance check (reconciliation finding 4) should read
@@ -349,7 +387,8 @@ python scripts/account_setup.py status                                       # e
   * Once the setup is finished, delete `config/kalshi.admin.yaml`: System 1 must not hold the
     unrestricted key. `account_setup.py` then falls back to `config/kalshi.yaml` and refuses
     admin steps with the restricted key.
-* **Audit trail:** keep `data/logs/account_setup.jsonl` and `data/logs/account_setup_state.json`.
+* **Audit trail:** keep `data/logs/account_setup.jsonl` and
+  `~/.kalshi/dh_account_setup/state.prod.json` (the per-user transfer state).
 * **Money back to subaccount 0** (a later reallocation or shutdown) is not supported by this
   tool. It is a manual transfer, and System 2 needs its own declaration: a deposit, with a
   positive `--amount`.
@@ -362,14 +401,17 @@ python scripts/account_setup.py status                                       # e
 | `upgrade-tier --to advanced` | `POST /account/api_usage_level/upgrade` | `advanced` | skipped when already Advanced+ |
 | `create-subaccount --exchange-index N [--another]` | `POST /portfolio/subaccounts` | `CREATE N` | tier Advanced+; refuses when a numbered subaccount exists |
 | `create-key --subaccount N --name X --pem P --env-file E --id-var A --path-var B` | `POST /api_keys/generate` | the key name | N >= 1 exists; P and E outside the repo; P new; A and B not already in E |
-| `transfer --from F --to T --amount-dollars D --exchange-index N [--i-stopped-system2]` | `POST /portfolio/subaccounts/transfer` | the amount | T >= 1; System 2 check when F = 0; balance check; saved `client_transfer_id` |
-| `shard-transfer --from-subaccount F --from-shard S --to-subaccount T --to-shard U --amount-dollars D` | `POST /portfolio/intra_exchange_instance_transfer`, then polls | the amount | T >= 1; S != U; System 2 check when F = 0; refuses while anything is unresolved |
-| `shard-transfer --resume ID` | GETs only | none | none |
+| `transfer --from F --to T --amount-dollars D --exchange-index N [--i-stopped-system2] [--again]` | `POST /portfolio/subaccounts/transfer` | the amount | T >= 1; System 2 check when F = 0; balance check; saved `client_transfer_id` (per-user state), outcome decided by evidence; an identical completed transfer needs `--again` |
+| `shard-transfer --from-subaccount F --from-shard S --to-subaccount T --to-shard U --probe-dollars P` | the same, a test of at most $5 | the amount | as below; MANDATORY first on each route |
+| `shard-transfer --from-subaccount F --from-shard S --to-subaccount T --to-shard U --amount-dollars D [--again]` | `POST /portfolio/intra_exchange_instance_transfer`, then polls | the amount | T >= 1; S != U; System 2 check when F = 0; a completed exact probe on the route; refuses while anything is unresolved; exact deltas (1 cent) |
+| `shard-transfer --resume ID [--i-stopped-system2]` | GETs only | none | System 2 check when the transfer is out of subaccount 0 |
 | `set-netting --subaccount N --on/--off` | `PUT /portfolio/subaccounts/netting` | `netting off N` | N >= 1 exists |
 | `forget-pending --id ID` | nothing (local state) | the id | none |
 
-Global options: `--config PATH`, `--demo`, `--system2-root PATH`. All write commands take
+Global options: `--config PATH`, `--demo`, `--system2-root PATH`, `--state-file PATH`
+(default `~/.kalshi/dh_account_setup/state.<env>.json`, or `$DH_ACCOUNT_SETUP_STATE`). All write commands take
 `--execute`. Amounts are dollars with at most 2 decimals, at most $1,000 (typo guard).
 
 Tests: `tests/kalshi/test_account_setup.py` (fake REST client; request bodies validated
-against the openapi schemas).
+against the openapi schemas) and `tests/kalshi/test_prelive_account_setup.py` (the pre-live
+review's retry / 400 / 409 / 200 / not-sent / over-move / probe / state-location cases).

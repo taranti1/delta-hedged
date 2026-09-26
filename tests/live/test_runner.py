@@ -44,8 +44,9 @@ P_MS = 50
 
 
 def cfg(mode: str = "live", loop: dict | None = None, **venue) -> LiveConfig:
-    v = dict(positions_interval_s=0.0, queue_positions_interval_s=0.0, ghost_sweep=False, fills_backfill_interval_s=0.0,
-             reconnect_settle_s=0.0)
+    # the primary account, explicitly (a test account shared with nobody)
+    v = dict(subaccount=0, shared_account=False, allow_primary_account=True, positions_interval_s=0.0,
+             queue_positions_interval_s=0.0, ghost_sweep=False, fills_backfill_interval_s=0.0, reconnect_settle_s=0.0)
     v.update(venue)
     lc = dict(heartbeat_interval_s=0.05, kill_check_interval_s=0.02, clock_sample_s=0.0, metrics_refresh_s=0.05,
               shutdown_timeout_s=2.0, max_lag_s=5.0, lag_resume_s=0.0, risk_state_interval_s=0.0)

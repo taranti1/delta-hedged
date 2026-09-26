@@ -369,8 +369,9 @@ def test_anchored_clock_is_monotonic_and_strict_across_wall_steps():
     mono["t"] += NS_PER_S
     wall["t"] -= 30 * NS_PER_S  # the wall clock is stepped back 30 s
     b = c()
-    assert b == a + NS_PER_S  # follows the monotonic clock, never the step
-    assert c.drift_ns() == pytest.approx(-31 * NS_PER_S, abs=10)
+    # follows the monotonic clock, never the step: the slew toward the wall clock is <= 50 ppm
+    assert a + NS_PER_S - 50_000 <= b <= a + NS_PER_S
+    assert c.drift_ns() == pytest.approx(-31 * NS_PER_S, abs=50_000)
 
 
 def test_session_token():

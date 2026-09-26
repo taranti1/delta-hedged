@@ -29,10 +29,15 @@ async def test_backfill_orders_and_reconcile_commands(tmp_path):
     assert out[-1] == "1 resting orders (subaccount 2)"
     # balance of the subaccount on every configured shard vs the start-up requirement ($50 + margin)
     rest.balances = {2: "75.0000"}
-    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 0
+    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1, shared_account=True)), rest, out.append) == 0
     assert rest.of("get_balance")[-1][1] == {"subaccount": 1, "exchange_index": 2} and out[-1].endswith("OK")
     rest.balances = {2: "59.0000"}
-    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 1 and "TOO LOW" in out[-1]
+    assert await cmd_balance(LiveConfig(venue=VenueCfg(subaccount=1, shared_account=True)), rest, out.append) == 1 \
+        and "TOO LOW" in out[-1]
+    # a config that does not name the subaccount is refused (never System 2's subaccount 0 by default)
+    n = len(rest.calls)
+    assert await cmd_orders(LiveConfig(), rest, out.append) == 2 and "venue.subaccount" in out[-1]
+    assert len(rest.calls) == n
     # reconcile: log.fill vs exchange fills
     log = tmp_path / "live-x.jsonl"
     jl = JsonLog(log, "c", "s")
@@ -41,10 +46,10 @@ async def test_backfill_orders_and_reconcile_commands(tmp_path):
     jl.write("log.fill", t0 + NS_PER_S, ticker="KXBTCD-X", coid="c-1", side="bid", px=4500, qty=200, taker=False, fee=10_000)
     jl.close()
     rest.fills = [{"fill_id": "f", "trade_id": "f", "ticker": "KXBTCD-X", "count_fp": "2.00", "fee_cost": "0.010000"}]
-    assert await cmd_reconcile(str(log), LiveConfig(), rest, out.append) == 0
+    assert await cmd_reconcile(str(log), LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 0
     assert out[-1] == "0 tickers mismatched" and rest.of("iter_fills")[0][1]["min_ts"] == t0 // NS_PER_S - 60
     rest.fills[0]["count_fp"] = "3.00"
-    assert await cmd_reconcile(str(log), LiveConfig(), rest, out.append) == 1
+    assert await cmd_reconcile(str(log), LiveConfig(venue=VenueCfg(subaccount=1)), rest, out.append) == 1
 
 
 async def test_ledger_and_replay_commands_on_a_recorded_session(tmp_path):

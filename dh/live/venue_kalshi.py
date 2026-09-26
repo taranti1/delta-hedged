@@ -116,7 +116,7 @@ from dh.kalshi.orders import (
 )
 from dh.kalshi.rest import KalshiError, KalshiHTTPError, NotSentError, UnknownOutcome
 from dh.kalshi.wire import ms_to_ns, opt_iso_to_ns, opt_qty
-from dh.live.config import VenueCfg
+from dh.live.config import VenueCfg, subaccount_problems
 
 log = logging.getLogger("dh.live.venue")
 
@@ -301,9 +301,10 @@ class KalshiVenue:
         self.on_group_map: Callable[[str, str], None] | None = None  # (logical, exchange id) recorder hook
         self.group_limits: dict[str, int] = {}
         self.stats = VenueStats()
-        self.sub = self.cfg.sub  # explicit subaccount on every request (0 = primary)
-        if self.cfg.shared_account and self.sub == 0:
-            raise ValueError("venue.shared_account: refusing to trade subaccount 0 (the other system's)")
+        problems = subaccount_problems(self.cfg)  # explicit subaccount AND shared flag; 0 only when allowed
+        if problems:
+            raise ValueError("; ".join(problems))
+        self.sub = self.cfg.sub  # explicit subaccount on every request
         self.shard_of: dict[str, int] = {}  # ticker -> exchange shard (MarketSpec.exchange_index)
         self.kill_latched = ""  # kill switch reason: groups triggered, no group created or reset again
         self._oid_shard: dict[str, int] = {}  # order id -> shard, from REST Order rows (bounded)
@@ -711,11 +712,64 @@ class KalshiVenue:
         self._emit(cancel_result_to_events(res, a, recv))
 
     # ================================================================== cancel all
+    @property
+    def bulk_cancel_allowed(self) -> bool:
+        """The BULK cancel-all endpoint may be used only on an account declared NOT shared
+        (``VenueCfg.bulk_cancel_allowed``); a shared account cancels by id (``scoped_cancel_all``)."""
+        return self.cfg.bulk_cancel_allowed
+
     async def cancel_all_now(self, reason: str, *, attempts: int = 5) -> bool:
+        """Cancel every resting order of our subaccount. Non-shared account: the bulk
+        DELETE /portfolio/events/orders (``_bulk_cancel_all``). Shared account: NEVER the bulk
+        endpoint (its one-minute tail's subaccount scope is unverified): the resting-order list
+        of our subaccount, cancelled by id, repeated until empty (``scoped_cancel_all``; order
+        groups are triggered first by ``latch_kill`` on every terminal path). True on success."""
+        if self.bulk_cancel_allowed:
+            return await self._bulk_cancel_all(reason, attempts=attempts)
+        for i in range(max(1, attempts)):
+            try:
+                left = await self.scoped_cancel_all(reason)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the resting-order list failed: retry
+                self._log("cancel_all_error", reason=reason, scoped=True, error=f"{type(exc).__name__}: {exc}"[:200])
+                await self._sleep(self._backoff_ns(i) / NS_PER_S)
+                continue
+            return not left
+        return False
+
+    async def scoped_cancel_all(self, reason: str, *, rounds: int | None = None, wait_s: float = 2.0) -> list[dict[str, Any]]:
+        """Shared-account cancel-all: GET /portfolio/orders?status=resting&subaccount=<ours> and a
+        batch cancel BY ID (every item names our subaccount and the order's own shard), repeated
+        until the list is empty or after ``rounds`` (venue.cancel_rounds). Returns the orders
+        still resting ([] = confirmed clean). Raises when the list cannot be read."""
+        n_rounds = max(1, int(self.cfg.cancel_rounds if rounds is None else rounds))
+        self.stats.bump("cancel_all_scoped")
+        for rnd in range(n_rounds):
+            left = await self.resting_orders()
+            if not left:
+                self._log("cancel_all", reason=reason, scoped=True, rounds=rnd)
+                return []
+            self._log("cancel_all_round", reason=reason, scoped=True, n=len(left), round=rnd + 1)
+            self.cancel_orders([CancelOrder(str(o.get("client_order_id") or ""), str(o.get("ticker") or ""),
+                                            str(o["order_id"]), reason=f"cancel_all:{reason}") for o in left if o.get("order_id")])
+            await self.wait_idle(wait_s)
+            await self._sleep(0.5 * (rnd + 1))
+        left = await self.resting_orders()
+        if left:
+            log.error("CANCEL-ALL (by id) UNCONFIRMED: %d orders of subaccount %d still resting after %d rounds (%s)",
+                      len(left), self.sub, n_rounds, reason)
+            self._log("cancel_all_leftovers", reason=reason, scoped=True, n=len(left),
+                      oids=[o.get("order_id") for o in left][:20])
+        return left
+
+    async def _bulk_cancel_all(self, reason: str, *, attempts: int = 5) -> bool:
         """DELETE /portfolio/events/orders?subaccount=<ours>, retried on unknown outcomes /
         throttling (cancel-all is idempotent). True on a 2xx. Kalshi may also cancel orders
         placed during the minute after the request (``last_cancel_all_ns``: the runner holds
-        new orders for ``cancel_all_hold_s``)."""
+        new orders for ``cancel_all_hold_s``). NEVER on a shared account (raises)."""
+        if not self.bulk_cancel_allowed:
+            raise RuntimeError("the bulk cancel-all is forbidden on a shared account (venue.shared_account)")
         for i in range(max(1, attempts)):
             self.stats.bump("cancel_all")
             t0 = self._mono()
@@ -755,8 +809,10 @@ class KalshiVenue:
         """Cancel-all, then confirm with the resting-order list; whatever still rests is
         cancelled individually (the read API can lag the cancel a moment). Returns the orders
         still resting after ``rounds`` checks ([] = verified clean). Raises if the cancel-all
-        itself failed."""
-        if not await self.cancel_all_now(reason):
+        itself failed. Shared account: ``scoped_cancel_all`` (list + cancel by id, no bulk)."""
+        if not self.bulk_cancel_allowed:
+            return await self.scoped_cancel_all(reason, rounds=max(1, rounds), wait_s=wait_s)
+        if not await self._bulk_cancel_all(reason):
             raise RuntimeError(f"cancel-all failed ({reason})")
         left: list[dict[str, Any]] = []
         for attempt in range(max(1, rounds)):
@@ -1288,12 +1344,16 @@ class KalshiVenue:
                        GET /portfolio/positions?subaccount&exchange_index)
             resting    the collateral of the resting orders (GET /portfolio/orders?status=
                        resting&subaccount&exchange_index: a bid px x remaining, an ask
-                       (1 - px) x remaining)
+                       (1 - px) x remaining), EXCEPT the part of an order that closes a held
+                       position (an ask against a long YES position, a bid against a short
+                       one): Kalshi reserves nothing for it, so counting it would overstate
+                       the funds (review L2)
             funds      their sum: what the shard holds for this system at cost, so our own
                        quotes and fills never make it look defunded (a real loss lowers it)
         {shard: {..., "body": GetBalanceResponse}}; ``funds`` None when the balance is
         unreadable. Raises on a failed read."""
         from dh.core.units import PX_SCALE, px_from_dollars
+        from dh.kalshi.normalize import market_position
 
         out: dict[int, dict[str, Any]] = {}
         for sh in sorted(set(self.cfg.exchange_indexes)):
@@ -1302,22 +1362,37 @@ class KalshiVenue:
             avail = balance_dollars(body)
             pos = await self.rest.get_all_positions(count_filter="position", subaccount=self.sub, exchange_index=sh)
             cost = 0.0
+            held: dict[str, int] = {}  # ticker -> signed YES position (qty units)
             for m in pos.get("market_positions") or []:
                 try:
                     cost += abs(float(str(m.get("market_exposure_dollars") or "0")))
                 except ValueError:
+                    pass
+                try:
+                    mp = market_position(m)
+                except (KeyError, ValueError, TypeError):
                     continue
+                if mp.ticker:
+                    held[mp.ticker] = held.get(mp.ticker, 0) + int(mp.position)
             rows = [o async for o in self.rest.iter_orders(status="resting", subaccount=self.sub, exchange_index=sh)]
             self._learn_rows(rows)
             reserved = 0.0
-            for o in rows:
+            closable_long = {t: q for t, q in held.items() if q > 0}  # asks closing a long YES position
+            closable_short = {t: -q for t, q in held.items() if q < 0}  # bids closing a short (NO) position
+            for o in sorted(rows, key=lambda r: str(r.get("order_id") or "")):
                 try:
                     px = px_from_dollars(str(o.get("yes_price_dollars")))
                     rem = qty_from_fp(str(o.get("remaining_count_fp") or "0"))
                 except (TypeError, ValueError, ArithmeticError):
                     continue
-                per = px if str(o.get("book_side") or "") == "bid" else PX_SCALE - px
-                reserved += per * rem / 1e6  # px (1e-4 $) x qty (1e-2) = 1e-6 $
+                t = str(o.get("ticker") or "")
+                bid = str(o.get("book_side") or "") == "bid"
+                room = closable_short if bid else closable_long
+                closing = min(rem, max(0, room.get(t, 0)))
+                if closing:
+                    room[t] -= closing
+                per = px if bid else PX_SCALE - px
+                reserved += per * (rem - closing) / 1e6  # px (1e-4 $) x qty (1e-2) = 1e-6 $
             out[sh] = {"available": avail, "positions": round(cost, 6), "resting": round(reserved, 6),
                        "funds": None if avail is None else round(avail + cost + reserved, 6), "body": body}
         return out

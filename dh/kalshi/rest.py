@@ -49,6 +49,22 @@ PROD_REST_URL = "https://external-api.kalshi.com/trade-api/v2"
 PROD_REST_URL_ALT = "https://api.elections.kalshi.com/trade-api/v2"
 DEMO_REST_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 DEFAULT_CF_HISTORY_PATH = "/cfbenchmarks/history/values"
+BULK_CANCEL_PATH = "/portfolio/events/orders"  # DELETE = the bulk cancel-all (CancelAllOrdersV2)
+
+
+def is_reducing_write(method: str, path: str) -> bool:
+    """A write that can only reduce what rests (cancel one / a batch, decrease, order-group
+    trigger / delete): it may name any exchange shard of the subaccount (or -1, Kalshi's
+    documented auto-route by market ticker for a cancel). Creates, amends and order-group
+    create / reset / limit must name one of the client's configured shards."""
+    m = method.upper()
+    if m == "DELETE" and path.startswith(BULK_CANCEL_PATH + "/"):
+        return True  # DELETE /portfolio/events/orders/{id} and /batched
+    if m == "POST" and path.startswith(BULK_CANCEL_PATH + "/") and path.endswith("/decrease"):
+        return True
+    if path.startswith("/portfolio/order_groups/") and (m == "DELETE" or (m == "PUT" and path.endswith("/trigger"))):
+        return True
+    return False
 
 RawCallback = Callable[[str, int, bytes], None]
 Params = Sequence[tuple[str, str]]
@@ -243,6 +259,8 @@ class KalshiRest:
         trust_env: bool = True,
         read_only: bool = False,
         write_subaccount: int | None = None,
+        write_shards: Sequence[int] | None = None,
+        forbid_bulk_cancel: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         # read_only: every non-GET/HEAD request raises ReadOnlyViolation BEFORE anything is
@@ -252,6 +270,14 @@ class KalshiRest:
         # of a batch) and an exchange_index (all but cancel-all, which has none), else it raises
         # UnscopedWriteError before anything is signed or sent (the live runner and watchdog)
         self.write_subaccount = None if write_subaccount is None else int(write_subaccount)
+        # write_shards: the exchange shards this client may create / amend / manage groups on
+        # (venue.exchange_indexes); anything else (shard 0 included) is refused before sending.
+        # Order-REDUCING writes (cancel, batch cancel, decrease, group trigger / delete) may name
+        # any shard of the subaccount, or -1 (Kalshi's documented auto-route by ticker).
+        self.write_shards = None if write_shards is None else frozenset(int(x) for x in write_shards)
+        # forbid_bulk_cancel: DELETE /portfolio/events/orders (bulk cancel-all) is refused before
+        # sending (a SHARED account: its one-minute tail may not honour ``subaccount``)
+        self.forbid_bulk_cancel = bool(forbid_bulk_cancel)
         self.signer = signer
         self.limiter = limiter
         self.on_raw = on_raw
@@ -419,10 +445,15 @@ class KalshiRest:
         (body ``{"orders": [...]}``) needs both on EVERY item. ``exchange_index`` is required on
         every write except cancel-all (DELETE /portfolio/events/orders spans every shard); -1
         (documented "require auto-routing by ticker") counts as explicit."""
+        bulk = method.upper() == "DELETE" and path == BULK_CANCEL_PATH
+        if bulk and self.forbid_bulk_cancel:
+            return ("the bulk cancel-all DELETE /portfolio/events/orders is forbidden on this client (shared account: "
+                    "cancel by id instead)")
         sub = self.write_subaccount
         if sub is None:
             return ""
-        need_shard = not (method.upper() == "DELETE" and path == "/portfolio/events/orders")
+        need_shard = not bulk
+        reducing = is_reducing_write(method, path)
         scopes: list[tuple[str, dict[str, Any]]]
         if isinstance(json_body, dict) and isinstance(json_body.get("orders"), list):
             items = json_body["orders"]
@@ -454,6 +485,11 @@ class KalshiRest:
                     return f"{where}: unparseable exchange_index {s!r}"
                 if si < -1:
                     return f"{where}: invalid exchange_index {si}"
+                if not reducing and si == -1:
+                    return f"{where}: exchange_index -1 (auto-route) is allowed on cancels only"
+                if not reducing and self.write_shards is not None and si not in self.write_shards:
+                    return (f"{where}: exchange_index {si} is not one of this client's shards "
+                            f"{sorted(self.write_shards)} (venue.exchange_indexes)")
         return ""
 
     async def paginate(

@@ -130,17 +130,26 @@ class LoopCfg:
 
 @dataclass(frozen=True)
 class VenueCfg:
-    # Kalshi subaccount (null / 0 = primary). ALWAYS sent explicitly (0 for primary): Kalshi
-    # reads an omitted subaccount as "all subaccounts" on GET orders/fills and cancel-all.
+    # Kalshi subaccount. ALWAYS sent explicitly: Kalshi reads an omitted subaccount as "all
+    # subaccounts" on GET orders/fills and cancel-all. FAIL-CLOSED: None = NOT CONFIGURED, which
+    # live mode, the venue and the watchdog refuse (no default may yield subaccount 0 silently);
+    # 0 (the primary account) only with allow_primary_account: true AND shared_account: false.
     subaccount: int | None = None
     # The Kalshi account is SHARED with another live system (which owns subaccount 0): live mode
-    # refuses subaccount null/0 and rate_limits.account_share > 0.5, and the REST client refuses
-    # any write that does not name this subaccount explicitly.
-    shared_account: bool = False
+    # refuses subaccount 0 and rate_limits.account_share > 0.5, requires
+    # key_restricted_to_subaccount, never calls the bulk cancel-all (DELETE /portfolio/events/
+    # orders: its one-minute tail's subaccount scope is unverified), and the REST client refuses
+    # any write that does not name this subaccount explicitly. None = NOT CONFIGURED (refused
+    # live): it must be stated in the file.
+    shared_account: bool | None = None
     # The API key(s) are restricted to ``subaccount`` (Kalshi scopes the private WebSocket
     # channels server-side): a fill / user_order / market_position without a subaccount field is
-    # this subaccount's. Verified at live start-up (GET /api_keys, else the balance breakdown).
+    # this subaccount's. Proven at live start-up: GET /portfolio/balance?subaccount=0 must be
+    # REFUSED (401/403) with the runner key (GET /api_keys is secondary evidence).
     key_restricted_to_subaccount: bool = False
+    # The only way to trade the PRIMARY account (subaccount 0): an explicit opt-in, and only on
+    # an account shared with nobody (shared_account: false).
+    allow_primary_account: bool = False
     # Exchange shards this runner trades and has funded (all KXBTC* markets: shard 2). A market on
     # an unknown or other shard is never traded; one order group per shard in use; the balance of
     # every listed shard is checked at start-up and every balance_interval_s.
@@ -148,7 +157,10 @@ class VenueCfg:
     # funds per shard (available + our positions at cost + resting collateral) >= worst-case loss (m1) + this
     min_balance_margin_dollars: float = 10.0
     balance_interval_s: float = 60.0  # GET /portfolio/balance re-read; below the requirement -> new orders blocked
+    balance_max_failures: int = 3  # this many failed balance reads in a row close the gate 'balance' (fail closed)
     exchange_status_interval_s: float = 10.0  # GET /exchange/status poll (trading pauses); live: > 0
+    # this many failed status polls in a row close the gate 'exchange_pause' (reason: status unreadable)
+    exchange_status_max_failures: int = 3
     exchange_schedule_interval_s: float = 3600.0  # GET /exchange/schedule (maintenance, weekly pause)
     pause_lead_s: float = 60.0  # pull quotes this long before a scheduled closure starts
     pause_reject_hold_s: float = 30.0  # a place rejected for a pause keeps the pause gate closed this long
@@ -168,6 +180,11 @@ class VenueCfg:
     read_reserve_tokens: float = 30.0  # skip optional polls when the read bucket is below this
     positions_interval_s: float = 30.0  # GET /portfolio/positions reconciliation; 0 = off
     position_confirm_s: float = 5.0  # a mismatch must persist this long before it halts
+    # a positions read older than the last WS fill OF THAT MARKET is not trusted to confirm a
+    # mismatch (deferred), at most this many times / this long after the mismatch was first
+    # seen; then the next read whose user-data timestamp is newer than that first sight confirms
+    position_defer_max: int = 5
+    position_defer_max_s: float = 60.0
     ghost_sweep: bool = True  # cancel resting orders the strategy does not know about
     fills_backfill_interval_s: float = 60.0  # GET /portfolio/fills safety net (0 = off)
     fills_backfill_margin_s: float = 120.0  # look-back overlap of every fill back-fill
@@ -175,15 +192,28 @@ class VenueCfg:
     reconnect_settle_s: float = 2.0  # after a WS reconnect, let subscriptions settle, then reconcile
     reconcile_retry_max_s: float = 30.0
     startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start (live: required)
-    cancel_all_hold_s: float = 60.0  # Kalshi may cancel orders placed within 1 min of a cancel-all
+    # Kalshi may cancel orders placed within 1 min of a BULK cancel-all (DELETE /portfolio/events/
+    # orders): new orders are held this long after one. Only non-shared accounts ever send it; a
+    # shared account cancels by id (group trigger + list + batch cancel), so no hold applies there.
+    cancel_all_hold_s: float = 60.0
+    cancel_rounds: int = 3  # list + cancel-by-id rounds of a scoped cancel-all before it alarms
     exclude_events_with_positions: bool = True  # never trade events we already hold at start (live: required)
     shutdown_delete_group: bool = True
     halt_on_fee_mismatch: bool = True
 
     @property
     def sub(self) -> int:
-        """The subaccount number sent on every request (0 = primary)."""
+        """The subaccount number sent on every request (0 = primary). Live mode, the venue and
+        the watchdog refuse a config whose subaccount is not set (``subaccount_problems``)."""
         return int(self.subaccount) if self.subaccount is not None else 0
+
+    @property
+    def bulk_cancel_allowed(self) -> bool:
+        """May this runner call the BULK cancel-all (DELETE /portfolio/events/orders)? Only on an
+        account explicitly declared NOT shared: Kalshi documents that it may also cancel orders
+        placed during the following minute, and whether that tail honours ``subaccount`` is
+        unverified (it could cancel the other system's new orders)."""
+        return self.shared_account is False
 
 
 @dataclass(frozen=True)
@@ -256,8 +286,29 @@ class WatchdogCfg:
     max_repeats: int = 10
     only_live: bool = True  # ignore heartbeats written by paper runners
     stopping_grace_s: float = 5.0  # a 'stopping' runner older than its shutdown_timeout_s + this is stuck
-    key_id_env: str = "KALSHI_WATCHDOG_KEY_ID"  # optional separate API key (falls back to the main one)
+    key_id_env: str = "KALSHI_WATCHDOG_KEY_ID"  # the watchdog's own API key (restricted to venue.subaccount)
     private_key_path_env: str = "KALSHI_WATCHDOG_PRIVATE_KEY_PATH"
+    # without its own key variables the watchdog REFUSES to run on a shared account unless this
+    # opt-in lets it sign with the runner's key (never silently)
+    allow_runner_key: bool = False
+    # the watchdog's own liveness file <heartbeat>.watchdog (pid, subaccount, state, armed runner,
+    # last poll), written this often while it runs
+    beat_interval_s: float = 1.0
+    # LIVE RUNNER side: it refuses to start without a watchdog beat for its subaccount younger than
+    # this, and blocks new orders (gate 'watchdog', quotes pulled) while the beat is older, names
+    # another subaccount, or (after this long in 'running') is not armed on this runner
+    runner_max_age_s: float = 10.0
+
+
+@dataclass(frozen=True)
+class DiskCfg:
+    """Free space of the filesystem holding paths.data_root (decimal GB, space available to this
+    user; the disk is shared with another system). Live only."""
+
+    min_free_gb_start: float = 10.0  # below: the live runner refuses to start (exit 2)
+    min_free_gb_gate: float = 5.0  # below: new orders blocked (gate 'disk'), the strategy pulls its quotes
+    resume_margin_gb: float = 1.0  # ... until free >= min_free_gb_gate + this
+    check_interval_s: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -275,6 +326,7 @@ class LiveConfig:
     paper: PaperCfg = field(default_factory=PaperCfg)
     feeds: FeedsCfg = field(default_factory=FeedsCfg)
     watchdog: WatchdogCfg = field(default_factory=WatchdogCfg)
+    disk: DiskCfg = field(default_factory=DiskCfg)
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -326,9 +378,44 @@ class ModeError(SystemExit):
         return self.message
 
 
+def subaccount_problems(v: VenueCfg) -> list[str]:
+    """Why ``v`` may not act on a Kalshi (sub)account at all ([] = it may). Shared by live mode,
+    the order venue and the watchdog (fail-closed defaults, review H2):
+
+    * ``venue.subaccount`` must be set explicitly (an integer 0-63; None = not configured);
+    * ``venue.shared_account`` must be set explicitly (true / false);
+    * subaccount 0 (the primary account) only with ``allow_primary_account: true`` AND
+      ``shared_account: false``."""
+    out: list[str] = []
+    s = v.subaccount
+    if s is None:
+        out.append("venue.subaccount is not set: it must be stated explicitly in the live config (the dedicated "
+                   "subaccount, e.g. 1); no default ever targets the primary account")
+    elif isinstance(s, bool) or not isinstance(s, int) or not 0 <= s <= 63:
+        out.append(f"venue.subaccount must be an integer 0-63, got {s!r}")
+    if not isinstance(v.shared_account, bool):
+        out.append("venue.shared_account is not set: state it explicitly in the live config (true when another "
+                   "system trades this Kalshi account)")
+    if isinstance(s, int) and not isinstance(s, bool) and s == 0:
+        if v.shared_account is not False or not v.allow_primary_account:
+            out.append("venue.subaccount is 0 (the primary account): refused unless venue.allow_primary_account is "
+                       "true AND venue.shared_account is false (on a shared account subaccount 0 belongs to the other "
+                       "live system: use a dedicated subaccount 1-63)")
+    return out
+
+
+def venue_scope_problems(v: VenueCfg) -> list[str]:
+    """``subaccount_problems`` plus: a shared account needs keys restricted to the subaccount."""
+    out = subaccount_problems(v)
+    if v.shared_account is True and not v.key_restricted_to_subaccount:
+        out.append("venue.shared_account is true: venue.key_restricted_to_subaccount must be true (System 1's own "
+                   "API keys restricted to its subaccount, RUNBOOK 1.2; the start-up proves it)")
+    return out
+
+
 def live_config_problems(cfg: LiveConfig) -> list[str]:
     """Settings that are refused in live mode (each is safe only for paper debugging)."""
-    out = []
+    out = venue_scope_problems(cfg.venue)
     if cfg.loop.strategy_error != "stop":
         out.append("loop.strategy_error must be 'stop' in live mode (a strategy exception must stop trading)")
     if not cfg.venue.exclude_events_with_positions:
@@ -341,9 +428,6 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
         out.append("loop.clock_sample_s must be > 0 in live mode (the clock-offset gate must measure the clock; "
                    "it blocks new orders when it cannot)")
     v = cfg.venue
-    if v.shared_account and v.sub == 0:
-        out.append("venue.shared_account is true: venue.subaccount must be a dedicated subaccount (1-63), never "
-                   "null/0 (subaccount 0 belongs to the other live system on this account)")
     if not v.exchange_indexes or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in v.exchange_indexes):
         out.append("venue.exchange_indexes must list the exchange shard(s) this runner trades and has funded "
                    "(KXBTC*: [2])")
@@ -351,6 +435,15 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
         out.append("venue.exchange_status_interval_s must be > 0 in live mode (trading pauses must be detected)")
     if v.balance_interval_s <= 0:
         out.append("venue.balance_interval_s must be > 0 in live mode (the shard balance must be re-checked)")
+    if v.balance_max_failures < 1 or v.exchange_status_max_failures < 1:
+        out.append("venue.balance_max_failures and venue.exchange_status_max_failures must be >= 1")
+    if cfg.watchdog.runner_max_age_s <= 0:
+        out.append("watchdog.runner_max_age_s must be > 0 in live mode (the runner trades only while the watchdog is "
+                   "alive)")
+    d = cfg.disk
+    if d.check_interval_s <= 0 or d.min_free_gb_gate <= 0 or d.min_free_gb_start < d.min_free_gb_gate:
+        out.append("disk: check_interval_s and min_free_gb_gate must be > 0 and min_free_gb_start >= min_free_gb_gate "
+                   "in live mode")
     return out
 
 

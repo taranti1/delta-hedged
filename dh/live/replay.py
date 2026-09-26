@@ -61,6 +61,7 @@ class SessionInfo:
     subaccount: int = 0
     key_restricted: bool = False  # venue.key_restricted_to_subaccount of the session
     series: tuple[str, ...] = ()  # the session's series (own-activity events of others were dropped)
+    own_id_prefix: str = ""  # live: fills / order updates of other client_order_ids were dropped ('' = no filter)
 
 
 def load_session(root: str | Path, session: str | None = None) -> SessionInfo:
@@ -93,7 +94,7 @@ def load_session(root: str | Path, session: str | None = None) -> SessionInfo:
         strategy_digest=str(st.get("strategy_digest", "")), start=st, group_map=group_map,
         id_prefix=st.get("id_prefix") or None, subaccount=int(st.get("subaccount") or 0),
         key_restricted=bool(((st.get("live_config") or {}).get("venue") or {}).get("key_restricted_to_subaccount", False)),
-        series=tuple(st.get("series") or ()))
+        series=tuple(st.get("series") or ()), own_id_prefix=str(st.get("own_id_prefix") or ""))
 
 
 class UniverseReplay:
@@ -102,15 +103,17 @@ class UniverseReplay:
         merged-stream item at or after the change, as the live consumer did);
       * live inbound rules (LiveRunner.push / _on_event): events of another subaccount
         (runner.own_subaccount_ok, incl. the restricted-key rule) or of a market outside the
-        session's series (runner.own_series_ok) dropped; order-group ids translated to the
-        logical id (other groups dropped); WS
+        session's series (runner.own_series_ok) dropped; fills / order updates whose
+        client_order_id lacks the session's own prefix and whose order id is not known
+        (runner.own_order_ok, the known ids built from the same events in the same order)
+        dropped; order-group ids translated to the logical id (other groups dropped); WS
         market_position snapshots dropped (the runner fed only checked ones, recorded on
         events.live with source 'ws_checked' / 'rest'); a fill whose trade/fill id was already
         delivered dropped (a REST back-fill that beat the WS message)."""
 
     def __init__(self, strategy: Any, changes: list[tuple[int, str, Any]], sim: Any = None, paper_fees: Any = None,
                  *, live: bool = False, group_map: dict[str, str] | None = None, subaccount: int = 0,
-                 key_restricted: bool = False, series: tuple[str, ...] = ()) -> None:
+                 key_restricted: bool = False, series: tuple[str, ...] = (), own_id_prefix: str = "") -> None:
         from dh.live.runner import SeenIds
 
         self.strategy = strategy
@@ -124,6 +127,8 @@ class UniverseReplay:
         self.key_restricted = bool(key_restricted)
         self.series = tuple(series)
         self.fills_seen = SeenIds()
+        self.own_id_prefix = str(own_id_prefix or "")
+        self.known_oids = SeenIds()
 
     def _apply(self, kind: str, payload: Any, t: int) -> None:
         s = self.strategy
@@ -160,11 +165,14 @@ class UniverseReplay:
             from dataclasses import replace
 
             from dh.core.events import KalshiFill, KalshiOrderGroupUpdate, KalshiPositionSnapshot
-            from dh.live.runner import OWN_TYPES, own_series_ok, own_subaccount_ok
+            from dh.live.runner import OWN_TYPES, note_own_order, own_order_ok, own_series_ok, own_subaccount_ok
 
             if isinstance(ev, OWN_TYPES) and not (own_subaccount_ok(ev, self.subaccount, key_restricted=self.key_restricted)
                                                   and own_series_ok(ev, self.series)):
                 return []
+            if not own_order_ok(ev, self.own_id_prefix, self.known_oids):
+                return []
+            note_own_order(ev, self.known_oids)
             if isinstance(ev, KalshiPositionSnapshot) and ev.source == "ws":
                 return []
             if isinstance(ev, KalshiOrderGroupUpdate) and ev.order_group_id not in self.logical:
@@ -212,7 +220,8 @@ def replay_session(root: str | Path, scfg: Any, *, session: str | None = None, e
     if info.mode == "paper":
         sim, fees = build_paper_sim(PaperCfg(**(info.paper or {})), info.specs, fee_engine)
     wrapper = UniverseReplay(mm, info.changes, sim, fees, live=(info.mode == "live"), group_map=info.group_map,
-                             subaccount=info.subaccount, key_restricted=info.key_restricted, series=info.series)
+                             subaccount=info.subaccount, key_restricted=info.key_restricted, series=info.series,
+                             own_id_prefix=info.own_id_prefix)
     from dh.feeds.registry import has_normalizer
     from dh.store.replay import list_streams
 

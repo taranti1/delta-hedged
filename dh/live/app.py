@@ -60,7 +60,18 @@ import orjson
 from dh.core.units import NS_PER_MS, NS_PER_S, QTY_SCALE
 from dh.live.clock import AnchoredClock, session_token
 from dh.live.config import LiveConfig, account_share_problem, live_config_problems, load_live_config, resolve_mode
-from dh.live.monitor import JsonLog, KillFile, Metrics, cancel_all_marker_path, git_sha, read_heartbeat, write_heartbeat
+from dh.live.monitor import (
+    JsonLog,
+    KillFile,
+    Metrics,
+    cancel_all_marker_path,
+    git_sha,
+    read_heartbeat,
+    read_watchdog_beat,
+    watchdog_beat_path,
+    watchdog_beat_problem,
+    write_heartbeat,
+)
 from dh.live.riskstate import (
     RiskBook,
     RiskStateError,
@@ -134,6 +145,22 @@ def quarantine_stale_marker(marker: Path, now_ns: int) -> Path | None:
         raise StartupError(f"cannot move the old watchdog marker {marker} aside ({exc})") from exc
     log.warning("watchdog cancel-all marker from before this start (%s) moved to %s", content.strip(), dest)
     return dest
+
+
+def data_root_free_gb(root: str | Path) -> float:
+    """Free space (decimal GB, available to this user) of the filesystem holding the session
+    store ``root`` (``<root>/raw`` when it exists: it may be a symlink to another volume)."""
+    import shutil
+
+    from dh.store.recorder import disk_usage_path
+
+    return shutil.disk_usage(disk_usage_path(root)).free / 1e9
+
+
+def watchdog_reader_for(path: Path, subaccount: int, clock: Callable[[], int]) -> Callable[[], dict[str, Any] | None]:
+    """Reader of the watchdog's beat file ``<heartbeat>.watchdog`` (``subaccount`` / ``clock``
+    are for test stand-ins; the file names its own subaccount and time)."""
+    return lambda: read_watchdog_beat(path)
 
 
 def ws_kwargs(ws: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +328,8 @@ class LiveApp:
         now = self.clock()
         self.token = self.ov.session_token or session_token(now)
         self.id_prefix = f"{scfg.run_prefix}-{self.token}"
+        # every client_order_id of this system starts with this (live: the own-activity filter, review M1)
+        self.own_id_prefix = f"{scfg.run_prefix}-"
         self.session_id = f"{mode}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now // 1_000_000_000))}-{self.token}"
         self.recorder: Any = None
         self.jsonlog: JsonLog | None = None
@@ -350,6 +379,29 @@ class LiveApp:
         paths = lcfg.paths
         self.locks = check_runtime_paths(lcfg, mode, now_ns=self.clock())
         hb = heartbeat_path(lcfg, mode)
+        watchdog_reader = None
+        disk_free = None
+        if mode == "live":
+            # before anything is sent: enough disk for the session store, and a LIVE watchdog for
+            # this subaccount (review M3: never trade with the dead-man switch down)
+            root = _resolve(paths.data_root)
+            disk_free = lambda: data_root_free_gb(root)  # noqa: E731
+            try:
+                free = disk_free()
+            except OSError as exc:
+                raise StartupError(f"cannot measure the free disk space of {root} ({exc})") from exc
+            self.info["disk_free_gb"] = round(free, 3)
+            if free < lcfg.disk.min_free_gb_start:
+                raise StartupError(f"only {free:.1f} GB free on the disk of {root} (< disk.min_free_gb_start "
+                                   f"{lcfg.disk.min_free_gb_start:g} GB): free space first (RUNBOOK 3 'Low disk')")
+            wd_path = watchdog_beat_path(hb)
+            watchdog_reader = watchdog_reader_for(wd_path, lcfg.venue.sub, self.clock)
+            problem = watchdog_beat_problem(watchdog_reader(), now_ns=self.clock(), subaccount=lcfg.venue.sub,
+                                            max_age_s=lcfg.watchdog.runner_max_age_s)
+            if problem:
+                raise StartupError(f"{problem} ({wd_path}): start the watchdog for subaccount {lcfg.venue.sub} first "
+                                   "(RUNBOOK 5.2 step 2; macOS: the launchd agent, deploy/launchd/README.md)")
+            self.info["watchdog"] = {"beat": str(wd_path), "ok": True}
         marker = cancel_all_marker_path(hb) if mode == "live" else None
         if marker is not None:
             moved = quarantine_stale_marker(marker, self.clock())
@@ -373,10 +425,14 @@ class LiveApp:
 
         # 3. REST
         # paper can never send a write (read_only); live refuses, before signing, any write that
-        # does not name this runner's subaccount and a shard explicitly (write_subaccount)
+        # does not name this runner's subaccount and one of its shards explicitly (write_subaccount,
+        # write_shards), and on a shared account the bulk cancel-all (forbid_bulk_cancel)
+        live = mode == "live"
         self.rest = self.ov.rest or KalshiRest(kc.rest_url, signer, kc.limiter(), on_raw=self.recorder.write,
-                                               clock_ns=self.clock, read_only=(mode != "live"),
-                                               write_subaccount=lcfg.venue.sub if mode == "live" else None,
+                                               clock_ns=self.clock, read_only=not live,
+                                               write_subaccount=lcfg.venue.sub if live else None,
+                                               write_shards=tuple(lcfg.venue.exchange_indexes) if live else None,
+                                               forbid_bulk_cancel=live and not lcfg.venue.bulk_cancel_allowed,
                                                **kc.rest_kwargs())
         try:
             limits = await self.rest.configure_rate_limits()
@@ -402,7 +458,7 @@ class LiveApp:
             try:
                 now = self.clock()
                 closures, notes = schedule_closures(await self.rest.get_exchange_schedule(), now - 86_400 * NS_PER_S,
-                                                    now + 8 * 86_400 * NS_PER_S)
+                                                    now + 8 * 86_400 * NS_PER_S, now_ns=now)
                 self.info["exchange_schedule"] = {"closures": closures[:20], "notes": notes}
                 nxt = next((c for c in closures if c[1] > now), None)
                 log.info("exchange schedule: %d closure(s) in the next week; next %s", len(closures), nxt)
@@ -447,6 +503,7 @@ class LiveApp:
             log.info("funds of subaccount %d per shard: %s (required $%.2f)", venue.sub, self.info["balances"]["shards"],
                      balance_need)
             if lcfg.venue.key_restricted_to_subaccount:
+                # positive proof (review M1): a read of subaccount 0 must be REFUSED with this key
                 ok, why = await verify_key_restriction(self.rest, str(getattr(signer, "key_id", "") or ""), venue.sub,
                                                        bodies.values())
                 self.info["key_restriction"] = {"ok": ok, "evidence": why}
@@ -455,7 +512,9 @@ class LiveApp:
                                        "subaccount field would be attributed to this runner")
                 log.info("API key restriction verified: %s", why)
             # 6. clean slate FIRST (verified), then positions: an order resting while the
-            # positions are read could fill unseen and escape the event exclusion
+            # positions are read could fill unseen and escape the event exclusion. A shared account
+            # never uses the bulk cancel-all: the venue lists subaccount 1's resting orders and
+            # cancels them by id until the list is empty
             try:
                 left = await venue.cancel_all_verified("startup")
             except RuntimeError as exc:
@@ -463,7 +522,8 @@ class LiveApp:
             if left:
                 raise StartupError(f"{len(left)} orders still resting after the start-up cancel-all: "
                                    f"{[o.get('order_id') for o in left][:10]}")
-            hold_until = venue.last_cancel_all_ns + int(lcfg.venue.cancel_all_hold_s * NS_PER_S)
+            if venue.last_cancel_all_ns:  # only a BULK cancel-all has the one-minute tail to wait out
+                hold_until = venue.last_cancel_all_ns + int(lcfg.venue.cancel_all_hold_s * NS_PER_S)
             try:
                 all_positions = await venue.fetch_positions(strict=True)
             except ValueError as exc:
@@ -555,7 +615,8 @@ class LiveApp:
             clock_ns=self.clock, kill_file=KillFile(_resolve(paths.kill_file)), heartbeat_path=hb,
             fee_engine=fee_engine, universe=specs, discover=discover, series=series, session_id=self.session_id,
             risk_store=store, cancel_all_marker=marker, risk_book=book, started_ns=started_ns,
-            clock_sampler=self.ov.clock_sampler)
+            clock_sampler=self.ov.clock_sampler, own_id_prefix=self.own_id_prefix if mode == "live" else "",
+            watchdog_reader=watchdog_reader, disk_free_gb=disk_free)
         hedge.sink = runner.push_result
         # the first event: the day's risk state (before any Timer; recorded for replay)
         runner.push_result(make_seed(seed_ts, seed))
@@ -603,6 +664,7 @@ class LiveApp:
                    skipped=sel.skipped, excluded_events=sorted(excluded), backfill=bf.summary(),
                    paper=asdict(lcfg.paper) if mode == "paper" else None, info=self.info,
                    id_prefix=self.id_prefix, session_token=self.token, subaccount=lcfg.venue.sub, series=list(series),
+                   own_id_prefix=self.own_id_prefix if mode == "live" else "",
                    exchange_indexes=list(shards), shared_account=lcfg.venue.shared_account,
                    key_restricted_to_subaccount=lcfg.venue.key_restricted_to_subaccount)
         self._meta("fv_warmup", source=bf.source, points=bf.points)

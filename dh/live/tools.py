@@ -69,7 +69,18 @@ async def cmd_backfill(lcfg: Any, rest: Any, out: Any = print) -> int:
     return 0 if cov >= cfg.min_coverage else 1
 
 
+def _no_subaccount(lcfg: Any, out: Any) -> bool:
+    """A config that does not NAME its subaccount is refused: a read of subaccount 0 by default
+    would show the other system's account (e.g. '0 resting orders' after a kill of subaccount 1)."""
+    if getattr(lcfg.venue, "subaccount", None) is None:
+        out("refused: venue.subaccount is not set in the live config (set it explicitly, e.g. 1)")
+        return True
+    return False
+
+
 async def cmd_orders(lcfg: Any, rest: Any, out: Any = print) -> int:
+    if _no_subaccount(lcfg, out):
+        return 2
     kw: dict[str, Any] = {"status": "resting"}
     kw["subaccount"] = lcfg.venue.sub  # explicit: omitted means ALL subaccounts
     rows = [o async for o in rest.iter_orders(**kw)]
@@ -92,6 +103,8 @@ async def cmd_balance(lcfg: Any, rest: Any, out: Any = print, scfg: Any = None) 
         scfg = load_config(REPO_ROOT / "config" / "m1.yaml")
     from dh.live.venue_kalshi import KalshiVenue
 
+    if _no_subaccount(lcfg, out):
+        return 2
     need = required_balance_usd(scfg.risk, lcfg.venue.min_balance_margin_dollars)
     try:  # the runner's own computation: available + positions at cost + resting collateral
         venue = KalshiVenue(rest, sink=lambda ev: None, cfg=lcfg.venue)
@@ -155,6 +168,8 @@ async def cmd_reconcile(log: str, lcfg: Any, rest: Any, out: Any = print) -> int
             o[2] += int(r.get("fee", 0))
     if t0 is None:
         out("no session_start in the log")
+        return 2
+    if _no_subaccount(lcfg, out):
         return 2
     from dh.core.units import micros_from_dollars, qty_from_fp
 

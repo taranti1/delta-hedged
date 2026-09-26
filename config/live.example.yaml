@@ -59,27 +59,39 @@ loop:
 
 venue:
   # Deployment (docs/RUNBOOK.md 1.2): System 1 trades subaccount 1 of an account SHARED with another
-  # live system (which owns subaccount 0 and must never be touched).
-  subaccount: 1                # Kalshi subaccount number (null / 0 = primary), sent EXPLICITLY on
-                               # every request (omitted = ALL subaccounts on GET orders/fills and
-                               # cancel-all). Use a DEDICATED (sub)account: cancel-all and the
-                               # ghost sweep act on all its orders; other subaccounts' WS events
-                               # are dropped.
-  shared_account: true         # live refuses subaccount null/0 and rate_limits.account_share > 0.5
-                               # (config/kalshi.yaml); every write must name this subaccount
-  key_restricted_to_subaccount: true  # runner + watchdog keys are restricted to `subaccount`
-                               # (verified at start-up): private WS messages without a subaccount
-                               # field are ours (Kalshi scopes the channels to the key)
+  # live system (which owns subaccount 0 and must never be touched). FAIL-CLOSED: live mode, the
+  # venue and the watchdog REFUSE a config that does not state subaccount and shared_account here.
+  subaccount: 1                # Kalshi subaccount number, sent EXPLICITLY on every request (omitted =
+                               # ALL subaccounts on GET orders/fills and cancel-all). Use a DEDICATED
+                               # subaccount: the cancel-all and the ghost sweep act on all its orders;
+                               # other subaccounts' WS events are dropped. 0 (the primary account) is
+                               # refused unless allow_primary_account: true AND shared_account: false
+  shared_account: true         # REQUIRED. true: live refuses subaccount 0, rate_limits.account_share
+                               # > 0.5 (config/kalshi.yaml) and key_restricted_to_subaccount: false;
+                               # every write must name this subaccount; the bulk cancel-all
+                               # (DELETE /portfolio/events/orders) is NEVER sent: orders are cancelled
+                               # by id (order-group trigger, then list + batch cancel until empty)
+  key_restricted_to_subaccount: true  # runner + watchdog keys are restricted to `subaccount`, PROVEN at
+                               # start-up: GET /portfolio/balance?subaccount=0 must be refused (401/403)
+                               # with the runner key. Private WS messages without a subaccount field
+                               # are then ours (Kalshi scopes the channels to the key); fills / order
+                               # updates of client_order_ids without this system's run prefix
+                               # (dhm1-) are dropped anyway (dh_foreign_order_events_total)
+  allow_primary_account: false # the ONLY way to trade subaccount 0 (with shared_account: false)
   exchange_indexes: [2]        # shards traded AND funded (every KXBTC* market is on shard 2); markets
                                # on an unknown / other shard are never traded; one order group per shard
   min_balance_margin_dollars: 10.0  # each shard's funds (available balance + our positions at cost +
                                # resting-order collateral) >= worst-case loss (m1: $50) + this, at
                                # start-up (else exit 2) and every balance_interval_s (else new orders blocked)
   balance_interval_s: 60.0
+  balance_max_failures: 3      # this many failed balance reads in a row close the gate 'balance'
   exchange_status_interval_s: 10.0  # GET /exchange/status (trading / exchange pauses; live: > 0)
+  exchange_status_max_failures: 3   # this many failed status polls in a row close 'exchange_pause'
+                               # (reason: exchange status unreadable) until a poll succeeds
   exchange_schedule_interval_s: 3600.0  # GET /exchange/schedule (maintenance, Thursday 03:00-05:00 ET pause)
   pause_lead_s: 60.0           # quotes pulled this long before a scheduled closure
-  pause_reject_hold_s: 30.0    # a place rejected for a pause keeps new orders blocked at least this long
+  pause_reject_hold_s: 30.0    # a place rejected for a pause blocks new orders this long: every market
+                               # for an exchange-level reason, only that market for a market-level one
   max_batch: 20                # places / cancels per batched request
   max_place_wait_s: 0.5        # quotes that would wait longer for write tokens are dropped
   self_trade_prevention: taker_at_cross
@@ -97,6 +109,9 @@ venue:
   read_reserve_tokens: 30.0
   positions_interval_s: 30.0        # GET /portfolio/positions reconciliation (0 = off)
   position_confirm_s: 5.0           # a mismatch must persist this long before Halt(all)
+  position_defer_max: 5             # a positions read older than the last WS fill OF THAT MARKET does not
+  position_defer_max_s: 60.0        # confirm (deferred), at most this often / this long after the mismatch
+                                    # was first seen; then the next read validated after that confirms
   ghost_sweep: true                 # cancel resting orders the strategy does not know
   fills_backfill_interval_s: 60.0   # GET /portfolio/fills safety net (0 = off)
   fills_backfill_margin_s: 120.0    # look-back overlap (duplicates are dropped by trade/fill id)
@@ -104,8 +119,10 @@ venue:
   reconnect_settle_s: 2.0           # after a WS reconnect: wait, then back-fill fills + positions + orders
   reconcile_retry_max_s: 30.0
   startup_cancel_all: true          # cancel (and verify) leftovers BEFORE reading positions; required live
-  cancel_all_hold_s: 60.0           # Kalshi may cancel orders placed within 1 min of a cancel-all:
-                                    # new orders are held this long after one (start-up, kill, watchdog)
+  cancel_all_hold_s: 60.0           # Kalshi may cancel orders placed within 1 min of a BULK cancel-all:
+                                    # new orders are held this long after one. Only an account declared
+                                    # NOT shared sends it; a shared account cancels by id: no hold
+  cancel_rounds: 3                  # list + cancel-by-id rounds of a scoped cancel-all before it alarms
   exclude_events_with_positions: true   # required live (held positions are not seeded into the strategy)
   shutdown_delete_group: true
   halt_on_fee_mismatch: true
@@ -161,5 +178,18 @@ watchdog:                      # scripts/watchdog.py (locks onto the live runner
   max_repeats: 10
   only_live: true
   stopping_grace_s: 5.0        # a 'stopping' runner older than its shutdown_timeout_s + this: cancel all
-  key_id_env: KALSHI_WATCHDOG_KEY_ID   # its own key, restricted to venue.subaccount (RUNBOOK 1.2)
-  private_key_path_env: KALSHI_WATCHDOG_PRIVATE_KEY_PATH
+  key_id_env: KALSHI_WATCHDOG_KEY_ID   # its own key, restricted to venue.subaccount (RUNBOOK 1.2);
+  private_key_path_env: KALSHI_WATCHDOG_PRIVATE_KEY_PATH  # without them it REFUSES on a shared account
+  allow_runner_key: false      # true: may sign with the runner's key instead (a deliberate, logged choice)
+  beat_interval_s: 1.0         # the watchdog writes <heartbeat>.watchdog (pid, subaccount, state, armed
+                               # runner, last poll) this often; EXITED when it stops
+  runner_max_age_s: 10.0       # LIVE RUNNER: refuses to start without a watchdog beat for its subaccount
+                               # younger than this, and blocks new orders (gate 'watchdog', quotes
+                               # pulled) while it is older, names another subaccount, or is not armed
+                               # on this runner once it has been running this long
+
+disk:                          # free space of paths.data_root's filesystem (decimal GB; live only)
+  min_free_gb_start: 10.0      # below: the live runner refuses to start (exit 2)
+  min_free_gb_gate: 5.0        # below: new orders blocked (gate 'disk'), the strategy pulls its quotes
+  resume_margin_gb: 1.0        # ... until free >= min_free_gb_gate + this
+  check_interval_s: 60.0

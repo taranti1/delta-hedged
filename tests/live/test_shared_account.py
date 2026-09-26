@@ -65,7 +65,7 @@ def venue(rest: Any = None, **cfg: Any) -> tuple[KalshiVenue, Any, list, FakeClo
     rest = rest if rest is not None else FakeRest()
     clock = FakeClock()
     out: list = []
-    c = {"subaccount": 1, "shared_account": True, **cfg}
+    c = {"subaccount": 1, "shared_account": True, "key_restricted_to_subaccount": True, **cfg}
     v = KalshiVenue(rest, sink=out.append, cfg=VenueCfg(**c), clock_ns=clock, monotonic=clock.mono, sleep=_nosleep)
     v.register_markets([kxbtcd_spec(ticker=TK), kxbtcd_spec(ticker=TK2)])
     return v, rest, out, clock
@@ -196,9 +196,9 @@ async def test_kill_switch_triggers_every_group_first_and_never_resets_or_recrea
 
 
 def test_venue_refuses_subaccount_zero_on_a_shared_account():
-    with pytest.raises(ValueError, match="subaccount 0"):
+    with pytest.raises(ValueError, match="venue.subaccount is not set"):
         KalshiVenue(FakeRest(), sink=lambda e: None, cfg=VenueCfg(subaccount=None, shared_account=True))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="subaccount is 0"):
         KalshiVenue(FakeRest(), sink=lambda e: None, cfg=VenueCfg(subaccount=0, shared_account=True))
 
 
@@ -360,11 +360,11 @@ def test_every_rest_client_in_dh_live_and_scripts_is_read_only_or_bound_to_a_sub
 
 # ============================================================================ 3. config refusals / paths
 def test_shared_account_live_refusals():
-    base = LiveConfig(mode="live", venue=VenueCfg(subaccount=1, shared_account=True))
+    base = LiveConfig(mode="live", venue=VenueCfg(subaccount=1, shared_account=True, key_restricted_to_subaccount=True))
     assert live_config_problems(base) == []
     for sub in (None, 0):
         bad = replace(base, venue=replace(base.venue, subaccount=sub))
-        assert any("dedicated subaccount" in p for p in live_config_problems(bad))
+        assert any("dedicated subaccount" in p or "not set" in p for p in live_config_problems(bad))
     assert any("exchange_indexes" in p for p in live_config_problems(replace(base, venue=replace(base.venue, exchange_indexes=()))))
     assert any("exchange_status_interval_s" in p
                for p in live_config_problems(replace(base, venue=replace(base.venue, exchange_status_interval_s=0.0))))
@@ -378,7 +378,8 @@ async def test_live_start_refuses_a_shared_account_with_the_whole_rate_budget(tm
     rest, fake, lcfg, scfg, _ = _setup(tmp_path, "live", forbid_writes=True)
     kcfg = tmp_path / "kalshi.yaml"
     kcfg.write_text((REPO / "config" / "kalshi.example.yaml").read_text())  # account_share: 1.0
-    lcfg = replace(lcfg, kalshi_config=str(kcfg), venue=replace(lcfg.venue, subaccount=1, shared_account=True))
+    lcfg = replace(lcfg, kalshi_config=str(kcfg), venue=replace(lcfg.venue, subaccount=1, shared_account=True,
+                                                                  key_restricted_to_subaccount=True))
     app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
     assert await app.run(duration_s=0.5) == 2 and rest.calls == [] and fake.conns == []
 
@@ -460,9 +461,10 @@ async def test_watchdog_cancel_now_triggers_the_heartbeat_groups(tmp_path):
     args = argparse.Namespace(live_config=str(REPO / "config" / "live.example.yaml"), heartbeat=str(tmp_path / "hb.json"),
                               once=False, cancel_now=True, arm_on_start=False, max_age_s=0.0)
     assert await mod.amain(args, rest=rest) == 0
-    assert rest.names() == ["trigger_order_group", "cancel_all_orders"]
+    # shared account: trigger, then subaccount 1's resting orders listed (and cancelled by id)
+    assert rest.names() == ["trigger_order_group", "iter_orders"]
     assert rest.of("trigger_order_group")[0][1] == {"subaccount": 1, "exchange_index": 2}
-    assert rest.of("cancel_all_orders")[0][1] == {"subaccount": 1}
+    assert rest.of("iter_orders")[0][1] == {"status": "resting", "subaccount": 1}
 
 
 # ============================================================================ 5. runner kill path + heartbeat
@@ -489,9 +491,12 @@ async def test_runner_kill_triggers_the_group_before_the_cancel_all_and_the_hear
     r.add_source("killer", killer)
     assert await r.run(duration_s=3.0) == 0
     names = rest.names()
-    assert names.index("trigger_order_group") < names.index("cancel_all_orders")
+    # shared account: the group trigger, then subaccount 1's resting orders listed and cancelled by
+    # id; the bulk cancel-all is never sent
+    assert "cancel_all_orders" not in names
+    assert names.index("trigger_order_group") < max(i for i, n in enumerate(names) if n == "iter_orders")
     assert rest.of("trigger_order_group")[0] == (("og-1",), {"subaccount": 1, "exchange_index": 2})
-    assert all(k.get("subaccount") == 1 for n, _, k in rest.calls if n in ("cancel_all_orders", "trigger_order_group"))
+    assert all(k.get("subaccount") == 1 for n, _, k in rest.calls if n in ("iter_orders", "trigger_order_group"))
     assert v.kill_latched.startswith("kill:")
 
 
@@ -537,7 +542,9 @@ def _live(tmp_path, **venue_kw):
     rest, fake, lcfg, scfg, tickers = _setup(tmp_path, "live", forbid_writes=False)
     kcfg = tmp_path / "kalshi.yaml"  # a shared account: this process keeps to 20% of the REST budget
     kcfg.write_text((REPO / "config" / "kalshi.example.yaml").read_text().replace("account_share: 1.0", "account_share: 0.2"))
+    venue_kw = {"key_restricted_to_subaccount": True, **venue_kw}
     lcfg = replace(lcfg, kalshi_config=str(kcfg), venue=replace(lcfg.venue, subaccount=1, shared_account=True, **venue_kw))
+    rest.key_subaccount = 1  # System 1's own key, restricted to subaccount 1: a subaccount-0 read is refused
     return rest, fake, lcfg, scfg, tickers
 
 
@@ -548,7 +555,10 @@ async def test_startup_reads_the_shard_balance_first_and_exposes_it(tmp_path):
     runner = await app.build()
     names = rest.names()
     assert rest.of("get_balance")[0][1] == {"subaccount": 1, "exchange_index": 2}
-    assert names.index("get_balance") < names.index("cancel_all_orders")  # read-only check before any write
+    assert "cancel_all_orders" not in names  # shared account: never the bulk cancel-all
+    # read-only checks (balance, the restricted-key probe) before the clean slate (listed + cancelled by id)
+    assert names.index("get_balance") < names.index("iter_orders")
+    assert {"subaccount": 0} in [k for _, k in rest.of("get_balance")]  # the probe: refused (403) for this key
     # the shard's funds: balance + positions at cost + resting collateral, all scoped to shard 2
     assert rest.of("get_all_positions")[0][1] == {"count_filter": "position", "subaccount": 1, "exchange_index": 2}
     assert rest.of("iter_orders")[0][1] == {"status": "resting", "subaccount": 1, "exchange_index": 2}
@@ -560,6 +570,7 @@ async def test_startup_reads_the_shard_balance_first_and_exposes_it(tmp_path):
     assert runner.metrics.get("dh_shard_funds_dollars", exchange_index="2") == 75.5
     assert all(k.get("subaccount") == 1 for n, _, k in rest.calls if n in ("cancel_all_orders", "iter_orders", "iter_fills",
                                                                          "get_all_positions", "iter_settlements"))
+    assert app.info["key_restriction"]["ok"] and "HTTP 403" in app.info["key_restriction"]["evidence"]
     await runner.shutdown()
     await app.close()
 
@@ -621,10 +632,15 @@ async def test_our_own_positions_and_quotes_never_make_a_funded_shard_look_empty
 
 
 @pytest.mark.parametrize("case, ok", [("api_keys_restricted", True), ("api_keys_unrestricted", False),
-                                      ("api_keys_other_sub", False), ("breakdown_absent", True),
-                                      ("breakdown_present", False)])
+                                      ("api_keys_other_sub", False), ("api_keys_refused", True),
+                                      ("probe_answers", False), ("probe_5xx", False)])
 async def test_key_restriction_is_verified(case, ok):
+    """Positive proof (review M1): GET /portfolio/balance?subaccount=0 must be REFUSED (401/403)
+    with the runner key; GET /api_keys is secondary (a listed unrestricted key still refuses)."""
+    from .fakes import http_error
+
     rest = FakeRest()
+    rest.key_subaccount = 1  # a key restricted to subaccount 1: the subaccount-0 probe answers 403
     bodies = [{"balance": 100, "balance_dollars": "1.00"}]
     if case == "api_keys_restricted":
         rest.api_keys = [{"api_key_id": "kid", "name": "runner", "scopes": [], "subaccount": 1}]
@@ -632,11 +648,13 @@ async def test_key_restriction_is_verified(case, ok):
         rest.api_keys = [{"api_key_id": "kid", "name": "runner", "scopes": [], "subaccount": None}]
     elif case == "api_keys_other_sub":
         rest.api_keys = [{"api_key_id": "kid", "name": "runner", "scopes": [], "subaccount": 0}]
-    elif case == "breakdown_present":
-        rest.on("get_api_keys", ConnectionError("forbidden"))
-        bodies = [{"balance": 100, "balance_breakdown": [{"exchange_index": 2, "balance": "1.00"}]}]
+    elif case == "api_keys_refused":
+        rest.on("get_api_keys", http_error(403, "forbidden", "restricted to a single sub-account", "GET"))
+    elif case == "probe_answers":  # an unrestricted key: the subaccount-0 read answers
+        rest.key_subaccount = None
+        rest.on("get_api_keys", http_error(503, "unavailable", "down", "GET"))
     else:
-        rest.on("get_api_keys", ConnectionError("forbidden"))
+        rest.on("get_balance", http_error(503, "unavailable", "down", "GET"))
     got, why = await verify_key_restriction(rest, "kid", 1, bodies)
     assert got is ok and why
 

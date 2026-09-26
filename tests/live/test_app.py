@@ -72,7 +72,9 @@ def _setup(tmp_path, mode: str, *, forbid_writes: bool):
                        heartbeat_file=str(tmp_path / "run" / "hb.json")),
         metrics=MetricsCfg(enabled=False),
         loop=LoopCfg(heartbeat_interval_s=0.05, clock_sample_s=60.0, shutdown_timeout_s=2.0, max_lag_s=5.0),
-        venue=VenueCfg(positions_interval_s=0.0, queue_positions_interval_s=0.0, fills_backfill_interval_s=0.0,
+        # the primary account, explicitly (a test account shared with nobody)
+        venue=VenueCfg(subaccount=0, shared_account=False, allow_primary_account=True,
+                       positions_interval_s=0.0, queue_positions_interval_s=0.0, fills_backfill_interval_s=0.0,
                        cancel_all_hold_s=0.3),
         universe=UniverseCfg(horizon_s=7200.0, discovery_interval_s=3600.0),
         backfill=BackfillCfg(days=2.0, chunk_s=12 * 3600, timespan="{span_s}s", timestamp="{end_ms}", align=False),

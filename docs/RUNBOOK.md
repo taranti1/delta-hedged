@@ -9,21 +9,28 @@ the first time. Commands run from the repository root with the venv active
 |---|---|---|
 | Recorder (market data capture) | `scripts/record.py` | always |
 | Strategy runner, paper or live | `scripts/run_live.py` | **never automatic**: a human restarts it |
-| Watchdog (dead-man group trigger + cancel-all, live only) | `scripts/watchdog.py` | always (macOS: launchd template `deploy/launchd/com.dh.watchdog.plist`) |
+| Watchdog (dead-man group trigger + cancel of every resting order, live only; writes its own beat `<heartbeat>.watchdog`) | `scripts/watchdog.py` | always (macOS: launchd template `deploy/launchd/com.dh.watchdog.plist`); the live runner refuses to start, and stops quoting, without its fresh beat |
 | Prometheus / Grafana (optional) | `deploy/docker-compose.yml` | always |
 
 **Deployment (decided 2026-09-25):** System 1 (this repository) trades **subaccount 1** of the
 user's Kalshi account, with API keys **restricted to subaccount 1**, on **exchange shard 2**
 (where every KXBTC* market lives), from **this Mac**. Subaccount 0 belongs to the other live
 system (System 2, `trading-strategy/Kalshi`) and must never be touched: `venue.shared_account:
-true` makes the runner and the watchdog refuse subaccount 0, and the REST client refuses any
-write that does not name subaccount 1 explicitly (`docs/research/SHARED_ACCOUNT_AUDIT.md`,
-`docs/research/KALSHI_DOCS_RECONCILIATION.md`).
+true` makes the runner and the watchdog refuse subaccount 0, the REST client refuses any write
+that does not name subaccount 1 and shard 2 explicitly, and **the bulk cancel-all
+`DELETE /portfolio/events/orders` is never sent** (Kalshi: it "may also cancel newly placed
+orders during the minute after the request", and whether that tail honours `subaccount` is
+unverified): every kill path triggers our order groups, then lists subaccount 1's resting orders
+and cancels them by id. The configuration fails CLOSED: live mode, the venue and the watchdog
+refuse a `config/live.yaml` that does not state `venue.subaccount` and `venue.shared_account`
+(pre-live review 2026-09-25, `docs/research/prelive_review_2026-09-25/PRELIVE_REVIEW.md`;
+`docs/research/SHARED_ACCOUNT_AUDIT.md`, `docs/research/KALSHI_DOCS_RECONCILIATION.md`).
 
 Exit codes of `run_live.py`: `0` normal stop or kill file, `2` refused to start (message says
 why), `3` shutdown could not confirm that all orders are cancelled (check the Kalshi UI now; the
 watchdog keeps trying), `4` strategy/consumer error or a dead background loop (heartbeat, risk
-state, fills, positions, clock, reconciler...: fail-safe stop with the normal cancel-all).
+state, fills, positions, clock, reconciler, watchdog / disk checks...: fail-safe stop with the
+normal cancel).
 
 One runner per `paths.data_root` and per heartbeat file: the runner holds a `flock` on
 `<data_root>/runner.lock` and `<heartbeat>.lock` and refuses to start while another process
@@ -67,7 +74,11 @@ Mac (subaccount 1, section 1.2). What differs from the Linux VM above:
   (`dh.live.runner.DARWIN_CLOCK_SOURCES`): "synchronised" means `sntp` answered with an error
   bound (`+/-`) within `loop.clock_max_est_error_ms` (default `clock_block_ms` = 250 ms); the
   offset gate (`clock_block_ms`) applies as on Linux; no answer, or a larger bound, blocks new
-  orders (`gate clock`). This Mac measured **35-50 ms behind NTP**: below the 250 ms block, so
+  orders (`gate clock`). The runner's receive clock SLEWS toward the wall clock at <= 50 ppm
+  (`dh.live.clock.AnchoredClock`): this Mac's monotonic clock runs ~3.2 ppm off the disciplined
+  wall clock (~11.5 ms/h, measured on `data/raw/clock`), which without the slew added up to the
+  250 ms block ~16 h into a session; now the offset stays at the sntp offset for any session
+  length. This Mac measured **35-50 ms behind NTP**: below the 250 ms block, so
   it trades, but set `loop.clock_alarm_ms: 100` in `config/live.yaml` here (the 5 ms alarm
   would fire on every sample; the warning is rate-limited to one a minute), and remember that
   every latency number the runner reports (`dh_consumer_lag_seconds`, `dh_lag_baseline_seconds`,
@@ -82,6 +93,9 @@ Mac (subaccount 1, section 1.2). What differs from the Linux VM above:
   demand, git-ignored). The kill file is then `echo why > data/run/KILL`.
 * **Watchdog as a launchd agent**: `deploy/launchd/com.dh.watchdog.plist` (KeepAlive,
   `--arm-on-start`, caffeinate; see `deploy/launchd/README.md`; not installed automatically).
+  It writes its own beat `data/run/heartbeat.json.watchdog` every second: a crash-looping agent
+  (TCC, missing key, config refusal) shows as a missing / stale beat, and the live runner then
+  refuses to start or stops quoting (gate `watchdog`).
   The runner stays manual (never a launchd job): start it in a terminal under
   `caffeinate -i` (section 5.2).
 * Binance (HTTP 451) and Bybit (HTTP 403) are geo-blocked from this US host: both are
@@ -112,7 +126,10 @@ One-time steps (the user, by hand; read-only checks with `python -m dh.live.tool
    non-atomic steps; or the UI at kalshi.com/account/exchange-indexes). Do the transfer while no
    System 2 session runs, bracket it with balance reads, and **declare it to System 2**
    (`two_leg_launcher declare-transfer`, D-059): an undeclared transfer breaks System 2's cash
-   parity. Fund at least the worst-case loss + margin: `max(risk.max_total_worst_loss,
+   parity. A cross-shard transfer starts with a mandatory **$1 probe** on the same route
+   (`account_setup.py shard-transfer ... --probe-dollars 1`): the request amount is in
+   centicents, the listing in dollars, and every result must match the amount EXACTLY (1 cent
+   tolerance) or the tool raises an ALARM instead of "Complete". Fund at least the worst-case loss + margin: `max(risk.max_total_worst_loss,
    risk.daily_loss_halt)` of `config/m1.yaml` ($50) + `venue.min_balance_margin_dollars` ($10) =
    **$60**, plus what the resting quotes' collateral needs (Kalshi rejects an order the shard
    balance cannot collateralize). Check: `python -m dh.live.tools balance` (per shard, vs $60).
@@ -121,19 +138,30 @@ One-time steps (the user, by hand; read-only checks with `python -m dh.live.tool
    read and trade on that sub-account": Kalshi itself then refuses any System 1 action on
    subaccount 0, and scopes the private WebSocket channels (`fill`, `user_orders`,
    `market_positions`, `order_group_updates`) to subaccount 1 server-side. Keep System 2's
-   unrestricted key untouched and **never give System 1 that key** (the live start-up verifies
-   the restriction: `GET /api_keys`, else the balance response's missing `balance_breakdown`;
-   an unrestricted key refuses the start with `venue.key_restricted_to_subaccount: true`). The
+   unrestricted key untouched and **never give System 1 that key**. The live start-up PROVES
+   the restriction with a read the restricted key must be refused: `GET /portfolio/balance?
+   subaccount=0` must answer **401/403**; a 2xx (the key can read subaccount 0) refuses the
+   start (exit 2), and so does any other failure (5xx, network: no proof; retry the start).
+   `GET /api_keys` is secondary evidence (a listed unrestricted key also refuses). **Verify
+   live** on the first start: the `key restriction verified` line names the HTTP status. The
    second key protects the dead-man switch against a revoked runner key, NOT against rate
-   limits (budgets are per account; cancel-all costs 2 tokens and a 429 carries no penalty, so
-   the watchdog's 1 s retry suffices).
+   limits (budgets are per account; a cancel costs 2 tokens and a 429 carries no penalty, so
+   the watchdog's 1 s retry suffices). On the shared account the watchdog REFUSES to run
+   without its own key variables (exit 2) unless `watchdog.allow_runner_key: true`.
 5. Store keys outside the repository, readable only by you:
    `mkdir -p ~/.kalshi && chmod 700 ~/.kalshi && mv <download>.pem ~/.kalshi/runner.pem && chmod 600 ~/.kalshi/*.pem`
    (`*.pem`, `*.key`, `secrets/` and `.env` are git-ignored; never commit a key).
 6. `config/live.yaml`: `venue.subaccount: 1`, `venue.shared_account: true`,
    `venue.key_restricted_to_subaccount: true`, `venue.exchange_indexes: [2]` (the example
-   config's values); `config/kalshi.yaml`: `rate_limits.account_share` <= 0.5 (0.2 here; live
-   refuses more on a shared account).
+   config's values). The first two MUST be written in the file: live mode, the venue, the
+   watchdog and the read-only tools refuse a config that leaves them out (no default ever
+   targets subaccount 0); subaccount 0 is refused unless `venue.allow_primary_account: true`
+   AND `venue.shared_account: false`, and `shared_account: true` requires
+   `key_restricted_to_subaccount: true`. `config/kalshi.yaml`: `rate_limits.account_share`
+   <= 0.5 (0.2 here; live refuses more on a shared account). The share applies PER PROCESS:
+   keep the sum over all System 1 processes (live runner 0.2, the recorder 0.1 by default via
+   `config/feeds.yaml` `kalshi.account_share`, a paper runner, the watchdog, the tools) at or
+   below 0.5, so System 2 keeps at least half of the account's budget.
 
 What this settles and what stays open (**verify live**, section 5.1):
 * `GET /historical/fills` now takes `subaccount` (openapi 3.31.0; omitted = all subaccounts):
@@ -141,8 +169,18 @@ What this settles and what stays open (**verify live**, section 5.1):
   "names no subaccount" refusal).
 * WebSocket `fill` / `market_positions` / `user_orders` messages mark `subaccount` optional.
   With a restricted key a message WITHOUT it is subaccount 1's (server-side scoping) and the
-  runner accepts it; one with another number is dropped. The first own fill of every session
-  logs `verify_live ws_fill_subaccount_field` (present or not; metric `dh_verify_live`).
+  runner accepts it; one with another number is dropped. Independently of the key, a `fill` /
+  `user_orders` message (and a REST back-filled fill) is accepted only when its
+  `client_order_id` starts with this system's run prefix (`dhm1-`) or its order id is one this
+  session knows (acknowledged / updated with the prefix): even an unrestricted key could never
+  feed System 2's fills into System 1 (dropped, `dh_foreign_order_events_total`, ERROR log
+  `DROPPED ... of an order that is not ours`; replay applies the same rule). The first own fill
+  of every session logs `verify_live ws_fill_subaccount_field` (present or not; metric
+  `dh_verify_live`).
+* The bulk cancel-all's one-minute tail: whether it honours `subaccount` is unverified, so on a
+  shared account System 1 never sends `DELETE /portfolio/events/orders` (start-up, kill, halt,
+  shutdown, watchdog): the order groups are triggered and the resting orders of subaccount 1
+  are listed and cancelled by id, until the list is empty (section 6).
 * Unscoped `GET /portfolio/balance` = System 2's primary balance (spec): System 2 reads it as
   "the account total"; check once after funding that it equals the sub-0 row of
   `GET /portfolio/subaccounts/balances` (SHARED_ACCOUNT_AUDIT C(i)).
@@ -187,7 +225,9 @@ trading system. REST budgets are per ACCOUNT (docs.kalshi.com "Rate Limits and T
 and FIX drain the same read/write buckets), so `config/kalshi.yaml` sets
 `rate_limits.account_share: 0.2`: the limiter reads `GET /account/limits` and keeps this
 process to 20% of the refill rate and bucket capacity (capacity floored at the largest single
-request cost). Observed 2026-09-25: tier **basic**, read 200 tokens/s (capacity 600), write
+request cost). The share is per PROCESS: the recorder takes its own
+`config/feeds.yaml` `kalshi.account_share` (default **0.1**), and the sum over all System 1
+processes (runner, recorder, paper runner, watchdog, tools) should stay **<= 0.5**. Observed 2026-09-25: tier **basic**, read 200 tokens/s (capacity 600), write
 100 tokens/s (capacity 100), default cost 10, CF passthrough 50, `GET /portfolio/orders/{id}`
 and cancels 2 -> this system: **read 40 tokens/s (cap 120), write 20/s (cap 30)**. Kalshi
 documents no WebSocket connection limit; every process here opens at most ONE Kalshi
@@ -205,12 +245,16 @@ Mac `config/kalshi.yaml` exists (env file, `account_share: 0.2`,
 does not yet (`dh.live.tools` then falls back to `config/live.example.yaml`).
 * `config/m1.yaml` holds the strategy (sizes, limits, timers). Do not edit it casually: its
   digest is written on every log line and every session record.
-* `config/live.yaml`: keep `mode: paper` until section 5. `venue.subaccount: 1` (the
-  deployment; `null`/`0` = the primary account, refused live with `venue.shared_account:
-  true`). The subaccount is sent **explicitly on every request**, `0` included: Kalshi reads
+* `config/live.yaml`: keep `mode: paper` until section 5. `venue.subaccount: 1` and
+  `venue.shared_account: true` stated explicitly (the deployment; left out = refused live and by
+  the watchdog; `0` = the primary account, refused unless `venue.allow_primary_account: true`
+  on an account shared with nobody). The subaccount is sent **explicitly on every request**: Kalshi reads
   an omitted subaccount as "all subaccounts" on `GET /portfolio/orders`, `GET /portfolio/fills`
   and cancel-all; in live mode the REST client refuses, before signing, any write that does not
-  name `venue.subaccount` and an exchange shard (`UnscopedWriteError`). Fills, order updates
+  name `venue.subaccount` and an exchange shard (`UnscopedWriteError`); creates, amends and
+  order-group writes must name one of `venue.exchange_indexes` (a create on shard 0 is
+  refused), cancels may name any shard (a leftover elsewhere stays cancellable) or `-1`; on a
+  shared account the bulk cancel-all is refused too. Fills, order updates
   and positions of other subaccounts arriving on the private WebSocket channels are dropped
   (`dh_foreign_subaccount_events_total`), as are those of markets outside the configured series
   (`dh_foreign_series_events_total`). `venue.exchange_indexes: [2]`: the shards traded and
@@ -250,7 +294,7 @@ does not yet (`dh.live.tools` then falls back to `config/live.example.yaml`).
 | Benchmark back-fill | `python -m dh.live.tools backfill` | `"ok": true`, coverage >= 0.9 |
 | Resting orders | `python -m dh.live.tools orders` | `0 resting orders (subaccount 1)` (exit 0) |
 | Collateral | `python -m dh.live.tools balance` | every `venue.exchange_indexes` shard of subaccount 1 `OK` (>= worst-case loss + margin, $60) |
-| Fee schedule | `python scripts/verify_fee_schedule.py --days 14` | series fee types supported; once the account has fills: every fill matches (sets `fees.balance_precision_dollars`) |
+| Fee schedule | `python scripts/verify_fee_schedule.py --days 14` (fills of `venue.subaccount` of `config/live.yaml`, or `--subaccount N`; with neither, all subaccounts) | series fee types supported; once the subaccount has fills: every fill matches (sets `fees.balance_precision_dollars`) |
 | Clock | `chronyc tracking` (Linux) / `sntp time.apple.com` (macOS; query only, never sets the clock) | offset < 1 ms (Linux); macOS: answers, offset well below 250 ms and `+/-` below 250 ms (measured ~35-50 ms, +/- ~20 ms) |
 
 **First live run, 2026-09-25, this Mac, prod, shared account (all read-only):**
@@ -304,7 +348,9 @@ disk (see "Low disk" below).
   `created`/`activated` events of already-open markets (at most every `min_refresh_gap_s`;
   `created` events of markets that open later, e.g. a day of KXBTC15M created at once, are
   parked until their open time instead of re-running discovery). Kalshi REST use measured:
-  105 GETs in 14 min = ~1.2 tokens/s, 3% of this system's 40 tokens/s share.
+  105 GETs in 14 min = ~1.2 tokens/s; the recorder keeps to its own share of the account's
+  budget, `config/feeds.yaml` `kalshi.account_share` (default 0.1: 20 read tokens/s at basic),
+  so that all System 1 processes together stay <= 0.5 (section 1.3).
 * External venues (no credentials): Coinbase `level2` (full book) + trades, Kraken book 100 +
   trades, Bitstamp diff book + trades, Gemini `l2`, Crypto.com book 50 + trades, Deribit
   BTC-PERPETUAL book/ticker/trades/index/DVOL and option tickers (2 nearest expiries,
@@ -452,16 +498,21 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
       exactly, including Kalshi's per-order rounding, and blocks new orders on a mismatch.)
 - [ ] Subaccount 1 exists (created with `exchange_index: 2`), its netting is OFF, and it is
       funded **on shard 2**: `python -m dh.live.tools balance` says OK (section 1.2 step 3);
-      the funding transfer was declared to System 2.
+      the $1 probe and the funding transfer both matched exactly, and every transfer out of
+      subaccount 0 was declared to System 2 (`account_setup.py status`: `(0 missing)`).
 - [ ] Runner and watchdog keys are System 1's own, **restricted to subaccount 1**, in System 1's
       env file (1.2 step 4, 1.3); System 2's key is nowhere in System 1's configuration.
-- [ ] `config/live.yaml`: `venue.subaccount: 1`, `venue.shared_account: true`,
-      `venue.key_restricted_to_subaccount: true`, `venue.exchange_indexes: [2]`;
-      `config/kalshi.yaml`: `rate_limits.account_share` <= 0.5 (0.2).
+- [ ] `config/live.yaml` states `venue.subaccount: 1`, `venue.shared_account: true`,
+      `venue.key_restricted_to_subaccount: true`, `venue.exchange_indexes: [2]` (written in the
+      file, not left to defaults); `config/kalshi.yaml`: `rate_limits.account_share` <= 0.5
+      (0.2), and all System 1 processes together <= 0.5 (recorder 0.1).
 - [ ] Watchdog running with its own key and `--arm-on-start` (macOS: the launchd agent,
-      `deploy/launchd/README.md`), logging `subaccount 1`; kill drill done (section 6) with
-      the runner in paper mode + watchdog `--cancel-now` (triggers the heartbeat's groups, then
-      cancels subaccount 1's orders).
+      `deploy/launchd/README.md`), logging `subaccount 1; cancel by id`, and its beat
+      `data/run/heartbeat.json.watchdog` fresh (`t` within a second, `subaccount` 1); kill drill
+      done (section 6) with the runner in paper mode + watchdog `--cancel-now` (triggers the
+      heartbeat's groups, then lists and cancels subaccount 1's orders by id).
+- [ ] At least 10 GB free on the disk of `paths.data_root` (`df -H data`; the start is refused
+      below `disk.min_free_gb_start`).
 - [ ] One runner per Kalshi subaccount; System 1 only ever on subaccount 1 (section 1.2).
 - [ ] Clock: `chronyc tracking` works for the runner's user/container (Linux) or `sntp
       time.apple.com` answers (macOS; `loop.clock_alarm_ms: 100` there), and the runner's first
@@ -481,7 +532,9 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
    refuses `loop.strategy_error: continue`, `venue.exclude_events_with_positions: false`,
    `venue.startup_cancel_all: false` (paper-only debugging settings), `loop.clock_sample_s: 0`,
    `venue.exchange_status_interval_s: 0` / `venue.balance_interval_s: 0`, an empty
-   `venue.exchange_indexes`, and, with `venue.shared_account: true`, subaccount null/0 or
+   `venue.exchange_indexes`, a `venue.subaccount` or `venue.shared_account` not stated in the
+   file, subaccount 0 (unless `venue.allow_primary_account: true` and `shared_account: false`),
+   and, with `venue.shared_account: true`, `key_restricted_to_subaccount: false` or
    `rate_limits.account_share` > 0.5.
 2. Start the watchdog first (macOS: `launchctl bootstrap gui/$(id -u)
    ~/Library/LaunchAgents/com.dh.watchdog.plist`, `deploy/launchd/README.md`; or by hand in its
@@ -491,7 +544,8 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
    ```
    (`--arm-on-start`: a watchdog restarted while the runner may have died meanwhile still
    triggers its order groups and cancels its orders, section 6.) Its log says `watching
-   .../heartbeat.json (stale after 2.0s; subaccount 1)`.
+   .../heartbeat.json (stale after 2.0s; subaccount 1; cancel by id; beat
+   .../heartbeat.json.watchdog)`. The runner will not start without that fresh beat (next step).
 3. Start the runner by hand (never a launchd job; both the config flag and the command-line
    flag are required; on macOS under `caffeinate -i`, lid open):
    ```sh
@@ -501,9 +555,14 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
    Use `--duration` for the first sessions and stay at the screen.
 
 Live start-up adds, in this order, before discovery:
-0. a watchdog marker `<heartbeat>.cancel_all` left from before this start is renamed to
-   `<heartbeat>.cancel_all.stale-<unix s>` (logged): it is about an earlier runner; then the
-   REST client is built (live: it refuses any write not naming subaccount 1 and a shard);
+0. **local guards, before anything is read or sent**: at least `disk.min_free_gb_start` (10 GB)
+   free on the disk of `paths.data_root`, and a **fresh watchdog beat for subaccount 1**
+   (`<heartbeat>.watchdog`, younger than `watchdog.runner_max_age_s` = 10 s, naming subaccount
+   1), else exit 2 (`no watchdog beat` / `watchdog beat ... old` / `the watchdog acts for
+   subaccount ...`: start or fix the watchdog first). A watchdog marker `<heartbeat>.cancel_all`
+   left from before this start is renamed to `<heartbeat>.cancel_all.stale-<unix s>` (logged):
+   it is about an earlier runner; then the REST client is built (live: it refuses any write not
+   naming subaccount 1 and one of its shards, and on the shared account the bulk cancel-all);
 1. **exchange status of shard 2**: `GET /exchange/status`, the shard's own entry in
    `exchange_index_statuses` (the top level describes shard 0); not trading -> exit 2. The
    schedule (`GET /exchange/schedule`: maintenance windows, the weekly Thursday 03:00-05:00 ET
@@ -513,14 +572,18 @@ Live start-up adds, in this order, before discovery:
    proves the subaccount exists and is funded where its collateral is checked) must be >=
    worst-case loss + margin ($60) on every `venue.exchange_indexes` shard, else exit 2;
    `dh_balance_dollars{exchange_index}` / `dh_shard_funds_dollars` from the first second;
-3. **key restriction** (`venue.key_restricted_to_subaccount: true`): `GET /api_keys` must show
-   the runner key restricted to subaccount 1 (else, if the key is not listed or the call is
-   refused, the balance response must lack `balance_breakdown`, which Kalshi omits only for
-   restricted keys); an unrestricted key -> exit 2;
-4. **clean slate**: `DELETE /portfolio/events/orders?subaccount=1` (subaccount 1 only, every
-   shard; scoped server-side too by the restricted key), then the resting-order list of
-   subaccount 1 must come back empty (leftovers are cancelled one by one with their own shard,
-   3 rounds; still resting -> exit 2);
+3. **key restriction** (`venue.key_restricted_to_subaccount: true`, required on the shared
+   account): `GET /portfolio/balance?subaccount=0` with the runner key must be REFUSED with
+   HTTP 401/403 (positive proof: a restricted key cannot read another subaccount); a 2xx
+   (unrestricted key) -> exit 2, any other failure (5xx, network) -> exit 2 (no proof; retry).
+   `GET /api_keys` is secondary: listing the key unrestricted or on another subaccount also
+   refuses; its failure (normal for a restricted key) is only noted;
+4. **clean slate**: on the shared account the resting orders of subaccount 1 (`GET
+   /portfolio/orders?status=resting&subaccount=1`, every shard) are cancelled BY ID (batch
+   cancel, every item with `subaccount: 1` and the order's own shard), and the list must come
+   back empty within `venue.cancel_rounds` (3) rounds, else exit 2. The bulk
+   `DELETE /portfolio/events/orders` is used only on an account declared `shared_account:
+   false` (then verified with the list the same way);
 5. **positions** of subaccount 1 are read AFTER that (an order resting while positions are read
    could fill unseen): **events that already hold a position are excluded** for this session
    (they settle within the hour); positions outside the configured series are logged and
@@ -535,9 +598,10 @@ Live start-up adds, in this order, before discovery:
    timeless fill / settlement row of the series, or a failed read, refuses the start (exit 2);
    a missing price falls back to the worst case and is logged (`risk state: ... no exchange
    price`). If midnight UTC passes meanwhile, it is derived again for the new day;
-7. **new orders are held for `venue.cancel_all_hold_s` (60 s) after that cancel-all**: Kalshi
-   documents that a cancel-all may also cancel orders placed during the following minute.
-   The strategy is told (`kalshi.reconcile` stale) and does not quote until the hold ends.
+7. only after a BULK cancel-all (a non-shared account): **new orders are held for
+   `venue.cancel_all_hold_s` (60 s)**, since Kalshi documents that it may also cancel orders
+   placed during the following minute (the strategy is told, `kalshi.reconcile` stale). The
+   shared account's by-id clean slate has no such tail: no hold.
 
 Discovery keeps only markets on a known shard listed in `venue.exchange_indexes` (skipped
 otherwise: `market ...: exchange shard ...` log lines). Then the exchange **order group** is
@@ -571,9 +635,16 @@ lock). Both may share the kill file (a kill stops both). Under Docker
 * **Exchange pauses**: `GET /exchange/status` every `venue.exchange_status_interval_s` (10 s;
   shard 2's own entry), the schedule's closures (re-read hourly; quotes pulled
   `venue.pause_lead_s` = 60 s before one, e.g. the weekly Thursday 03:00-05:00 ET trading pause)
-  and any place rejected with a pause-like reason (held `venue.pause_reject_hold_s` = 30 s,
+  and any place rejected with an EXCHANGE-level pause reason (`exchange ... paused/closed`,
+  `trading ... paused`, `outside trading hours`; held `venue.pause_reject_hold_s` = 30 s,
   status polled at once): new orders blocked (`gate exchange_pause`) and the strategy told
-  `kalshi.reconcile` stale (it cancels its quotes while cancels still work). When trading is
+  `kalshi.reconcile` stale (it cancels its quotes while cancels still work). A MARKET-level
+  pause reject (`market ... paused`, or an unqualified `paused`) blocks only that market for
+  the hold (`block market_pause`, its quotes cancelled; the status poll, run at once, decides
+  the global state). `venue.exchange_status_max_failures` (3) failed status polls in a row
+  close `gate exchange_pause` as well (fail closed; reason `exchange status unreadable`) until
+  a poll succeeds. The schedule's session closing at `00:00` ET means midnight (the end of the
+  day), not a closure. When trading is
   active again, fills / positions / resting orders are re-read before it quotes (`resynced`).
   A **trading pause** (`trading_active` false) still accepts cancels; an **exchange pause**
   (`exchange_active` false, logged CRITICAL) rejects cancels too: then only
@@ -582,8 +653,12 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   `GET /portfolio/balance?subaccount=1&exchange_index=2` (the AVAILABLE cash) + the cost of
   subaccount 1's open positions there (`market_exposure_dollars`) + the collateral of its
   resting orders there (so our own quotes and fills never make a funded shard look empty; a
-  transfer out or a real loss does); below the requirement ($60) or unreadable -> `gate
-  balance` (new orders blocked, resting ones stay) until a read shows it covered again.
+  transfer out or a real loss does), except the part of a resting order that closes a held
+  position (an ask against a long YES position, a bid against a short one: Kalshi reserves no
+  collateral for it); below the requirement ($60) or unreadable -> `gate balance` (new orders
+  blocked, resting ones stay) until a read shows it covered again. A failed read changes
+  nothing, but `venue.balance_max_failures` (3) failed reads in a row close the gate (fail
+  closed).
   `dh_balance_dollars` = available cash, `dh_shard_funds_dollars` = the funds compared.
 * A create with unknown outcome (timeout, 5xx) is **never resent**: the runner looks the
   order up by client_order_id with the explicit subaccount (backoff 0.5 s .. 30 s), and only
@@ -607,8 +682,12 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   a fill the WebSocket lost silently is back-filled by it instead of halting the bot. Each
   positions read is preceded by `GET /exchange/user_data_timestamp` (the time up to which
   Kalshi's portfolio reads are validated; REST lags the exchange): a read whose timestamp is
-  older than the last WebSocket fill never confirms a difference (`position_confirm_deferred`,
-  `dh_position_reads_stale_total`; read again at once). WebSocket position messages can raise
+  older than the last WebSocket fill OF THAT MARKET does not confirm its difference
+  (`position_confirm_deferred`, `dh_position_reads_stale_total`; read again at once), at most
+  `venue.position_defer_max` (5) times / `venue.position_defer_max_s` (60 s) after the
+  difference was first seen: then the next read validated after that first sight confirms it
+  (Halt), so fills that keep arriving can no longer defer a real mismatch forever (after twice
+  that time any read confirms). WebSocket position messages can raise
   or clear a suspicion (and trigger that check at once) but never confirm one.
 * Positions of excluded events (held at start-up) are carried at their start-up marks; when
   such a market is determined, the runner realizes it at once (an updated `RiskStateSeed`
@@ -646,10 +725,28 @@ lock). Both may share the kill file (a kill stops both). Under Docker
 * **CancelAll**: with a (manual) Halt in the same cycle -> first the **order-group trigger**
   (`PUT /portfolio/order_groups/{id}/trigger?subaccount=1&exchange_index=2`: cancels the
   group's quotes, rejects new ones, no documented trailing tail; the group is never reset or
-  re-created in this session), then `DELETE /portfolio/events/orders?subaccount=1` (and new
-  orders held 60 s, moot while halted); without one (lag, disconnect, reconciling, pauses) ->
-  the strategy's working orders are cancelled in batches and every other order still resting
-  (REST list) is swept, so quoting can resume without the one-minute cancel-all tail.
+  re-created in this session), then every resting order of subaccount 1: on the shared account
+  listed (`GET /portfolio/orders?status=resting&subaccount=1`) and cancelled BY ID (batch
+  cancel, `subaccount` + the order's shard on every item), repeated until the list is empty
+  (`venue.cancel_rounds`, then the `cancel_all_leftovers` alarm); only on an account declared
+  not shared `DELETE /portfolio/events/orders?subaccount=1` (and new orders held 60 s, moot
+  while halted). A timed halt does the same without the trigger. Without a halt (lag,
+  disconnect, reconciling, pauses) -> the strategy's working orders are cancelled in batches
+  and every other order still resting (REST list) is swept, so quoting can resume at once.
+* **Watchdog liveness** (`<heartbeat>.watchdog`, read every second): a beat older than
+  `watchdog.runner_max_age_s` (10 s), a watchdog that exited or acts for another subaccount,
+  or, once the runner has been running 10 s, one not armed on this runner (pid + session) ->
+  new orders blocked (`gate watchdog`, CRITICAL log) and the strategy told `kalshi.reconcile`
+  stale (it pulls its quotes); it resumes when the beat is good again (`dh_watchdog_ok`).
+* **Free disk** (every `disk.check_interval_s`, 60 s): below `disk.min_free_gb_gate` (5 GB) on
+  the disk of `paths.data_root`, or unmeasurable -> `gate disk` and the strategy pulls its
+  quotes, until it is back above 5 + `disk.resume_margin_gb` (1) GB (`dh_disk_free_gb`).
+* **Own-activity filter**: `fill` / `user_orders` messages and REST back-filled fills are fed
+  only when their client_order_id starts with this system's run prefix (`dhm1-`) or their
+  order id is one of this session's; anything else is dropped and counted
+  (`dh_foreign_order_events_total`, ERROR `DROPPED ...`: another system's activity reaches
+  this key: stop and check the key restriction). Fills of an earlier session's orders found by
+  a back-fill after a restart are skipped silently (`dh_fills_before_session_skipped_total`).
 * Every 2 s: `GET /portfolio/orders/queue_positions?subaccount=1` -> calibration samples of the
   queue estimator (`dh_queue_error_contracts`, `queue_positions` log lines). The endpoint has
   no `exchange_index` parameter and the docs do not say whether it covers shard 2 (**verify
@@ -659,9 +756,12 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   persisted as a halt.
 * New orders (and amends) are blocked (cancels never) while the kill file exists, after a
   strategy Halt (before the orders decided in the same cycle go out), on a fee mismatch, on
-  data lag or a loop stall, while reconciling, during a cancel-all hold, during an exchange /
-  trading pause, while the shard balance is below the requirement, while the clock offset
-  (chrony offset plus the drift of the session clock from the wall clock) exceeds
+  data lag or a loop stall, while reconciling, during a cancel-all hold (after a bulk
+  cancel-all only), during an exchange / trading pause (or while the status is unreadable),
+  while the shard balance is below the requirement (or unreadable 3 times in a row), while the
+  watchdog's beat is stale or not armed on this runner, while free disk is below 5 GB, while the clock offset
+  (chrony / sntp offset plus the drift of the session clock from the wall clock, kept near
+  zero by the slew) exceeds
   `loop.clock_block_ms` on `loop.clock_block_samples` checks in a row **or the clock cannot be
   trusted** (live: no `chronyc`/`timedatectl` answer (macOS: no `sntp` answer), not
   synchronised, estimated error above `loop.clock_max_est_error_ms`, or every market-data
@@ -669,53 +769,72 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   proves the local clock behind; `dh_clock_untrusted` = 1, re-sampled every
   `loop.clock_resample_s` until it recovers; the strategy is told `runner.clock` stale and
   pulls its quotes), and per market after a
-  close-time / tick-grid change of that market or a spec change found by re-discovery. Event
+  close-time / tick-grid change of that market, a spec change found by re-discovery, or (for
+  `venue.pause_reject_hold_s`) a market-level pause reject. Event
   fee overrides (`event_fee_update`) are re-priced by the strategy itself; the runner's fee
   check follows them (a cleared override restores the market's base fee), and re-discovery
   compares the base fee, so an override never blocks a market.
-* Receive times come from one monotonic, strictly increasing clock anchored to the wall
-  clock at start: a wall-clock step never moves them (a large step shows up as clock offset
-  and blocks new orders; a restart re-anchors).
+* Receive times come from one strictly increasing clock anchored to the wall clock at start,
+  advanced by the monotonic clock and SLEWED toward the wall clock at <= 50 ppm: the monotonic
+  clock's rate error (this Mac: ~3.2 ppm, 11.5 ms/h) never accumulates, so the clock offset
+  stays at the wall clock's own (chrony / sntp) offset for any session length. It never steps:
+  a wall-clock step moves it by at most 50 us per second, so a large step still shows up as a
+  clock offset for hours (a 1 s step: ~5.5 h above 250 ms) and blocks new orders (fail safe;
+  a restart re-anchors). Receive times are recorded, so replay is unaffected.
 
 ---------------------------------------------------------------------------------------------
 ## 6. Kill procedures (fastest first)
 
-Every kill path acts on **subaccount 1 only**: `DELETE /portfolio/events/orders?subaccount=1`
-is scoped by its parameter AND, with the restricted keys, by Kalshi itself; System 2's orders on
-subaccount 0 are never touched. Each kill path first **triggers the order group(s)**
-(`PUT /portfolio/order_groups/{id}/trigger?subaccount=1&exchange_index=2`): the fastest scoped
-kill, it cancels every quote of the group on its shard and rejects new ones until a reset (none
-follows), with no documented trailing tail (unlike cancel-all's "orders placed during the next
-minute may also be cancelled"); the subaccount's cancel-all follows for everything outside a
-group. Runtime directory below: `/run/dh` (Linux) or `data/run` (macOS).
+Every kill path acts on **subaccount 1 only**, and on the shared account **never through the
+bulk cancel-all** (`DELETE /portfolio/events/orders`: Kalshi says it "may also cancel newly
+placed orders during the minute after the request", and whether that tail honours `subaccount`
+is unverified: it could cancel System 2's new orders, leaving it a naked leg). Each kill path
+(1) **triggers the order group(s)** (`PUT /portfolio/order_groups/{id}/trigger?subaccount=1&
+exchange_index=2`: the fastest scoped kill, it cancels every quote of the group on its shard and
+rejects new ones until a reset (none follows), with no documented trailing tail), then (2)
+**lists the resting orders of subaccount 1** (`GET /portfolio/orders?status=resting&
+subaccount=1`, every shard) and **cancels them by id** (`DELETE /portfolio/events/orders/batched`,
+every item with `subaccount: 1` and the order's shard), repeated until the list is empty
+(bounded rounds; still resting -> exit 3 / the `cancel_all_leftovers` alarm, the watchdog keeps
+retrying). The REST clients of the runner and the watchdog refuse the bulk endpoint before
+signing on a shared account, and a static test (`tests/live/test_prelive_fixes.py`) fails if any
+code path reachable with `shared_account: true` can call it. Runtime directory below: `/run/dh`
+(Linux) or `data/run` (macOS).
 
 1. **Kill file** (preferred; <= 0.2 s): `echo "reason" > /run/dh/KILL` (macOS:
    `echo "reason" > data/run/KILL`)
-   New orders blocked, group trigger, cancel-all via REST, graceful stop (in-flight requests
-   awaited, resting orders verified, order group deleted). The runner refuses to start while
-   the file exists: remove it after the investigation (`rm <run dir>/KILL`).
-2. **SIGTERM / Ctrl-C**: same graceful stop (group trigger, cancel-all, verification) without
-   the kill-file flag.
+   New orders blocked, group trigger, every resting order of subaccount 1 cancelled by id,
+   graceful stop (in-flight requests awaited, resting orders verified, order group deleted).
+   The runner refuses to start while the file exists: remove it after the investigation
+   (`rm <run dir>/KILL`).
+2. **SIGTERM / Ctrl-C**: same graceful stop (group trigger, cancel by id, verification)
+   without the kill-file flag.
 3. **Watchdog, manual**: `python scripts/watchdog.py --live-config config/live.yaml --cancel-now`
    (its own key and session: works when the runner is hung): triggers the groups named in the
-   heartbeat file, then cancels all of subaccount 1.
+   heartbeat file (only if it names subaccount 1), then lists and cancels by id every resting
+   order of subaccount 1.
 4. **Watchdog, automatic**: locks onto the live runner it armed on (pid + session; any other
    writer of the file is ignored, so a paper runner or a second process can neither disarm
    it nor keep it quiet) and, when that runner's heartbeat is older than 2 s
    (`watchdog.stale_s`), when the file vanished, or when a shutdown hangs longer than the
    runner's `shutdown_timeout_s` + `watchdog.stopping_grace_s` (the runner also stops writing
    `stopping` after its timeout), first triggers the order groups of the runner's last
-   heartbeat (only groups of `venue.subaccount`, each on its shard), then fires
-   `DELETE /portfolio/events/orders?subaccount=1`. It retries every second until the
-   cancel-all succeeds and repeats every 30 s while stale. After each attempt it writes
-   `<heartbeat>.cancel_all` (`{"t", "ok", "watched": [pid, session], "groups_triggered"}`). A
-   live runner that
+   heartbeat (only groups of `venue.subaccount`, each on its shard), then lists and cancels by
+   id every resting order of subaccount 1 (the bulk cancel-all only on an account declared not
+   shared). It only ever locks onto a heartbeat that names ITS subaccount (`"subaccount": 1`).
+   It retries every second until the list is empty and repeats every 30 s while stale (orders
+   in flight when the runner died). After each attempt it writes
+   `<heartbeat>.cancel_all` (`{"t", "ok", "watched": [pid, session], "groups_triggered",
+   "bulk"}`). A live runner that
    finds a marker written after its own start **about itself** was alive but unresponsive:
    it **halts** (Halt(all), reason `watchdog_cancel_all`, persisted and carried across
    restarts: investigate why the heartbeat went stale, then `--reset-daily-halt`). A marker
-   about another runner (a restart racing a trigger) only holds new orders for 60 s and
-   reconciles. A clean shutdown writes heartbeat state `stopped` only after the cancel-all was
-   confirmed, which disarms it; a new live runner re-arms it.
+   about another runner (a restart racing a trigger) reconciles (and, only after a bulk
+   cancel-all on a non-shared account, holds new orders for 60 s). A clean shutdown writes
+   heartbeat state `stopped` only after the cancel was confirmed, which disarms it; a new live
+   runner re-arms it. While it runs, the watchdog writes its own beat `<heartbeat>.watchdog`
+   every second (`EXITED` when it stops): the live runner refuses to start without a fresh one
+   for its subaccount, and stops quoting (`gate watchdog`) when it goes stale.
    **`--arm-on-start`** (used by `deploy/docker-compose.yml`): on its first poll a restarted
    watchdog acts on an EXISTING LIVE heartbeat only (mode live, state running/stopping): it
    locks onto that runner if the heartbeat is fresh, and cancels all at once if it is stale
@@ -741,10 +860,11 @@ them at the pause) and the 120 s expiry. A trading pause (the weekly Thursday 03
 window, `trading_active` false) still accepts cancels; sessions may be disconnected in it.
 
 **The cancel-all tail**: Kalshi documents that `DELETE /portfolio/events/orders` may also
-cancel orders placed during the minute after the request. After any global cancel-all (the
-start-up clean slate, a kill, a halt, the watchdog) new orders are therefore held for
-`venue.cancel_all_hold_s` (60 s); a restart right after a kill or a watchdog trigger quotes a
-minute later.
+cancel orders placed during the minute after the request, and does not say whether that tail
+respects `subaccount`. That is why the shared account never sends it (above). Only on an
+account declared `shared_account: false` is it used (start-up clean slate, kill, halt, shutdown,
+watchdog); new orders are then held for `venue.cancel_all_hold_s` (60 s) after one. On the
+shared account there is no hold: a restart right after a kill quotes as soon as it is ready.
 
 After any kill: `python -m dh.live.tools orders` must print `0 resting orders (subaccount 1)`;
 check positions (`GET /portfolio/positions?subaccount=1`, or the UI); write down what happened.
@@ -766,12 +886,15 @@ check positions (`GET /portfolio/positions?subaccount=1`, or the UI); write down
 | `dh_consumer_lag_seconds` | data lag: max(queue lag, exchange-time lag) | > 0.5 s sustained |
 | `dh_lag_episodes_total{why}`, `dh_loop_stalls_total` | lag / stall gate closures | growing |
 | `dh_queue_depth` | events waiting | > 1000 |
-| `dh_gate_closed`, `dh_gate_reason{reason}` | new orders blocked (lag, reconciling, cancel_all_hold, clock, exchange_pause, balance) | 1 for long (read `/health` `gate`) |
-| `dh_exchange_paused`, `dh_exchange_active`, `dh_trading_active`, `dh_exchange_pauses_total`, `dh_pause_rejects_total`, `dh_next_closure_ts` | trading / exchange pauses of shard 2 (status poll, schedule, rejects) | paused outside the Thursday window |
+| `dh_gate_closed`, `dh_gate_reason{reason}` | new orders blocked (lag, reconciling, cancel_all_hold, clock, exchange_pause, balance, watchdog, disk) | 1 for long (read `/health` `gate`) |
+| `dh_watchdog_ok` | the watchdog's beat is fresh, for subaccount 1, armed on this runner (`/health` `watchdog`) | 0 |
+| `dh_disk_free_gb` | free space of the data root's disk (`/health` `disk`) | < 10 |
+| `dh_foreign_order_events_total{type,source}` | fills / order updates of client_order_ids that are not ours, dropped | > 0: another system's activity reaches this key |
+| `dh_exchange_paused`, `dh_exchange_active`, `dh_trading_active`, `dh_exchange_pauses_total`, `dh_pause_rejects_total{scope}`, `dh_exchange_status_errors_total`, `dh_next_closure_ts` | trading / exchange pauses of shard 2 (status poll, schedule, rejects: scope exchange / market), status polls failing | paused outside the Thursday window; errors growing |
 | `dh_balance_dollars{exchange_index}`, `dh_shard_funds_dollars{exchange_index}`, `dh_balance_required_dollars` | subaccount 1's available cash per shard; its funds (cash + positions at cost + resting collateral) vs the requirement | funds below the requirement |
 | `dh_verify_live{check}` | open questions settled by the first live session (`ws_fill_subaccount_field`, `queue_positions_covers_shard`): 1 as expected, 0 not | 0 |
 | `dh_queue_positions_coverage` | share of our resting orders `queue_positions` returned (shard-2 coverage) | < 1 persistently |
-| `dh_position_reads_stale_total` | positions reads older than the last WS fill (user_data_timestamp): never confirmed | growing fast |
+| `dh_position_reads_stale_total` | positions reads older than the last WS fill of the market (user_data_timestamp): deferred (capped: 5 / 60 s) | growing fast |
 | `dh_foreign_series_events_total` | own-channel events of markets outside the series (dropped) | > 0 (who trades subaccount 1?) |
 | `dh_reconciling` | own-activity reconciliation in progress | 1 for > 60 s |
 | `dh_venue_stuck_cancels` | orders still resting after every cancel failed | > 0: Kalshi UI now |
@@ -795,7 +918,7 @@ check positions (`GET /portfolio/positions?subaccount=1`, or the UI); write down
 | `dh_venue_unknown_outcomes`, `dh_venue_pending_reconciliations` | REST writes with unknown outcome | pending > 0 for > 60 s |
 | `dh_rest_rtt_seconds_{count,sum,max}{op,outcome}` | REST latency | p99 > 250 ms |
 | `dh_gate_rejects_total{reason}` | orders blocked by the gate | growing unexpectedly |
-| `dh_clock_offset_seconds`, `dh_clock_alarms_total` | clock offset (chrony / macOS sntp + session-clock drift) | alarms > 0 (> `clock_alarm_ms`: 5 ms Linux, 100 ms on this Mac); orders blocked above 250 ms |
+| `dh_clock_offset_seconds`, `dh_clock_alarms_total` | clock offset (chrony / macOS sntp + session-clock drift, kept near zero by the <= 50 ppm slew) | alarms > 0 (> `clock_alarm_ms`: 5 ms Linux, 100 ms on this Mac); orders blocked above 250 ms |
 | `dh_recorder_write_errors`, `dh_record_errors_total` | capture | > 0 |
 | `dh_strategy_errors_total`, `dh_source_restarts_total{source}` | crashes / reconnect loops | > 0 |
 
@@ -811,6 +934,8 @@ jq -c 'select(.k=="action" and .type=="PlaceOrder") | [.t,.ticker,.book_side,.px
 jq -c 'select(.k=="feed_status")' $L                 # gaps / disconnects
 jq -c 'select(.k=="verify_live" or .k=="exchange_pause" or .k=="exchange_status" or .k=="pause_reject")' $L
 jq -c 'select(.k=="kill_switch" or .k=="venue.groups_triggered" or .k=="venue.order_group")' $L
+jq -c 'select(.k=="venue.cancel_all" or .k=="venue.cancel_all_round" or .k=="venue.cancel_all_leftovers")' $L
+jq -c 'select(.k=="foreign_order_event" or .k=="exchange_status_unreadable" or .k=="position_confirm_deferred")' $L
 ```
 
 ---------------------------------------------------------------------------------------------
@@ -829,10 +954,16 @@ jq -c 'select(.k=="kill_switch" or .k=="venue.groups_triggered" or .k=="venue.or
 | `log.risk` `abnormal_move`, `settlement_loss_pause` | timed pauses inside the strategy | nothing (they expire; a pause survives a restart) |
 | `gate` `lag` | data lag or a loop stall (quotes cancelled) | check CPU, `dh_queue_depth`, `dh_consumer_lag_seconds`; reduce load |
 | `gate` `reconciling` / `reconcile` log | WS reconnect, cancel-all hold | nothing; > 60 s: check REST (`reconcile_error` lines) |
-| `gate` `cancel_all_hold` | the minute after a global cancel-all | nothing (expires) |
-| `gate` `clock` | clock offset > 250 ms persists, or the clock cannot be trusted (`gate` log `why`: unmeasurable / not synchronised / estimated error / behind exchange time) | fix chrony (`chronyc tracking`; Docker: `/run/chrony` mounted; macOS: `sntp time.apple.com` must answer, check the network / time server); restart the runner (re-anchors its clock) |
+| `gate` `cancel_all_hold` | the minute after a BULK cancel-all (non-shared account only) | nothing (expires) |
+| `gate` `watchdog` (CRITICAL `WATCHDOG: ...`) | the watchdog's beat `<heartbeat>.watchdog` is older than 10 s, missing, `EXITED`, names another subaccount, or is not armed on this runner | the runner keeps its resting orders cancelled and does not quote: check the watchdog (`launchctl print gui/$(id -u)/com.dh.watchdog`, `data/logs/watchdog.launchd.out`, `cat data/run/heartbeat.json.watchdog`); it resumes by itself once the beat is good |
+| `gate` `disk` | < 5 GB free on the data root's disk (or unmeasurable) | free space from OUR `data/` (section 3 "Low disk"); resumes above 6 GB |
+| `gate` `exchange_pause`, `exchange_status_unreadable` log | 3 status polls in a row failed (fail closed) | check the network / `smoke_kalshi.py`; resumes after a successful poll and the re-read |
+| `block` `market_pause`, `pause_reject` log with `scope: market` | a place in that market was rejected for a market-level pause | nothing: that market only, lifted after `pause_reject_hold_s` (30 s) |
+| `foreign_order_event` log (ERROR `DROPPED ...`), `dh_foreign_order_events_total` | a fill / order update whose client_order_id is not ours and whose order id is unknown | STOP and check the keys: with System 1's restricted key this should never happen (another system's activity reaches this key) |
+| `venue.cancel_all_leftovers` log | orders of subaccount 1 still resting after every cancel-by-id round | Kalshi UI / `tools orders`; the watchdog keeps trying |
+| `gate` `clock` | clock offset > 250 ms persists, or the clock cannot be trusted (`gate` log `why`: unmeasurable / not synchronised / estimated error / behind exchange time) | fix chrony (`chronyc tracking`; Docker: `/run/chrony` mounted; macOS: `sntp time.apple.com` must answer, check the network / time server). The session clock's own drift is slewed away, so a long session no longer reaches the block by itself; after a wall-clock STEP the offset decays only at 50 us/s: restart the runner (re-anchors its clock) |
 | `gate` `exchange_pause`, `exchange_pause` / `exchange_status` log | shard 2 not trading (status poll), a scheduled closure within `pause_lead_s`, or a place rejected for a pause | nothing: quoting resumes after trading is active again and fills / positions / orders were re-read; an `EXCHANGE PAUSE` (cancels rejected too): watch `dh_venue_stuck_cancels`, resting quotes rely on `cancel_order_on_pause` |
-| `gate` `balance` | subaccount 1's balance on a shard below worst-case loss + margin (or unreadable) | fund subaccount 1 on that shard (1.2 step 3, declared to System 2) or stop; reopens on the next read (60 s) |
+| `gate` `balance` | subaccount 1's funds on a shard below worst-case loss + margin (or unreadable 3 reads in a row) | fund subaccount 1 on that shard (1.2 step 3, declared to System 2) or stop; reopens on the next good read (60 s) |
 | `kill_switch` log, `venue.groups_triggered` | a manual halt / kill / fee mismatch / watchdog marker / shutdown triggered the order group(s) | nothing: the group stays triggered for the session (never reset); the next start creates a fresh one |
 | `verify_live` log, `dh_verify_live{check}` 0 | the first live session answered an open question differently than expected | `ws_fill_subaccount_field` 0 with an unrestricted key: switch to restricted keys (1.2); `queue_positions_covers_shard` 0: queue calibration has no shard-2 samples (report, not a trading problem) |
 
@@ -877,10 +1008,11 @@ start-up), and a later restart the same UTC day keeps that base. The override is
 Do not delete the state file instead: the start-up re-derivation from Kalshi would still count
 the day's loss (and a sticky halt would be lost).
 
-A restart after a crash is safe: start-up checks the shard balance, cancels subaccount 1's
-leftovers (verified), excludes events with positions, counts the day's P&L, holds new orders
-for the cancel-all minute and creates a fresh order group on shard 2 (the old one may still be
-triggered: it is never reused). The weekly Thursday 03:00-05:00 ET trading pause needs no
+A restart after a crash is safe: start-up checks the free disk and the watchdog's beat, the
+shard balance and the key restriction, cancels subaccount 1's leftovers by id (verified),
+excludes events with positions, counts the day's P&L and creates a fresh order group on shard 2
+(the old one may still be triggered: it is never reused). Only after a bulk cancel-all (a
+non-shared account) are new orders held for the cancel-all minute. The weekly Thursday 03:00-05:00 ET trading pause needs no
 restart: the runner pulls its quotes a minute before, waits, re-reads and resumes.
 
 ---------------------------------------------------------------------------------------------
@@ -926,9 +1058,14 @@ simulation and attribution before it is believed.
 |---|---|
 | `refusing to start: kill-file directory /run/dh does not exist` | section 1.1 (Linux); on macOS leave `paths.kill_file` empty (`data/run`, created on demand) |
 | `kill file ... is present` | investigate, then `rm <run dir>/KILL` |
-| `venue.shared_account is true: venue.subaccount must be a dedicated subaccount` / `rate_limits.account_share ... must be <= 0.5` | `config/live.yaml` / `config/kalshi.yaml` (section 1.2 step 6) |
+| `venue.subaccount is not set` / `venue.shared_account is not set` / `venue.subaccount is 0 (the primary account): refused ...` / `venue.shared_account is true: venue.key_restricted_to_subaccount must be true` / `rate_limits.account_share ... must be <= 0.5` | state them in `config/live.yaml` / fix `config/kalshi.yaml` (section 1.2 step 6); the watchdog (exit 2) and `dh.live.tools` refuse the same config |
+| `no watchdog beat (is scripts/watchdog.py running on this heartbeat file?)` / `watchdog beat ... old` / `the watchdog acts for subaccount ...` / `the watchdog exited` | start the watchdog first (5.2 step 2; macOS: `launchctl kickstart -k gui/$(id -u)/com.dh.watchdog`), with the SAME `config/live.yaml` (heartbeat path, `venue.subaccount`); `cat data/run/heartbeat.json.watchdog` |
+| watchdog log `refusing to run: no watchdog key ...` (exit 2) | put `KALSHI_WATCHDOG_KEY_ID` / `KALSHI_WATCHDOG_PRIVATE_KEY_PATH` (System 1's second restricted key) in System 1's env file (1.3); `watchdog.allow_runner_key: true` only deliberately |
+| watchdog log `ignoring a live heartbeat of another subaccount` | the runner and the watchdog use different live configs: give both the same `config/live.yaml` |
+| `only N GB free on the disk of ... (< disk.min_free_gb_start 10 GB)` | free space from OUR `data/` (section 3 "Low disk"), never the other system's files |
 | `balance of subaccount 1 on shard(s) {...} does not cover ...` / `GET /portfolio/balance?subaccount=1 failed` | fund subaccount 1 on shard 2 (1.2 step 3); a failed read: the subaccount may not exist, or the key is restricted to another one |
-| `venue.key_restricted_to_subaccount is true but GET /api_keys: the runner key is NOT restricted ...` | the runner uses an unrestricted key (e.g. System 2's): create System 1's restricted keys (1.2 step 4, 1.3) |
+| `venue.key_restricted_to_subaccount is true but GET /portfolio/balance?subaccount=0 ANSWERED with the runner key ...` / `... GET /api_keys: the runner key is NOT restricted ...` | the runner uses an unrestricted key (e.g. System 2's): create System 1's restricted keys (1.2 step 4, 1.3) |
+| `... GET /portfolio/balance?subaccount=0 failed with HTTP 4xx/5xx, not 401/403: no proof ...` | a 5xx / network error: retry the start. A 400 (or other 4xx) on every start: Kalshi answers the restricted key's subaccount-0 read with another status than documented: report it (the start stays refused until the proof is settled) |
 | `exchange not trading on shard(s) [2]` | a trading / exchange pause (e.g. Thursday 03:00-05:00 ET): wait |
 | `UnscopedWriteError ... refused before sending` in the log | a code path tried to write without subaccount 1 / a shard: a bug, nothing was sent; report it |
 | `market ...: exchange shard unknown` / `not in venue.exchange_indexes` | Kalshi moved or did not label the market's shard: nothing is traded there; if KXBTC* moved shard, fund the new shard and update `venue.exchange_indexes` |
@@ -939,7 +1076,7 @@ simulation and attribution before it is believed.
 | `risk state: fill/settlement rows outside [...] skipped` | subaccount 1 has activity in other markets (a manual trade?): not counted in the day's P&L; find out who trades subaccount 1 |
 | `malformed position row` | inspect `GET /portfolio/positions`; the runner will not trade with an unknown inventory |
 | `the UTC day kept changing while today's P&L was derived` | start-up took more than a day's rollover twice: retry |
-| `N orders still resting after the start-up cancel-all` | Kalshi UI; `tools orders`; retry |
+| `N orders still resting after the start-up cancel-all` | the list + cancel-by-id rounds left orders resting: Kalshi UI; `tools orders`; retry |
 | `loop.strategy_error must be 'stop' in live mode` (and the other live refusals) | fix `config/live.yaml` |
 | `no Kalshi API credentials` | section 1.3 |
 | `exchange not trading` (live) | wait for the exchange; paper mode keeps recording |

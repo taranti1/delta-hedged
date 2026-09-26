@@ -154,6 +154,10 @@ kalshi:
   config: null                    # dh.kalshi.config.load_config path; null = config/kalshi.yaml or the example
   env: null                       # prod | demo (null = from the kalshi config)
   max_markets_per_subscription: 100  # shard market subscriptions (Kalshi error 26 = too many markets)
+  # this recorder's share of the account's REST budget (budgets are per ACCOUNT, shared with the
+  # other live system): 0.1 (default). Keep the sum over ALL System 1 processes (live runner 0.2 =
+  # config/kalshi.yaml rate_limits.account_share, paper runner, watchdog, tools, this) <= 0.5
+  account_share: 0.1
   series: [KXBTCD, KXBTC, KXBTC15M]
   market_channels: [orderbook_delta, trade, ticker]
   lifecycle_channels: [market_lifecycle_v2]   # all markets (new-market discovery + settlements)
