@@ -258,6 +258,7 @@ class SettlementTracker:
     _t5: list[int] = field(default_factory=list, repr=False)  # 5 Hz source times, ascending
     _v5: list[float] = field(default_factory=list, repr=False)
     _max_src: int = field(default=-1, repr=False)
+    _min_src: int = field(default=-1, repr=False)  # oldest source time ever ingested (never pruned)
     _qh: dict[int, _QH] = field(default_factory=dict, repr=False)  # close_ns -> latest qh avg
     stats: dict[str, int] = field(
         default_factory=lambda: {"ticks": 0, "duplicates": 0, "conflicts": 0, "out_of_order": 0, "ignored": 0}
@@ -305,6 +306,8 @@ class SettlementTracker:
         else:
             self.stats["ignored"] += 1
             return
+        if self._min_src < 0 or src < self._min_src:
+            self._min_src = src
         if src > self._max_src:
             self._max_src = src
             self._maybe_prune()
@@ -335,6 +338,12 @@ class SettlementTracker:
                 del self._qh[k]
 
     # ------------------------------------------------------------------ queries
+    @property
+    def first_src_ns(self) -> int:
+        """Oldest source timestamp ever ingested (ns), -1 if none: prints before it were never
+        seen here (unknown, not missing; dh.settlement.closemark)."""
+        return self._min_src
+
     @property
     def latest_src_ns(self) -> int:
         """Newest source timestamp seen (ns), -1 if none."""

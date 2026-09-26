@@ -550,6 +550,16 @@ class LiveApp:
             self.info["day_pnl_rest"] = rest_pnl.summary()
             for fb in rest_pnl.fallbacks:
                 log.warning("risk state: %s", fb)
+            for tk, q in sorted(rest_pnl.positions_now.items()):  # how each open position is valued
+                src = rest_pnl.mark_source.get(tk, "") or "unknown"
+                log.info("risk state: open %s %+.2f valued at $%.4f (%s)", tk, q / 100,
+                         rest_pnl.open_px.get(tk, 0) / 1e4, rest_pnl.price_src.get(f"open:{tk}", src))
+                self.metrics.inc("dh_position_marks_total", scope="startup", source=src)
+            if rest_pnl.window_backfill:
+                wb = rest_pnl.window_backfill
+                (log.warning if wb.get("errors") else log.info)(
+                    "risk state: closed markets awaiting their result %s: window prints back-filled (%d CF call(s), "
+                    "%d ticks, errors %s)", wb.get("markets"), wb.get("calls", 0), wb.get("ticks", 0), wb.get("errors"))
             if rest_pnl.foreign:
                 log.warning("risk state: fill/settlement rows outside %s skipped: %s", list(series), rest_pnl.foreign)
         else:
@@ -614,7 +624,9 @@ class LiveApp:
         # what the strategy's equity does not cover: earlier sessions' realized P&L, the excluded
         # positions at their start-up marks (settled during the session -> updated seed)
         ex_marks = rest_pnl.open_px if rest_pnl is not None else {}
-        book = RiskBook.from_decision(seed, {t: (q, ex_marks.get(t, 0)) for t, q in positions.items() if q})
+        book = RiskBook.from_decision(seed, {t: (q, ex_marks.get(t, 0)) for t, q in positions.items() if q},
+                                      specs=rest_pnl.specs if rest_pnl is not None else None,
+                                      sources=rest_pnl.mark_source if rest_pnl is not None else None, now_ns=seed_ts)
         runner = LiveRunner(
             mm, mode=mode, period_ns=int(scfg.timers.quote_period_ms) * NS_PER_MS, cfg=lcfg, venue=venue, sim=sim,
             paper_fees=paper_fees, hedge=hedge, recorder=self.recorder, jsonlog=self.jsonlog, metrics=self.metrics,
@@ -685,7 +697,8 @@ class LiveApp:
         for _ in range(3):
             ds = day_start(self.clock())
             try:
-                pnl = await derive_day_pnl(self.rest, ds, positions, subaccount=sub, series=series or None)
+                pnl = await derive_day_pnl(self.rest, ds, positions, subaccount=sub, series=series or None,
+                                           now_ns=self.clock(), window_backfill=True)
             except RiskStateError as exc:
                 raise StartupError(f"risk state: {exc}") from exc
             seed_ts = self.clock()

@@ -112,8 +112,10 @@ Safety
   * Risk state (day P&L split into realized and mark, halt with its scope and UTC day, pause,
     budget base) persisted every ``risk_state_interval_s``, on every Halt (fsync) and at
     shutdown (dh.live.riskstate); the next session's seed reads it. Positions of events
-    excluded from the session are tracked at their start-up marks (RiskBook); when one of
-    those markets settles, an updated RiskStateSeed tells the strategy at once.
+    excluded from the session are tracked at their start-up marks (RiskBook); one that was
+    open at start-up is re-marked at its close from the BRTI prints of its settlement window
+    (dh.settlement.closemark: the exact payout, else the worst case; ``close_mark`` log), and
+    when one of those markets settles, an updated RiskStateSeed tells the strategy at once.
   * Graceful shutdown: gate closed, consumer drained, in-flight requests awaited, cancel-all
     via REST verified with the resting-order list, order group deleted, sources stopped.
 """
@@ -178,6 +180,7 @@ from dh.live.config import RECONCILE_CONFIRM_ROUNDS, LiveConfig
 from dh.live.monitor import JsonLog, KillFile, Metrics, MetricsServer, write_heartbeat
 from dh.live.pump import EventPump, OrderingError
 from dh.live.riskstate import CARRIED, RiskBook, day_start, payout_px
+from dh.settlement.closemark import close_mark, evaluate_window
 from dh.live.startup import closure_at, spec_to_dict
 
 log = logging.getLogger("dh.live.runner")
@@ -1236,6 +1239,8 @@ class LiveRunner:
         if isinstance(ev, IndexTick):
             if ev.index_id == "BRTI":
                 self._last_brti_ns = ev.ts
+                if self.riskbook.watch:
+                    self._remark_excluded(ev.ts)
         elif isinstance(ev, KalshiFill):
             self.metrics.inc("dh_fills_total", side=ev.book_side, taker=str(ev.is_taker).lower())
             self.fills_seen.add(ev.trade_id, getattr(ev, "fill_id", ""))
@@ -1277,6 +1282,41 @@ class LiveRunner:
         self.jlog("excluded_settlement", ts, ticker=ticker, qty=q, mark_px=mark, payout_px=payout,
                   pnl_vs_mark=round(diff, 6), how=how)
         self._post_feed.append(RiskStateSeed(ts, 0, day_start(ts), book.seed_value(ts), False, "", 0))
+
+    def _remark_excluded(self, ts: int) -> None:
+        """Excluded positions whose market was open at start-up and has closed since: re-mark
+        them from the BRTI prints of the window (the strategy's SettlementTracker; the prints
+        up to this tick, which is fed after this), dh.settlement.closemark: the exact payout
+        (own_benchmark), else the worst case (a print missing, a value within $0.01 of a strike,
+        or the window not evaluable). REST bid / ask of the start-up are never kept past the
+        close. A changed mark is logged (``close_mark``, scope excluded) and the strategy gets
+        an updated RiskStateSeed right after this event, as for a settlement."""
+        book = self.riskbook
+        tracker = getattr(self.strategy, "tracker", None)
+        changed = False
+        for t in sorted(book.watch):
+            spec, pos = book.specs.get(t), book.excluded.get(t)
+            if spec is None or pos is None:
+                book.watch.discard(t)
+                continue
+            if ts < spec.close_ts:
+                continue
+            oc = evaluate_window(spec, tracker) if tracker is not None and hasattr(tracker, "print_for") else None
+            cm = close_mark(pos[0], oc)
+            if oc is not None and oc.final:
+                book.watch.discard(t)  # more prints cannot change it: the mark stays until the result
+            if (cm.px, cm.source) == (pos[1], book.mark_src.get(t)):
+                continue
+            book.remark(t, cm.px, cm.source, ts)
+            changed = True
+            diff = pos[0] * (cm.px - pos[1]) / 1e6
+            log.info("excluded position %s %+.2f closed: marked $%.4f (%s, was $%.4f): %+.2f; %s", t, pos[0] / 100,
+                     cm.px / PX_SCALE, cm.source, pos[1] / PX_SCALE, diff, cm.detail)
+            self.metrics.inc("dh_position_marks_total", scope="excluded", source=cm.source)
+            self.jlog("close_mark", ts, scope="excluded", ticker=t, position=pos[0] / 100, prev_px=pos[1],
+                      pnl_vs_prev=round(diff, 6), **cm.as_log())
+        if changed:
+            self._post_feed.append(RiskStateSeed(ts, 0, day_start(ts), book.seed_value(ts), False, "", 0))
 
     def _on_wake(self, ts: int) -> None:
         """Deliver due timers / simulator messages. If the timer grid is far behind the wake
@@ -1440,6 +1480,8 @@ class LiveRunner:
         for a, done in zip(actions, handled, strict=True):
             if isinstance(a, Log):
                 self.jlog("log." + a.kind, ts, **a.payload)
+                if a.kind == "close_mark":
+                    self.metrics.inc("dh_position_marks_total", scope="strategy", source=str(a.payload.get("source", "")))
                 if a.kind == "risk" and a.payload.get("event") == "reconcile_requested":
                     self._reconcile_now(ts, str(a.payload.get("channel", "")))
                 continue
@@ -3100,6 +3142,18 @@ class LiveRunner:
                 m.set("dh_equity_dollars", float(eq(S)))
             except Exception:  # noqa: BLE001
                 pass
+        # positions valued at a close-time mark (closed market, no result yet), by source
+        counts: dict[tuple[str, str], int] = {}
+        for cm in (getattr(s, "close_marks", None) or {}).values():
+            counts[("strategy", cm.source)] = counts.get(("strategy", cm.source), 0) + 1
+        for t in self.riskbook.excluded:
+            k = ("excluded", self.riskbook.mark_src.get(t, "") or "unknown")
+            counts[k] = counts.get(k, 0) + 1
+        for scope, sources in (("strategy", ("own_benchmark", "last_trade", "worst_case")),
+                               ("excluded", ("result_rest", "own_benchmark", "last_trade", "worst_case", "exchange_quote",
+                                             "unknown"))):
+            for src in sources:
+                m.set("dh_marked_positions", float(counts.get((scope, src), 0)), scope=scope, source=src)
         if self.venue is not None:
             m.set("dh_venue_inflight", float(self.venue.inflight))
             m.set("dh_venue_pending_reconciliations", float(self.venue.pending_reconciliations))

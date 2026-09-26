@@ -11,7 +11,8 @@ What a session leaves on disk (dh.live.runner / dh.live.app):
                             reconciliation updates, gate rejects), runner-derived events (lag /
                             reconciliation / clock FeedStatus, checked position snapshots,
                             back-filled fills, order-group updates, the updated RiskStateSeed
-                            after an excluded market settled or the watchdog's halt)
+                            after an excluded market settled or was re-marked at its close, or
+                            the watchdog's halt)
   events.paper              simulator messages (audit only: the replay regenerates them)
   meta                      session_start (configs, universe, paper simulator config, id
                             prefix, subaccount), fv_warmup (the exact benchmark points fed to
@@ -22,7 +23,9 @@ prefix), applies the recorded universe changes at their recorded times and the r
 inbound rules, and runs dh.backtest.runner.run over the recorded events (paper: with a
 simulator built from the recorded config, which regenerates the fills). events.live is merged
 LAST: a runner-derived event shares the timestamp of the item that caused it and was fed
-after it. Any difference in actions or Log records up to the last delivered ts is a bug.
+after it. Any difference in actions or Log records up to the last delivered ts is a bug; that
+includes the strategy's ``close_mark`` logs (positions in closed markets awaiting their result,
+marked from the recorded BRTI prints and lifecycle results: dh.settlement.closemark).
 """
 
 from __future__ import annotations

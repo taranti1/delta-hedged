@@ -11,14 +11,22 @@ The day's P&L (UTC day D, YES terms, dollars):
                + today's settlements ((yes_count - no_count) * YES payout)
                - value of the positions held at 00:00 UTC, at the last trade at or before
                  midnight (fixed for the day)
-    open value = the positions held now at exchange prices: long YES at the YES bid, short YES
-                 at the YES ask; a determined market at its payout; a market that is no longer
-                 active (closed, awaiting determination) at its last trade
+    open value = the positions held now: a market with a result at its payout; an open market
+                 at exchange prices (long YES at the YES bid, short YES at the YES ask); a
+                 market past its close_time without a result (closed, awaiting
+                 determination) at the payout our own BRTI prints of its settlement window
+                 imply (``mark_source`` own_benchmark; the window's prints are back-filled with
+                 one CF passthrough call per hour, ``backfill_window_prints``), at the worst case
+                 when a print is missing or the value is within $0.01 of a strike, at the last
+                 trade when the window cannot be evaluated (dh.settlement.closemark). REST bid /
+                 ask are never used after close_time (stale pre-close quotes, then 0 / 1.00).
 
 A price that does not exist falls back to the worst case (open: long $0, short $1; midnight:
-long $1, short $0) and is logged. A settlement row's ``fee_cost`` is not added: the spec
-describes it as the total fees paid (next to the position's cost basis), not as a charge at
-settlement; trading fees are counted once, from today's fills.
+long $1, short $0) and is logged. Every open position's price source is in
+``DayPnl.price_src`` ("open:<ticker>": "<mark_source>: why") and ``DayPnl.mark_source``. A
+settlement row's ``fee_cost`` is not added: the spec describes it as the total fees paid (next
+to the position's cost basis), not as a charge at settlement; trading fees are counted once,
+from today's fills.
 
 Sources at start-up
   * the PERSISTED state of earlier sessions (``RiskStateStore``; written every
@@ -61,6 +69,15 @@ from typing import Any
 
 from dh.core.units import NS_PER_S, PX_SCALE, px_from_dollars, qty_from_fp
 from dh.kalshi.wire import opt_iso_to_ns
+from dh.settlement.closemark import (
+    EXCHANGE_QUOTE,
+    LAST_TRADE,
+    RESULT_REST,
+    WORST_CASE,
+    WindowOutcome,
+    close_mark,
+    evaluate_window,
+)
 
 log = logging.getLogger("dh.live.riskstate")
 
@@ -359,11 +376,18 @@ class DayPnl:
     open_px: dict[str, int] = field(default_factory=dict)  # ticker -> px the open position is valued at
     midnight_px: dict[str, int] = field(default_factory=dict)
     price_src: dict[str, str] = field(default_factory=dict)  # "open:<t>" / "midnight:<t>" -> where the price came from
+    mark_source: dict[str, str] = field(default_factory=dict)  # ticker -> source of its open mark (closemark names)
+    window_backfill: dict[str, Any] = field(default_factory=dict)  # the CF back-fill of closed markets' windows
     fallbacks: list[str] = field(default_factory=list)  # prices that did not exist: worst case used
     foreign: dict[str, int] = field(default_factory=dict)  # fill/settlement rows outside the series (skipped)
 
+    # the open positions' specs (from their Market rows): the runner re-marks an excluded
+    # position when its market closes during the session. Not part of the summary.
+    specs: dict[str, Any] = field(default_factory=dict, repr=False)
+
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
+        d.pop("specs", None)
         for k in ("pnl_usd", "realized_usd", "open_usd", "midnight_usd", "cash_usd", "fees_usd", "settlements_usd"):
             d[k] = round(d[k], 6)
         return d
@@ -372,7 +396,8 @@ class DayPnl:
 def day_pnl_from_flows(fl: DayFlows, positions: dict[str, int], *, open_px: dict[str, int] | None = None,
                        midnight_px: dict[str, int] | None = None, price_src: dict[str, str] | None = None) -> DayPnl:
     """Value today's flows and positions (module docstring). ``open_px`` / ``midnight_px``:
-    {ticker: px}; a missing price falls back to the worst case and is listed in ``fallbacks``."""
+    {ticker: px}; a missing price falls back to the worst case and is listed in ``fallbacks``
+    (with the reason ``price_src`` gives)."""
     out = DayPnl(fl.day_start_ns, fills=fl.fills, historical_fills=fl.historical_fills, settlements=fl.settlements,
                  price_src=dict(price_src or {}), foreign=dict(fl.foreign))
     open_px = open_px or {}
@@ -383,9 +408,14 @@ def day_pnl_from_flows(fl: DayFlows, positions: dict[str, int], *, open_px: dict
             continue
         out.positions_now[tk] = int(q)
         px = open_px.get(tk)
+        why = out.price_src.get(f"open:{tk}", "")
         if px is None:
             px = 0 if q > 0 else PX_SCALE
-            out.fallbacks.append(f"{tk}: open {q / 100:+.2f} valued at ${px / PX_SCALE:.2f} (no exchange price)")
+            reason = why.split(": ", 1)[1] if why.startswith(WORST_CASE + ": ") else (why or "no exchange price")
+            out.fallbacks.append(f"{tk}: open {q / 100:+.2f} valued at ${px / PX_SCALE:.2f} (worst case: {reason})")
+            out.mark_source[tk] = WORST_CASE
+        else:
+            out.mark_source[tk] = why.split(":", 1)[0] if why else ""
         out.open_px[tk] = px
         open_micros += q * px
     for tk, q0 in fl.midnight_positions(positions).items():
@@ -436,31 +466,158 @@ def payout_px(result: str, settlement_value: Any = None) -> int | None:
     return PX_SCALE if r == "yes" else 0 if r == "no" else None
 
 
-def mark_px(m: dict[str, Any], q: int) -> tuple[int | None, str]:
-    """(px, source) an open position of ``q`` is worth according to Market object ``m``:
-    determined -> its payout; active -> long at the YES bid, short at the YES ask; no longer
-    active (closed, awaiting determination) -> the last trade; else (None, why)."""
-    res = str(m.get("result") or "").lower()
-    if res in ("yes", "no", "scalar"):
+CLOSED_STATUSES = ("closed", "determined", "disputed", "amended", "finalized", "settled")
+
+
+def row_close_ns(m: dict[str, Any]) -> int:
+    """close_time of a Market row (ns), 0 if absent / unparseable."""
+    try:
+        return opt_iso_to_ns(m.get("close_time"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def row_result(m: dict[str, Any]) -> str:
+    """The Market row's result ('yes' / 'no' / 'scalar'), '' when there is none yet."""
+    r = str(m.get("result") or "").lower()
+    return r if r in ("yes", "no", "scalar") else ""
+
+
+def row_closed(m: dict[str, Any], now_ns: int | None) -> bool:
+    """The market no longer trades: its close_time has passed (``now_ns``), or its status says
+    so (closed / determined / finalized ...; the only test without ``now_ns``)."""
+    close = row_close_ns(m)
+    if now_ns is not None and close and now_ns >= close:
+        return True
+    return str(m.get("status") or "").lower() in CLOSED_STATUSES
+
+
+def row_spec(m: dict[str, Any]) -> Any:
+    """MarketSpec of a Market row for the settlement evaluation (strike, close_time, the
+    series' settlement convention; the tick grid does not matter here), None when the row
+    does not define one (another series, unsupported strike, rules_primary naming another
+    settlement time than close_time)."""
+    from dh.core.market import MarketSpec
+    from dh.kalshi.normalize import default_settlement, rest_market_to_spec, series_of
+    from dh.settlement.convention import rules_settlement_time_ns
+
+    try:
+        return rest_market_to_spec(m)
+    except (KeyError, ValueError, TypeError):  # UnsupportedMarket is a ValueError (e.g. no tick grid in the row)
+        pass
+    try:
+        series = series_of(m, None, None)
+        settle = default_settlement(series)
+        close = row_close_ns(m)
+        if settle is None or not close:
+            return None
+        rules_t = rules_settlement_time_ns(m.get("rules_primary"))
+        if rules_t is not None and rules_t != close:
+            return None
+        floor, cap = m.get("floor_strike"), m.get("cap_strike")
+        return MarketSpec(ticker=str(m["ticker"]), event_ticker=str(m.get("event_ticker") or ""), series_ticker=series,
+                          strike_type=str(m.get("strike_type") or ""), floor_strike=None if floor is None else float(floor),
+                          cap_strike=None if cap is None else float(cap), open_ts=0, close_ts=close, expiration_ts=close,
+                          settlement=settle)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def mark_px(m: dict[str, Any], q: int, *, now_ns: int | None = None,
+            outcome: WindowOutcome | None = None) -> tuple[int | None, str]:
+    """(px, "<mark_source>: why") an open position of ``q`` is worth according to Market object
+    ``m`` (module docstring; dh.settlement.closemark):
+
+      a result             -> its payout (result_rest)
+      past close_time (``now_ns``) or a closed status, no result
+                           -> the payout our own prints of the window imply (``outcome``:
+                              own_benchmark); a missing print / a value within $0.01 of a strike
+                              -> (None, worst_case: why); the window not evaluable -> the last
+                              trade (last_trade), else (None, worst_case: why). REST bid / ask
+                              are NEVER used after the close
+      open                 -> long at the YES bid, short at the YES ask (exchange_quote); a
+                              market that is not active (paused) without one at its last trade
+
+    (None, why) = no price: the caller values the position at the worst case and logs why."""
+    res = row_result(m)
+    if res:
         p = payout_px(res, m.get("settlement_value_dollars"))
         if p is not None:
-            return p, f"payout ({res})"
+            return p, f"{RESULT_REST}: payout ({res})"
     status = str(m.get("status") or "").lower()
+    last = _px(m.get("last_price_dollars"))
+    if row_closed(m, now_ns):
+        cm = close_mark(q, outcome, last_trade_px=last)
+        if cm.source == WORST_CASE:
+            return None, f"{WORST_CASE}: {cm.detail} (status {status or '?'})"
+        return cm.px, f"{cm.source}: {cm.detail}"
     p = _px(m.get("yes_bid_dollars" if q > 0 else "yes_ask_dollars"))
     if q > 0 and p is not None and p > 0:
-        return p, "YES bid"
+        return p, f"{EXCHANGE_QUOTE}: YES bid"
     if q < 0 and p is not None and 0 < p < PX_SCALE:
-        return p, "YES ask"
-    if status not in ("", "active"):
-        last = _px(m.get("last_price_dollars"))
-        if last is not None and 0 < last < PX_SCALE:
-            return last, f"last trade ({status})"
-    return None, f"no YES {'bid' if q > 0 else 'ask'} (status {status or '?'})"
+        return p, f"{EXCHANGE_QUOTE}: YES ask"
+    if status not in ("", "active") and last is not None and 0 < last < PX_SCALE:
+        return last, f"{LAST_TRADE}: last trade (status {status})"
+    return None, f"{WORST_CASE}: no YES {'bid' if q > 0 else 'ask'} (status {status or '?'})"
 
 
-async def open_marks(rest: Any, positions: dict[str, int]) -> tuple[dict[str, int], dict[str, str]]:
-    """Exchange prices of the open positions (GET /markets?tickers=..., archived markets via
-    GET /historical/markets/{ticker})."""
+WINDOW_CHUNK_NS = 3600 * NS_PER_S  # the CF passthrough's timespan=HOUR
+
+
+async def backfill_window_prints(rest: Any, specs: Iterable[Any]) -> tuple[Any, dict[str, Any]]:
+    """The BRTI prints of the settlement windows of ``specs`` (closed markets without a result)
+    from the CF Benchmarks passthrough: ONE call per hour the windows touch (normally one),
+    GET /cfbenchmarks/history/values?id=BRTI&timespan=HOUR&timestamp=<hour START, ISO ms>
+    (the format VERIFIED LIVE on 2026-09-25: the hour's 5 Hz ticks), fed as the 5 Hz stream into
+    a fresh SettlementTracker: a print is final once a later tick exists. CF publishes with a
+    delay (up to 15 min), so a window at the end of the published data stays not evaluable (its
+    mark falls back). Failures are reported in the info, never raised. Returns (tracker, info)."""
+    from dataclasses import replace as _replace
+
+    from dh.kalshi.normalize import cf_history_to_ticks
+    from dh.live.startup import _iso_ms
+    from dh.settlement.window import SettlementTracker
+
+    specs = [s for s in specs if s is not None]
+    index_id = specs[0].settlement.index_id if specs else "BRTI"
+    tracker = SettlementTracker(index_id=index_id, retain_s=4 * 3600.0)
+    chunk = WINDOW_CHUNK_NS
+    hours: set[int] = set()
+    for s in specs:
+        obs = s.settlement.obs_times(s.expiration_ts)
+        hours.update({obs[0] - obs[0] % chunk, obs[-1] - obs[-1] % chunk})
+    info: dict[str, Any] = {"hours": sorted(h // NS_PER_S for h in hours), "calls": 0, "ticks": 0, "errors": []}
+    for h in sorted(hours):
+        info["calls"] += 1
+        try:
+            body = await rest.get_cfbenchmarks_history(index_id, timespan="HOUR", timestamp=_iso_ms(h))
+        except Exception as exc:  # noqa: BLE001 - unavailable history: the marks fall back
+            info["errors"].append(f"hour {h // NS_PER_S}: {type(exc).__name__}: {exc}"[:300])
+            continue
+        for t in cf_history_to_ticks(body, h, index_id):
+            if h <= t.ts_exch < h + chunk:
+                tracker.on_index(_replace(t, feed="5hz"))
+                info["ticks"] += 1
+    return tracker, info
+
+
+@dataclass
+class OpenMarks:
+    """The open positions' prices (``open_marks``)."""
+
+    px: dict[str, int] = field(default_factory=dict)
+    src: dict[str, str] = field(default_factory=dict)  # "open:<t>" -> "<mark_source>: why"
+    specs: dict[str, Any] = field(default_factory=dict)  # ticker -> MarketSpec (from its row)
+    outcomes: dict[str, WindowOutcome] = field(default_factory=dict)  # closed, no result: our window evaluation
+    backfill: dict[str, Any] = field(default_factory=dict)
+
+
+async def open_marks(rest: Any, positions: dict[str, int], *, now_ns: int | None = None,
+                     window_backfill: bool = False) -> OpenMarks:
+    """Prices of the open positions (GET /markets?tickers=..., archived markets via
+    GET /historical/markets/{ticker}; ``mark_px``). The markets past their close without a
+    result are evaluated from their window's prints (``backfill_window_prints``, one CF call per
+    hour) when ``window_backfill`` is true."""
     from dh.kalshi.rest import KalshiHTTPError
 
     tickers = sorted(t for t, q in positions.items() if q)
@@ -482,15 +639,27 @@ async def open_marks(rest: Any, positions: dict[str, int]) -> tuple[dict[str, in
         m = (body or {}).get("market")
         if isinstance(m, dict):
             rows[t] = m
-    px: dict[str, int] = {}
-    src: dict[str, str] = {}
+    out = OpenMarks()
+    for t in tickers:
+        sp = row_spec(rows[t]) if t in rows else None
+        if sp is not None:
+            out.specs[t] = sp
+    waiting = [t for t in tickers if t in out.specs and not row_result(rows[t]) and row_closed(rows[t], now_ns)]
+    if waiting and window_backfill:
+        tracker, out.backfill = await backfill_window_prints(rest, [out.specs[t] for t in waiting])
+        out.backfill["markets"] = waiting
+        for t in waiting:
+            out.outcomes[t] = evaluate_window(out.specs[t], tracker)
     for t in tickers:
         m = rows.get(t)
-        p, why = mark_px(m, positions[t]) if m is not None else (None, "market not found")
-        src[f"open:{t}"] = why
+        if m is None:
+            p, why = None, f"{WORST_CASE}: market not found"
+        else:
+            p, why = mark_px(m, positions[t], now_ns=now_ns, outcome=out.outcomes.get(t))
+        out.src[f"open:{t}"] = why
         if p is not None:
-            px[t] = p
-    return px, src
+            out.px[t] = p
+    return out
 
 
 async def last_trade_px(rest: Any, ticker: str, at_ns: int, trades_cutoff_ns: int) -> tuple[int | None, str]:
@@ -547,12 +716,15 @@ async def historical_cutoff(rest: Any) -> dict[str, int]:
 
 
 async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int], *, subaccount: int = 0,
-                         series: Iterable[str] | None = None) -> DayPnl:
+                         series: Iterable[str] | None = None, now_ns: int | None = None,
+                         window_backfill: bool = False) -> DayPnl:
     """Today's P&L from Kalshi (module docstring): the historical cutoff, today's fills (live
     and, before the cutoff, historical: both with the explicit ``subaccount``), settlements,
-    then the prices of the open positions and of the positions held at midnight. Fill and
-    settlement rows outside ``series`` are skipped (``DayPnl.foreign``); pass the positions
-    of ``series`` only. Any failure raises RiskStateError."""
+    then the prices of the open positions (``open_marks``: ``now_ns`` tells which markets are
+    past their close; ``window_backfill`` back-fills their windows' prints) and of the
+    positions held at midnight. Fill and settlement rows outside ``series`` are skipped
+    (``DayPnl.foreign``); pass the positions of ``series`` only. Any failure raises
+    RiskStateError (a failed window back-fill does not: those marks fall back)."""
     try:
         cut = await historical_cutoff(rest)
         trades_cut = cut["trades_created_ts"]
@@ -564,7 +736,8 @@ async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int]
                                                                 subaccount=subaccount)]
         settles = [s async for s in rest.iter_settlements(min_ts=min_s, subaccount=subaccount)]
         fl = day_flows(day_start_ns, fills, settles, subaccount=subaccount, historical_fills=hist, series=series)
-        open_px, src = await open_marks(rest, positions)
+        om = await open_marks(rest, positions, now_ns=now_ns, window_backfill=window_backfill)
+        open_px, src = om.px, dict(om.src)
         mid_px: dict[str, int] = {}
         for tk in fl.midnight_positions(positions):
             p, why = await last_trade_px(rest, tk, day_start_ns, trades_cut)
@@ -575,7 +748,14 @@ async def derive_day_pnl(rest: Any, day_start_ns: int, positions: dict[str, int]
         raise
     except Exception as exc:  # noqa: BLE001 - network / auth / shape: never seed from a partial view
         raise RiskStateError(f"today's P&L could not be derived from Kalshi ({type(exc).__name__}: {exc})") from exc
-    return day_pnl_from_flows(fl, positions, open_px=open_px, midnight_px=mid_px, price_src=src)
+    out = day_pnl_from_flows(fl, positions, open_px=open_px, midnight_px=mid_px, price_src=src)
+    out.specs = dict(om.specs)
+    out.window_backfill = dict(om.backfill)
+    if om.outcomes:
+        out.window_backfill["outcomes"] = {t: {"status": o.status, "value": o.value, "prints": o.n_prints,
+                                               "missing": o.n_missing, "detail": o.detail}
+                                           for t, o in sorted(om.outcomes.items())}
+    return out
 
 
 # ============================================================================ the seed
@@ -683,6 +863,10 @@ class RiskBook:
       excluded      {ticker: (signed YES qty, px it is valued at)}: positions of events excluded
                     from the session, at their start-up marks until they settle
       base_usd      the operator's budget base of the day (--reset-daily-halt)
+      mark_src      {ticker: mark source of the excluded position} (dh.settlement.closemark names)
+      specs         {ticker: MarketSpec} of the excluded markets (from their REST rows)
+      watch         excluded markets still OPEN at start-up: when one closes during the session,
+                    the runner re-marks it from the BRTI prints of its window (``remark``)
 
     The real day P&L = the strategy's P&L of the day + realized_usd + value of ``excluded``; the
     strategy carries (via RiskStateSeed) that carry minus the base."""
@@ -695,13 +879,35 @@ class RiskBook:
     halt_scope: str = ""
     seed_day_ns: int = -1  # the last RiskStateSeed the strategy was fed (its day and value)
     seed_usd: float = 0.0
+    mark_src: dict[str, str] = field(default_factory=dict)
+    specs: dict[str, Any] = field(default_factory=dict)
+    watch: set[str] = field(default_factory=set)
 
     @classmethod
-    def from_decision(cls, dec: SeedDecision, excluded: dict[str, tuple[int, int]] | None = None) -> RiskBook:
+    def from_decision(cls, dec: SeedDecision, excluded: dict[str, tuple[int, int]] | None = None, *,
+                      specs: dict[str, Any] | None = None, sources: dict[str, str] | None = None,
+                      now_ns: int | None = None) -> RiskBook:
+        """``specs`` / ``sources``: the excluded markets' specs and start-up mark sources
+        (``DayPnl.specs`` / ``DayPnl.mark_source``); with ``now_ns``, the excluded markets that
+        close after it are watched (re-marked at their close)."""
         ex = {t: (int(q), int(px)) for t, (q, px) in (excluded or {}).items() if q}
         mark = sum(q * px for q, px in ex.values()) / 1e6
+        sp = {t: s for t, s in (specs or {}).items() if t in ex and s is not None}
+        watch = {t for t, s in sp.items() if now_ns is not None and s.close_ts > now_ns}
         return cls(dec.day_start_ns, dec.real_pnl_usd - mark, dec.budget_base_usd, ex,
-                   dec.halt_day_ns if dec.halted else 0, dec.halt_scope if dec.halted else "")
+                   dec.halt_day_ns if dec.halted else 0, dec.halt_scope if dec.halted else "",
+                   mark_src={t: str(v) for t, v in (sources or {}).items() if t in ex}, specs=sp, watch=watch)
+
+    def remark(self, ticker: str, px: int, source: str, ts: int) -> tuple[int, int] | None:
+        """Re-value an excluded position at ``px`` (its market closed: dh.settlement.closemark).
+        Returns the (qty, previous px), None if ``ticker`` is not an excluded position."""
+        self.roll(ts)  # a new day's baseline is the value at midnight, before this re-mark
+        pos = self.excluded.get(ticker)
+        if pos is None:
+            return None
+        self.excluded[ticker] = (pos[0], int(px))
+        self.mark_src[ticker] = source
+        return pos
 
     def mark_usd(self) -> float:
         return sum(q * px for q, px in self.excluded.values()) / 1e6
@@ -730,6 +936,9 @@ class RiskBook:
         (qty, mark px) it had, None if ``ticker`` is not an excluded position."""
         self.roll(ts)
         pos = self.excluded.pop(ticker, None)
+        self.watch.discard(ticker)
+        self.specs.pop(ticker, None)
+        self.mark_src.pop(ticker, None)
         if pos is not None:
             self.realized_usd += pos[0] * payout / 1e6
         return pos
@@ -745,7 +954,7 @@ class RiskBook:
 
 
 __all__ = ["DAY_NS", "DayFlows", "DayPnl", "RiskBook", "RiskState", "RiskStateError", "RiskStateStore", "SeedDecision",
-           "base_reason", "day_flows", "day_pnl_from_flows", "day_pnl_from_rows", "day_start", "decide_seed",
+           "OpenMarks", "backfill_window_prints", "base_reason", "day_flows", "day_pnl_from_flows", "day_pnl_from_rows", "day_start", "decide_seed",
            "derive_day_pnl", "fsync_dir", "historical_cutoff", "in_series", "last_trade_px", "make_seed", "mark_px",
-           "open_marks", "parse_fill_row", "parse_settlement_row", "payout_px", "row_in_subaccount", "row_ticker",
+           "open_marks", "parse_fill_row", "parse_settlement_row", "payout_px", "row_closed", "row_in_subaccount", "row_result", "row_spec", "row_ticker",
            "state_from_decision", "sticky"]
