@@ -37,3 +37,5 @@ data/live_logs/
 
 # Claude Code agent worktrees
 .claude/
+
+.DS_Store
