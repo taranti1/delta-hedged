@@ -259,7 +259,7 @@ NOW = 1_790_000_000 * NS_PER_S
 
 def _beat(**kw: Any) -> dict[str, Any]:
     b = {"t": NOW, "pid": 1, "subaccount": 1, "state": "ARMED", "armed": [42, "s"], "api_ok": True, "api_ok_ns": NOW,
-         "step_ok": True}
+         "step_ok": True, "api_write_ok": True}
     b.update(kw)
     return b
 
@@ -300,8 +300,12 @@ async def test_watchdog_probes_its_key_at_start_and_reports_it_in_the_beat(tmp_p
             raise KalshiHTTPError("GET", "/portfolio/orders", 401, {"error": {"code": "unauthorized"}})
         return {"orders": []}
 
+    async def write_probe():  # review F2: the write proof (404 on a random id) is required too
+        return {"write_ok": True, "status": 404}
+
     w = Watchdog(hbp, rest_scoped_cancel_all(rest, 1, sleep=_nosleep),
-                 WatchdogCfg(poll_s=0.01, beat_interval_s=0.01, api_probe_interval_s=0.02), subaccount=1, api_probe=probe)
+                 WatchdogCfg(poll_s=0.01, beat_interval_s=0.01, api_probe_interval_s=0.02), subaccount=1, api_probe=probe,
+                 api_write_probe=write_probe)
     write_heartbeat(hbp, {"mode": "live", "state": "running", "pid": 77, "session": "live-a", "subaccount": 1})
     stop = asyncio.Event()
     seen: dict[str, Any] = {}

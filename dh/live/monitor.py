@@ -190,7 +190,8 @@ def watchdog_beat_problem(beat: dict[str, Any] | None, *, now_ns: int, subaccoun
     a clock step or a macOS sleep makes an old beat look new), a watchdog that exited, one
     configured for another subaccount, one whose own key cannot reach the API (review NEW-2:
     ``api_ok`` false or missing, or its last successful authenticated probe older than
-    ``api_max_age_s``: liveness is not the ability to cancel), one whose poll keeps failing
+    ``api_max_age_s``: liveness is not the ability to cancel), one whose key is not proven to be
+    allowed to CANCEL (review F2: ``api_write_ok`` false or missing), one whose poll keeps failing
     (``step_ok`` false), or (``runner`` given: the live runner's (pid, session), checked once it
     has been running a while) one not armed on this runner."""
     if beat is None:
@@ -216,6 +217,10 @@ def watchdog_beat_problem(beat: dict[str, Any] | None, *, now_ns: int, subaccoun
     if api_age > api_max_age_s or api_age < -max_future_s:
         return (f"the watchdog's last successful API probe is {api_age:.0f}s old (limit {api_max_age_s:g}s): "
                 "its key / network may be down")
+    if beat.get("api_write_ok") is not True:
+        # review F2: reading is not cancelling (a key without the write scope passes a read)
+        err = str(beat.get("api_write_error") or "no write-capability probe result in its beat")[:160]
+        return f"the watchdog cannot prove its key may CANCEL ({err})"
     if beat.get("step_ok") is False:
         return f"the watchdog's poll keeps failing ({str(beat.get('step_error') or '?')[:120]})"
     if runner is not None:

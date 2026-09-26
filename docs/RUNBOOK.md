@@ -25,7 +25,8 @@ and cancels them by id. The configuration fails CLOSED: live mode, the venue and
 refuse a `config/live.yaml` that does not state `venue.subaccount` and `venue.shared_account`
 (pre-live review 2026-09-25, `docs/research/prelive_review_2026-09-25/PRELIVE_REVIEW.md` and
 its re-review `PRELIVE_REREVIEW.md`, findings NEW-1..6 fixed with regression tests in
-`tests/live/test_rereview_fixes.py` and `tests/kalshi/test_rereview_account_setup.py`;
+`tests/live/test_rereview_fixes.py` and `tests/kalshi/test_rereview_account_setup.py`, and
+the final check `PRELIVE_FINAL_CHECK.md`, findings F1..F3 fixed in `tests/live/test_final_fixes.py`;
 `docs/research/SHARED_ACCOUNT_AUDIT.md`, `docs/research/KALSHI_DOCS_RECONCILIATION.md`).
 
 Exit codes of `run_live.py`: `0` normal stop or kill file, `2` refused to start (message says
@@ -101,7 +102,14 @@ Mac (subaccount 1, section 1.2). What differs from the Linux VM above:
   WORKS: at start and every `watchdog.api_probe_interval_s` (60 s) it reads `GET
   /portfolio/orders?subaccount=1&status=resting&limit=1` with its own key; `api_ok: false`
   (revoked / wrong key, network down) or a last success older than `watchdog.api_max_age_s`
-  (180 s) counts as "not protecting" exactly like a stale beat.
+  (180 s) counts as "not protecting" exactly like a stale beat. Reading is not cancelling
+  (final check F2): at start and every `watchdog.api_write_probe_interval_s` (600 s; every
+  60 s while it fails) it also sends `DELETE /portfolio/events/orders/<fresh random uuid4>?
+  subaccount=1&exchange_index=2` through its scoped write client: 404 (no such order) proves
+  the key may cancel, 401 / 403 (no `write` scope, key not allowed on subaccount 1) or anything
+  else sets `api_ok: false` and `api_write_ok: false` with the reason in `api_write_error`; the
+  runner requires `api_write_ok: true`. The id is new and random every time, never a real
+  order id: the probe cannot cancel anything (2 write tokens per probe).
   The runner stays manual (never a launchd job): start it in a terminal under
   `caffeinate -i` (section 5.2).
 * Binance (HTTP 451) and Bybit (HTTP 403) are geo-blocked from this US host: both are
@@ -776,9 +784,30 @@ lock). Both may share the kill file (a kill stops both). Under Docker
   ...` (`dh_unknown_order_events_dropped_total`) and quoting pauses through the reconcile
   path (`kalshi.reconcile` stale, reason `unknown_order`: fills, positions and resting orders
   are re-read; a position the fills cannot explain halts as any confirmed mismatch). While a
-  market has a parked event its position difference is never confirmed
+  market has an event parked for the FIRST time its position difference is never confirmed
   (`position_confirm_parked`). Fills of an earlier session's orders found by a back-fill
   after a restart are skipped silently (`dh_fills_before_session_skipped_total`).
+  **An order that can never be proven** (final check F1: e.g. `GET /portfolio/orders/{id}`,
+  which has no subaccount / shard parameter, does not see shard-2 orders) no longer loops
+  park -> timeout -> reconcile -> re-park: (a) after its first timeout, a fill of it read by
+  `GET /portfolio/fills?subaccount=1` under the key restricted to subaccount 1 (proven at start)
+  is ours by construction and is DELIVERED (ERROR `... DELIVERED as ours`,
+  `order_event_delivered_by_subaccount`, `dh_unknown_order_fills_delivered_total`; client id
+  `dhm1-orphan-<order id>`, recorded on `events.live`, replay-exact; the strategy books it as
+  an orphan fill); (b) the lookup also searches the list `GET /portfolio/orders?subaccount=1&
+  ticker=<market>` (every page) when the by-id read 404s; (c) after a timeout the market is no
+  longer exempt from the mismatch confirmation; and the `venue.unknown_order_max_park_cycles`-th
+  (3) timeout of the same order HALTS (Halt(all), reason `unknown_order_loop`, persisted and
+  sticky like the watchdog halt: investigate that order id, then restart with
+  `--reset-daily-halt`). Live requires `venue.unknown_order_park_s` < 3 x
+  `venue.position_confirm_s` (the `unknown_order` reconciliation ends, reopening the gate, 3
+  confirmation rounds of `position_confirm_s` after the re-read; a longer park would let the
+  runner quote while such an event is still parked) and `unknown_order_max_park_cycles` >= 2.
+  **Verify live** (`verify_live get_order_by_id_finds_shard_orders`, metric `dh_verify_live`):
+  once per session, `venue.verify_get_order_after_s` (60 s) after our first acknowledged order,
+  that order is read by id (and in the subaccount list): ok = the by-id endpoint finds our
+  shard-2 orders; 0 = only the list does (the lookup still works through the list). The same
+  check is reported by any lookup that finds an order.
 * Every 2 s: `GET /portfolio/orders/queue_positions?subaccount=1` -> calibration samples of the
   queue estimator (`dh_queue_error_contracts`, `queue_positions` log lines). The endpoint has
   no `exchange_index` parameter and the docs do not say whether it covers shard 2 (**verify
@@ -870,10 +899,17 @@ code path reachable with `shared_account: true` can call it. Runtime directory b
    `api_ok` / `api_ok_ns` (its key's read-only probe `GET /portfolio/orders?subaccount=1&
    status=resting&limit=1`, at start and every 60 s; a successful cancel-all counts too) and
    `step_ok`: a watchdog that cannot reach the API with its key does not protect, and the
-   runner treats it so. A runner heartbeat stamped more than `watchdog.max_future_s` (2 s) in
-   the future is not trusted: it neither arms the watchdog nor refreshes the watched runner's
-   liveness, so the watchdog fires as for a stale heartbeat (a clock step between the two
-   processes costs a cancel-all, never a silent dead-man switch).
+   runner treats it so. The beat also carries `api_write_ok` / `api_write_ok_ns` /
+   `api_write_error`: the write-capability probe (a cancel of a random, non-existent order id on
+   subaccount 1 / shard 2 at start and every `watchdog.api_write_probe_interval_s` = 600 s; 404
+   = may cancel), which the runner requires. A runner heartbeat stamped more than
+   `watchdog.max_future_s` (2 s) in the future is not trusted: it neither arms the watchdog nor
+   refreshes the watched runner's liveness, so the watchdog fires as for a stale heartbeat (a
+   clock step between the two processes costs a cancel-all, never a silent dead-man switch).
+   After a BACKWARD wall-clock step on the host (final check F3) the stored heartbeat time lies
+   in the future: a fresh heartbeat of the SAME watched runner (pid + session), consistent with
+   the new clock, resets it (log `wall clock stepped back ...`, not fired); without one within
+   `watchdog.stale_s` of noticing, the watchdog fires (the runner may have died at the step).
    **`--arm-on-start`** (used by `deploy/docker-compose.yml`): on its first poll a restarted
    watchdog acts on an EXISTING LIVE heartbeat only (mode live, state running/stopping): it
    locks onto that runner if the heartbeat is fresh, and cancels all at once if it is stale
@@ -931,9 +967,11 @@ check positions (`GET /portfolio/positions?subaccount=1`, or the UI); write down
 | `dh_foreign_order_events_total{type,source}` | fills / order updates of client_order_ids that are not ours (or of orders a lookup proved not ours), dropped | > 0: another system's activity reaches this key |
 | `dh_unknown_order_events_parked` / `_parked_total`, `dh_unknown_order_events_released_total{why}` | own-activity events without client id of a not-yet-known order: parked, then released (`why` = known / lookup) | a parked gauge that stays > 0 for more than 10 s |
 | `dh_unknown_order_events_dropped_total{type,source}` | parked events whose order stayed unknown: dropped, quoting paused, reconciled | > 0: check the ERROR `UNKNOWN ...` lines and the positions |
+| `dh_unknown_order_fills_delivered_total` | REST fills of subaccount 1 delivered as ours after their order's park timed out (restricted key) | > 0: check the order id on Kalshi (why did no ack / lookup prove it?) |
+| `dh_unknown_order_loops_total` | an order timed out of the park `venue.unknown_order_max_park_cycles` times: Halt(all) `unknown_order_loop` | > 0 (halted) |
 | `dh_exchange_paused`, `dh_exchange_active`, `dh_trading_active`, `dh_exchange_pauses_total`, `dh_pause_rejects_total{scope}`, `dh_exchange_status_errors_total`, `dh_next_closure_ts` | trading / exchange pauses of shard 2 (status poll, schedule, rejects: scope exchange / market), status polls failing | paused outside the Thursday window; errors growing |
 | `dh_balance_dollars{exchange_index}`, `dh_shard_funds_dollars{exchange_index}`, `dh_balance_required_dollars` | subaccount 1's available cash per shard; its funds (cash + positions at cost + resting collateral) vs the requirement | funds below the requirement |
-| `dh_verify_live{check}` | open questions settled by the first live session (`ws_fill_subaccount_field`, `queue_positions_covers_shard`): 1 as expected, 0 not | 0 |
+| `dh_verify_live{check}` | open questions settled by the first live session (`ws_fill_subaccount_field`, `queue_positions_covers_shard`, `get_order_by_id_finds_shard_orders`): 1 as expected, 0 not | 0 |
 | `dh_queue_positions_coverage` | share of our resting orders `queue_positions` returned (shard-2 coverage) | < 1 persistently |
 | `dh_position_reads_stale_total` | positions reads older than the last WS fill of the market (user_data_timestamp): deferred (capped: 5 / 60 s) | growing fast |
 | `dh_foreign_series_events_total` | own-channel events of markets outside the series (dropped) | > 0 (who trades subaccount 1?) |
@@ -1002,13 +1040,14 @@ jq -c 'select(.k|test("order_event_parked|order_event_released|order_event_unkno
 | `gate` `exchange_pause`, `exchange_status_unreadable` log | 3 status polls in a row failed (fail closed) | check the network / `smoke_kalshi.py`; resumes after a successful poll and the re-read |
 | `block` `market_pause`, `pause_reject` log with `scope: market` | a place in that market was rejected for a market-level pause | nothing: that market only, lifted after `pause_reject_hold_s` (30 s) |
 | `foreign_order_event` log (ERROR `DROPPED ...`), `dh_foreign_order_events_total` | a fill / order update whose client_order_id is not ours (or whose order a lookup proved another system's / subaccount's) | STOP and check the keys: with System 1's restricted key this should never happen (another system's activity reaches this key) |
-| `order_event_unknown_dropped` log (ERROR `UNKNOWN ...`), `reconcile begin reason unknown_order` | a fill / update without client id whose order id stayed unknown for 10 s (the create response, reconciliation and `GET /portfolio/orders/{id}` all failed to prove it) | quoting pauses by itself and fills / positions / orders are re-read; if the position then differs, trading halts (mismatch). Check the `order_lookup` lines (404? read errors?) and Kalshi's order history for that order id |
+| `order_event_unknown_dropped` log (ERROR `UNKNOWN ...`), `reconcile begin reason unknown_order` | a fill / update without client id whose order id stayed unknown for 10 s (the create response, reconciliation and `GET /portfolio/orders/{id}` + the subaccount list all failed to prove it) | quoting pauses by itself and fills / positions / orders are re-read; its REST fill is then delivered as ours (restricted key); if the position still differs, trading halts (mismatch). Check the `order_lookup` lines (404? read errors? `via`) and Kalshi's order history for that order id |
+| `halt` log / CRITICAL with reason `unknown_order_loop` | the same order timed out of the park 3 times (`venue.unknown_order_max_park_cycles`): it could never be proven ours or another system's | sticky Halt(all). Look the order id up on Kalshi (subaccount, client id, shard); check `verify_live get_order_by_id_finds_shard_orders` and the key restriction; restart with `--reset-daily-halt` only once explained |
 | `venue.cancel_all_leftovers` log | orders of subaccount 1 still resting after every cancel-by-id round | Kalshi UI / `tools orders`; the watchdog keeps trying |
 | `gate` `clock` | clock offset > 250 ms persists, or the clock cannot be trusted (`gate` log `why`: unmeasurable / not synchronised / estimated error / behind exchange time) | fix chrony (`chronyc tracking`; Docker: `/run/chrony` mounted; macOS: `sntp time.apple.com` must answer, check the network / time server). The session clock's own drift is slewed away, so a long session no longer reaches the block by itself; after a wall-clock STEP the offset decays only at 50 us/s: restart the runner (re-anchors its clock) |
 | `gate` `exchange_pause`, `exchange_pause` / `exchange_status` log | shard 2 not trading (status poll), a scheduled closure within `pause_lead_s`, or a place rejected for a pause | nothing: quoting resumes after trading is active again and fills / positions / orders were re-read; an `EXCHANGE PAUSE` (cancels rejected too): watch `dh_venue_stuck_cancels`, resting quotes rely on `cancel_order_on_pause` |
 | `gate` `balance` | subaccount 1's funds on a shard below worst-case loss + margin (or unreadable 3 reads in a row) | fund subaccount 1 on that shard (1.2 step 3, declared to System 2) or stop; reopens on the next good read (60 s) |
 | `kill_switch` log, `venue.groups_triggered` | a manual halt / kill / fee mismatch / watchdog marker / shutdown triggered the order group(s) | nothing: the group stays triggered for the session (never reset); the next start creates a fresh one |
-| `verify_live` log, `dh_verify_live{check}` 0 | the first live session answered an open question differently than expected | `ws_fill_subaccount_field` 0 with an unrestricted key: switch to restricted keys (1.2); `queue_positions_covers_shard` 0: queue calibration has no shard-2 samples (report, not a trading problem) |
+| `verify_live` log, `dh_verify_live{check}` 0 | the first live session answered an open question differently than expected | `ws_fill_subaccount_field` 0 with an unrestricted key: switch to restricted keys (1.2); `queue_positions_covers_shard` 0: queue calibration has no shard-2 samples (report, not a trading problem); `get_order_by_id_finds_shard_orders` 0: `GET /portfolio/orders/{id}` does not see shard-2 orders; unknown-order lookups rely on the subaccount list (report; no action needed) |
 
 **Halts survive restarts.** The runner persists the day's P&L, the halt (reason, scope, the
 UTC day it was decided) and any pause (`paths.risk_state_file`, atomically, every 2 s and

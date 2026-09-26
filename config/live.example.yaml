@@ -129,6 +129,13 @@ venue:
   unknown_order_lookup_delay_s: 1.0 # first GET order after this (the create response usually wins)
   unknown_order_lookup_retry_s: 2.0 # then every this while parked (404 / read error)
   unknown_order_park_max: 1000      # parked events in all; beyond: the oldest order times out
+  # F1 (final check): after an order's FIRST park timeout its REST fills (read with subaccount=<ours>
+  # under the proven restricted key) are delivered as ours, its market is no longer exempt from the
+  # mismatch confirmation, and this many timeouts of the SAME order halt (Halt(all)
+  # 'unknown_order_loop', sticky). Live: >= 2, and unknown_order_park_s < 3 x position_confirm_s.
+  unknown_order_max_park_cycles: 3
+  verify_get_order_after_s: 60.0    # once per session after our first ack: does GET /portfolio/orders/
+                                    # {id} see shard-2 orders? (verify_live; 0 = off)
   reconcile_retry_max_s: 30.0
   startup_cancel_all: true          # cancel (and verify) leftovers BEFORE reading positions; required live
   cancel_all_hold_s: 60.0           # Kalshi may cancel orders placed within 1 min of a BULK cancel-all:
@@ -204,9 +211,16 @@ watchdog:                      # scripts/watchdog.py (locks onto the live runner
   api_max_age_s: 180.0         # beat carries api_ok + the last success. LIVE RUNNER: api_ok false or a
                                # last success older than api_max_age_s = not protecting (start refused,
                                # gate 'watchdog' closed)
+  api_write_probe_interval_s: 600.0  # WRITE capability (F2): at start and this often (every
+                               # api_probe_interval_s while failing) DELETE /portfolio/events/orders/
+                               # <fresh random uuid4>?subaccount=<n>&exchange_index=<first shard>: 404 =
+                               # may cancel; 401/403 = api_ok false. Never a real order id. The runner
+                               # requires api_write_ok: true. Live: in [api_probe_interval_s, 3600]
   max_future_s: 2.0            # a beat (runner side) or runner heartbeat (watchdog side) stamped more
                                # than this in the FUTURE is not fresh: the runner gates, the watchdog
-                               # treats it like a stale heartbeat (it fires)
+                               # treats it like a stale heartbeat (it fires). After a BACKWARD wall-clock
+                               # step a fresh heartbeat of the watched runner resets its stored time
+                               # (no fire); none within stale_s -> it fires (F3)
 
 disk:                          # free space of paths.data_root's filesystem (decimal GB; live only)
   min_free_gb_start: 10.0      # below: the live runner refuses to start (exit 2)

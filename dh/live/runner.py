@@ -35,7 +35,13 @@ Data path
     live parked it) delivers the same event at the same point. Proven foreign: dropped. Still
     unknown after ``venue.unknown_order_park_s``: dropped with an ERROR and quoting paused through
     the reconcile path ('unknown_order': fills, positions, orders re-read; an unexplained
-    position halts as any confirmed mismatch).
+    position halts as any confirmed mismatch). Such an order never loops (final check F1):
+    after its first timeout a REST fill of it (read with subaccount=<ours> under the proven
+    restricted key: ours by construction) is delivered as '<prefix>orphan-<order id>' and
+    recorded, its market is no longer exempt from the mismatch confirmation, and the
+    ``venue.unknown_order_max_park_cycles``-th timeout halts (Halt(all) 'unknown_order_loop',
+    persisted). The lookup falls back to the subaccount's order LIST by ticker when the by-id
+    read 404s (``verify_live get_order_by_id_finds_shard_orders``).
   * The consumer task takes items in order and hands events to ``EventPump`` (dh.live.pump),
     which calls ``strategy.on_event`` synchronously, never concurrently, with ``Timer``
     events synthesized on the grid ``k * period_ns`` exactly as the backtest runner does.
@@ -168,7 +174,7 @@ from dh.core.events import (
 )
 from dh.core.market import MarketSpec
 from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
-from dh.live.config import LiveConfig
+from dh.live.config import RECONCILE_CONFIRM_ROUNDS, LiveConfig
 from dh.live.monitor import JsonLog, KillFile, Metrics, MetricsServer, write_heartbeat
 from dh.live.pump import EventPump, OrderingError
 from dh.live.riskstate import CARRIED, RiskBook, day_start, payout_px
@@ -201,6 +207,11 @@ MARKET_PAUSE_REASON = "market_pause"  # per-market block after a market-level pa
 WATCHDOG_REASON = "watchdog"  # gate + reconcile reason: the watchdog is not protecting this runner
 DISK_REASON = "disk"  # gate + reconcile reason: too little free disk for the session store
 UNKNOWN_ORDER_REASON = "unknown_order"  # reconcile reason: a parked fill / update whose order stayed unknown
+# halt reason (review F1): the same order timed out of the park venue.unknown_order_max_park_cycles times
+UNKNOWN_ORDER_LOOP_REASON = "unknown_order_loop"
+# client_order_id tag of a REST fill delivered as ours by construction after its order's park timed
+# out (review F1): '<own prefix>orphan-<order id>' (never a real id: ours are '<prefix><token>-<n>')
+ORPHAN_COID_TAG = "orphan-"
 # place-reject reasons that mean the EXCHANGE / trading as a whole is paused (Kalshi's codes are
 # undocumented; never 'market_inactive' / 'market_closed', which follow a market's own close)
 _EXCHANGE_PAUSE_REJECT = re.compile(r"exchange[_ ](is[_ ])?(paused|closed|inactive|unavailable|not[_ ]active)"
@@ -569,6 +580,10 @@ class LiveRunner:
         self._release: list[tuple[Any, str, str]] = []  # (event, source, client_order_id) to deliver now
         self._unknown_logged = 0
         self._unk_gen = 0  # generation of the 'unknown_order' reconciliation
+        # review F1: park timeouts per order id (bounded): > 0 = timed out before (no longer exempt from
+        # the mismatch confirmation; a REST fill of it is ours by construction on a restricted key)
+        self._park_timeouts: dict[str, int] = {}
+        self._get_order_verify = False  # the one-time GET /portfolio/orders/{id} verification started
         self._unknown_since = 0  # earliest exchange/receive time of an event dropped as unknown (fills window)
         # the watchdog's liveness (review M3): reader of its beat file, the current problem
         self._watchdog_reader = watchdog_reader
@@ -861,6 +876,18 @@ class LiveRunner:
             if fid in self._parked_ids or self.fills_seen.seen(ev):
                 return  # parked already (a REST re-read) or delivered
         vc = self.cfg.venue
+        cycles = self._park_timeouts.get(oid, 0)
+        if cycles:  # review F1: this order already timed out of the park
+            if cycles >= max(1, int(vc.unknown_order_max_park_cycles)):
+                # the runner halted on it ('unknown_order_loop'): never parked / reconciled again
+                self.metrics.inc("dh_unknown_order_events_dropped_total", type=type(ev).__name__, source=source)
+                self.jlog("order_event_unknown_dropped", ts, type=type(ev).__name__, source=source, order_id=oid,
+                          why=f"{UNKNOWN_ORDER_LOOP_REASON} (halted)", ticker=getattr(ev, "ticker", ""),
+                          trade_id=getattr(ev, "trade_id", ""))
+                return
+            if source == "rest" and isinstance(ev, KalshiFill) and self._rest_fills_ours_by_construction():
+                self._deliver_by_subaccount(ev, oid, ts, cycles)
+                return
         while self._parked_n >= max(1, int(vc.unknown_order_park_max)) and self._parked:
             old = min(self._parked_since, key=self._parked_since.__getitem__)
             self._park_timeout(old, ts, "park buffer full")
@@ -878,16 +905,48 @@ class LiveRunner:
             self._lookups.add(oid)
             self._spawn(self._lookup_order(oid, vc.unknown_order_lookup_delay_s), "order_lookup")
 
+    def _rest_fills_ours_by_construction(self) -> bool:
+        """Review F1 (a): a REST fill is read with GET /portfolio/fills?subaccount=<ours> and kept only
+        when its row names our subaccount (``row_in_subaccount``); under a key RESTRICTED to our
+        (non-primary) subaccount, proven at start by a 403 on subaccount 0, Kalshi scopes the read
+        server-side: such a fill is ours whatever its order id."""
+        return self.mode == "live" and self.key_restricted and self.subaccount != 0
+
+    def _deliver_by_subaccount(self, ev: KalshiFill, oid: str, ts: int, cycles: int) -> None:
+        """Review F1 (a): the REST copy of a fill whose order timed out of the park is delivered
+        (never re-parked): released right after the fills read that carried it, with the client id
+        '<own prefix>orphan-<order id>' (the strategy books it as an orphan fill: position, cash and
+        fees move; a later ack of that order id attaches it), recorded on events.live so replay
+        delivers it at the same point (the raw copies are dropped there as unknown, as live did)."""
+        coid = f"{self.own_id_prefix}{ORPHAN_COID_TAG}{oid}"
+        self.metrics.inc("dh_unknown_order_fills_delivered_total")
+        log.error("fill %s of order %s (%s) stayed unproven through %d park timeout(s): DELIVERED as ours (read with "
+                  "GET /portfolio/fills?subaccount=%d under the key restricted to that subaccount)",
+                  getattr(ev, "trade_id", ""), oid, ev.ticker, cycles, self.subaccount)
+        self.jlog("order_event_delivered_by_subaccount", ts, type=type(ev).__name__, order_id=oid, ticker=ev.ticker,
+                  trade_id=ev.trade_id, client_order_id=coid, park_cycles=cycles, subaccount=self.subaccount)
+        self._release.append((ev, "rest", coid))
+
     async def _lookup_order(self, oid: str, delay_s: float) -> None:
-        """GET /portfolio/orders/{oid} (read-only) after ``delay_s`` if the order is still parked
-        (the create response usually releases it first); the verdict goes through the queue."""
+        """Who owns order ``oid`` (read-only), after ``delay_s`` if the order is still parked (the
+        create response usually releases it first): GET /portfolio/orders/{oid} and, when that 404s,
+        the list GET /portfolio/orders?subaccount=<ours>&ticker=<the parked event's market> (every
+        page; review F1 (b): the by-id endpoint takes no subaccount / shard and may not see shard-2
+        orders). The verdict goes through the queue."""
         try:
             await asyncio.sleep(max(0.0, delay_s))
             if self._stopping or oid not in self._parked:
                 self._lookups.discard(oid)
                 return
+            evs = self._parked.get(oid) or []
+            ticker = str(getattr(evs[0][0], "ticker", "") or "") if evs else ""
+            via: dict[str, Any] = {}
             try:
-                row = await self.venue.lookup_order(oid)
+                find = getattr(self.venue, "find_order", None)
+                if find is not None:
+                    row, via = await find(oid, ticker=ticker)
+                else:
+                    row = await self.venue.lookup_order(oid)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - retried while the order is parked
@@ -895,18 +954,62 @@ class LiveRunner:
                 self.push_side("order_lookup", {"oid": oid, "verdict": "error", "client_order_id": "",
                                                 "detail": f"{type(exc).__name__}: {exc}"[:200]})
                 return
-            self.push_side("order_lookup", {"oid": oid, **order_row_owner(row, self.own_id_prefix, self.subaccount,
-                                                                          key_restricted=self.key_restricted)})
+            self.push_side("order_lookup", {"oid": oid, "via": dict(via or {}),
+                                            **order_row_owner(row, self.own_id_prefix, self.subaccount,
+                                                              key_restricted=self.key_restricted)})
         except BaseException:
             self._lookups.discard(oid)
             raise
+
+    def _verify_get_order(self, via: dict[str, Any], oid: str, where: str) -> None:
+        """Review F1 (b): verify_live 'get_order_by_id_finds_shard_orders' once an order of OUR
+        subaccount was found: by id (OK) or only by the subaccount list (the by-id endpoint does not
+        see it: parked fills of such orders are released only by the ack, the create reconciliation
+        or the list lookup)."""
+        if not via or not (via.get("by_id") or via.get("by_list")):
+            return
+        self.verify_live("get_order_by_id_finds_shard_orders", bool(via.get("by_id")), order_id=oid,
+                         exchange_index=via.get("shard"), by_id=via.get("by_id"), by_list=via.get("by_list"), where=where)
+
+    def _maybe_verify_get_order(self, ev: Any) -> None:
+        """Start the one-time GET-by-id verification on our first acknowledged order (live)."""
+        if (self._get_order_verify or self.mode != "live" or not isinstance(ev, OrderAck) or not ev.order_id
+                or self.cfg.venue.verify_get_order_after_s <= 0 or not hasattr(self.venue, "find_order")):
+            return
+        self._get_order_verify = True
+        self._spawn(self._verify_get_order_task(ev.order_id, ev.ticker), "verify_get_order")
+
+    async def _verify_get_order_task(self, oid: str, ticker: str) -> None:
+        """One-time live check (review F1 (b)): does GET /portfolio/orders/{id} find our order (on its
+        shard)? Up to 3 tries ``venue.verify_get_order_after_s`` apart; the list is the reference."""
+        delay = max(0.0, float(self.cfg.venue.verify_get_order_after_s))
+        for attempt in range(3):
+            await asyncio.sleep(delay)
+            if self._stopping:
+                return
+            try:
+                _row, via = await self.venue.find_order(oid, ticker=ticker)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a check only: try again later
+                self.jlog("verify_live_error", self._clock(), check="get_order_by_id_finds_shard_orders", order_id=oid,
+                          attempt=attempt, error=f"{type(exc).__name__}: {exc}"[:200])
+                continue
+            if via.get("by_id") or via.get("by_list"):
+                self._verify_get_order(via, oid, "session_check")
+                return
+            self.jlog("verify_live_inconclusive", self._clock(), check="get_order_by_id_finds_shard_orders",
+                      order_id=oid, attempt=attempt, note="found neither by id nor in the subaccount list")
 
     def _on_order_lookup(self, ts: int, p: dict[str, Any]) -> None:
         oid = str(p.get("oid") or "")
         self._lookups.discard(oid)
         verdict = str(p.get("verdict") or "")
+        via = dict(p.get("via") or {})
         self.jlog("order_lookup", ts, order_id=oid, verdict=verdict, client_order_id=p.get("client_order_id", ""),
-                  detail=p.get("detail", ""), parked=len(self._parked.get(oid, ())))
+                  detail=p.get("detail", ""), parked=len(self._parked.get(oid, ())), via=via)
+        if verdict == "ours":
+            self._verify_get_order(via, oid, "lookup")
         if verdict == "ours":
             coid = str(p.get("client_order_id") or "")
             self._proven_ours[oid] = coid
@@ -971,7 +1074,21 @@ class LiveRunner:
                 self._park_timeout(oid, ts, f"unknown after {self.cfg.venue.unknown_order_park_s:g}s")
 
     def _park_timeout(self, oid: str, ts: int, why: str) -> None:
-        self._unknown_dropped(self._unpark(oid), ts, why)
+        """The order's events leave the park unproven: dropped as unknown (reconcile). Review F1: the
+        timeouts are counted per order id; from the first one on, its market is no longer exempt from
+        the mismatch confirmation and a REST fill of it is delivered (restricted key); the
+        ``venue.unknown_order_max_park_cycles``-th one halts the runner ('unknown_order_loop')."""
+        n = self._park_timeouts.pop(oid, 0) + 1
+        self._park_timeouts[oid] = n
+        while len(self._park_timeouts) > 20_000:
+            self._park_timeouts.pop(next(iter(self._park_timeouts)))
+        self._unknown_dropped(self._unpark(oid), ts, f"{why} (park cycle {n})")
+        if n >= max(1, int(self.cfg.venue.unknown_order_max_park_cycles)) and self.mode == "live":
+            self.metrics.inc("dh_unknown_order_loops_total")
+            self._runner_halt(ts, UNKNOWN_ORDER_LOOP_REASON,
+                              f"order {oid} stayed unproven (neither ours nor foreign) through {n} park cycles: HALT "
+                              "(investigate the order on the exchange, then restart with --reset-daily-halt)",
+                              order_id=oid, park_cycles=n)
 
     def _unknown_dropped(self, evs: list[tuple[Any, str]], ts: int, why: str) -> None:
         """Parked events whose order could not be proven ours or foreign: dropped (counted, ERROR)
@@ -1006,6 +1123,7 @@ class LiveRunner:
             return
         if live:
             self._note_own(ev)
+            self._maybe_verify_get_order(ev)
         if live and isinstance(ev, KalshiFill) and self.fills_seen.seen(ev):
             # delivered already (a REST back-fill beat the WS message, or a duplicate)
             self.metrics.inc("dh_duplicate_fills_dropped_total")
@@ -1248,25 +1366,32 @@ class LiveRunner:
         self._reconcile_now(ts, "watchdog_cancel_all")
 
     def _watchdog_halt(self, ts: int, marker_t: int) -> None:
-        """The watchdog triggered on this live runner: Halt(all) (gate, persisted sticky halt,
-        and a halting RiskStateSeed so the strategy halts and cancels through its own path)."""
+        """The watchdog triggered on this live runner: Halt(all) (``_runner_halt``)."""
+        self.jlog("watchdog_cancel_all_seen", ts, marker_t=marker_t, halt=True)
+        self._runner_halt(ts, "watchdog_cancel_all", "the WATCHDOG cancelled every order while this runner was alive "
+                          "(its heartbeat went stale): HALT (investigate, then restart with --reset-daily-halt)")
+        self._reconcile_now(ts, "watchdog_cancel_all")
+
+    def _runner_halt(self, ts: int, reason: str, message: str, /, **info: Any) -> None:
+        """A runner-decided Halt(all), sticky (the watchdog's cancel-all naming this runner, an
+        unknown-order loop): gate closed, the halt persisted at once (a restart carries it until
+        --reset-daily-halt), and a halting RiskStateSeed fed (recorded: replay halts at the same
+        point) so the strategy halts and cancels through its own path."""
         key = "halt:all"
         self._halt_until[key] = 0
-        self._halt_info.setdefault(key, ("watchdog_cancel_all", day_start(ts), "all"))
+        self._halt_info.setdefault(key, (reason, day_start(ts), "all"))
         if self.gate.close(key, ts):
-            log.critical("the WATCHDOG cancelled every order while this runner was alive (its heartbeat went "
-                         "stale): HALT (investigate, then restart with --reset-daily-halt)")
+            log.critical("%s", message)
             self.metrics.set("dh_halted", 1.0, scope="all")
-            self.meta("halt", ts, scope="all", reason="watchdog_cancel_all")
-        self.jlog("watchdog_cancel_all_seen", ts, marker_t=marker_t, halt=True)
-        self.persist_risk_state(ts, fsync=True, halt_reason="watchdog_cancel_all")
+            self.meta("halt", ts, scope="all", reason=reason, **info)
+            self.jlog("halt", ts, scope="all", reason=reason, until_ts=0, **info)
+        self.persist_risk_state(ts, fsync=True, halt_reason=reason)
         st = max(ts, self.pump.last_ts)
-        seed = RiskStateSeed(st, 0, day_start(st), self.riskbook.seed_value(st), True, "watchdog_cancel_all", 0)
+        seed = RiskStateSeed(st, 0, day_start(st), self.riskbook.seed_value(st), True, reason, 0)
         self._pre_event(seed)
         self._inject(seed)
         if not getattr(getattr(self.strategy, "risk", None), "halted_all", False):
-            self._cancel_all_async("watchdog_cancel_all")  # a strategy without a risk engine: cancel here
-        self._reconcile_now(ts, "watchdog_cancel_all")
+            self._cancel_all_async(reason)  # a strategy without a risk engine: cancel here
 
     def _schedule_wake(self) -> None:
         """Arm one wake-up for the next deadline (timer grid / simulator / housekeeping)."""
@@ -1643,7 +1768,7 @@ class LiveRunner:
         # a position still differs (or, for an unknown order, events are still parked): confirm
         # (-> mismatch -> Halt) or clear before quoting
         pending = bool(self._pos_suspect) or (reason == UNKNOWN_ORDER_REASON and bool(self._parked))
-        if pending and int(d.get("round", 0)) < 3:
+        if pending and int(d.get("round", 0)) < RECONCILE_CONFIRM_ROUNDS:
             self._spawn(self._confirm_positions(gen, int(d.get("round", 0)) + 1, reason), "confirm_positions")
             return
         if reason == UNKNOWN_ORDER_REASON:
@@ -2074,7 +2199,10 @@ class LiveRunner:
         # review NEW-1: a market with a parked fill / update (order id not proven yet) never
         # confirms: the event is released, or dropped as unknown (which reconciles), within
         # venue.unknown_order_park_s, then the normal confirmation applies
-        parked = {str(getattr(ev, "ticker", "")) for evs in self._parked.values() for ev, _ in evs} if self._parked else set()
+        # review F1 (c): only while parked for the FIRST time; after a park timeout the order's
+        # market confirms normally (a mismatch there halts)
+        parked = {str(getattr(ev, "ticker", "")) for oid, evs in self._parked.items() if not self._park_timeouts.get(oid)
+                  for ev, _ in evs} if self._parked else set()
         for t in sorted(cands):
             ex, ours = int(exch.get(t, 0)), self._position_of(t)
             if ex == ours:

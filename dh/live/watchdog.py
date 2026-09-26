@@ -23,13 +23,24 @@ stale, names another subaccount, or is not armed on it (review M3). Liveness is 
 probe with its OWN key (``rest_api_probe``: GET /portfolio/orders?subaccount=<n>&status=resting&
 limit=1); the beat carries ``api_ok``, ``api_ok_ns`` (last success; a successful cancel-all
 counts too), ``api_error`` and ``step_ok`` (false after 3 failed polls in a row), and the runner
-treats a watchdog whose key cannot be shown to work as not protecting.
+treats a watchdog whose key cannot be shown to work as not protecting. Reading is not cancelling
+(review F2): at start and every ``api_write_probe_interval_s`` (every ``api_probe_interval_s``
+while the last one failed) it also proves WRITE capability with ``rest_write_probe``: DELETE
+/portfolio/events/orders/<fresh uuid4>?subaccount=<n>&exchange_index=<shard> through its scoped
+write client; 404 (no such order) = the key may cancel, 401 / 403 (or anything else) = api_ok false
+with the reason. The id is a new random uuid4 every time, never a real order id, so the probe can
+never cancel anything. The beat carries ``api_write_ok`` / ``api_write_ok_ns`` / ``api_write_error``
+and the runner requires ``api_write_ok`` true.
 
 Timestamps (review NEW-3): a runner heartbeat stamped more than ``max_future_s`` in the FUTURE
 is untrusted: it neither arms the watchdog nor refreshes the watched runner's liveness, so an
 armed watchdog fires exactly as for a stale heartbeat (fail-safe: a clock step between the two
 processes costs a cancel-all, never a silent dead-man switch). The same absolute-age rule
-applies to the watchdog's own beat as read by the runner.
+applies to the watchdog's own beat as read by the runner. A BACKWARD wall-clock step (review F3)
+leaves the stored heartbeat time (a running max) in the future: a fresh, trusted heartbeat of the
+SAME watched runner (pid + session) that is older than the stored time but consistent with the
+new clock (not in the future, not stale) resets it instead of firing; with no such heartbeat
+within ``stale_s`` of the step being noticed, it fires (the runner may have died at the step).
 
 State machine (poll every ``poll_s``):
   DISARMED   waiting for a fresh heartbeat of a LIVE runner (state running/stopping); it then
@@ -89,6 +100,8 @@ class WatchdogState:
     last_mode: str = ""
     last_state: str = ""
     stopping_seen_ns: int = 0  # when the watched runner was first seen 'stopping'
+    last_hb_raw: int = 0  # the last heartbeat time read from the file (trusted or not)
+    back_step_ns: int = 0  # when the stored heartbeat time was first seen in the future (clock stepped back)
     shutdown_timeout_s: float = 10.0  # the watched runner's own (from its heartbeat)
     triggered_at_ns: int = 0
     last_attempt_ns: int = 0
@@ -120,6 +133,7 @@ class Watchdog:
         bulk: bool = False,
         beat_path: str | Path | None = None,
         api_probe: ProbeFn | None = None,
+        api_write_probe: ProbeFn | None = None,
     ) -> None:
         self.path = Path(heartbeat_path)
         self.cancel_all = cancel_all
@@ -144,6 +158,14 @@ class Watchdog:
         self.api_ok_ns = 0
         self.api_error = "not probed yet" if api_probe is not None else "no API probe configured"
         self.api_probes = 0
+        # WRITE capability (review F2): a harmless cancel of a random order id (404 = may cancel)
+        self.api_write_probe = api_write_probe
+        self.write_ok: bool | None = None  # None: not probed yet / no write probe configured
+        self.write_ok_ns = 0
+        self.write_error = "not probed yet" if api_write_probe is not None else "no write probe configured"
+        self.write_probes = 0
+        self._write_last_ns = 0  # last write-probe attempt
+        self.back_steps = 0  # backward wall-clock steps absorbed (review F3)
         self.step_failures = 0  # consecutive failed polls
         self.step_error = ""
         self.future_hb = 0  # runner heartbeats stamped in the future (not trusted)
@@ -186,34 +208,77 @@ class Watchdog:
                 "armed": list(self.st.armed) if self.st.armed else None, "last_poll_ns": self._last_poll_ns,
                 "heartbeat": str(self.path), "bulk_cancel": self.bulk, "stale_s": self.cfg.stale_s,
                 "api_ok": self.api_ok, "api_ok_ns": self.api_ok_ns or None, "api_error": self.api_error,
+                "api_write_ok": self.write_ok, "api_write_ok_ns": self.write_ok_ns or None,
+                "api_write_error": self.write_error,
                 "step_ok": self.step_failures < STEP_FAILURES_REPORTED, "step_error": self.step_error}, now_ns=now)
         except OSError as exc:
             log.error("watchdog: cannot write its beat %s: %s", self.beat_path, exc)
 
     async def probe_api(self) -> bool:
-        """One read-only authenticated probe with the watchdog's own key (review NEW-2); the result
-        goes into the beat (``api_ok``, ``api_ok_ns``, ``api_error``). Bounded by
+        """One read-only authenticated probe with the watchdog's own key (review NEW-2) and, when due,
+        the write-capability probe (review F2, ``probe_write``); the result goes into the beat
+        (``api_ok`` = read AND write proven, ``api_ok_ns``, ``api_error``). Each bounded by
         ``api_probe_timeout_s``. A successful cancel-all also counts as proof."""
         if self.api_probe is None:
             return False
         self.api_probes += 1
+        err = ""
         try:
             await asyncio.wait_for(self.api_probe(), timeout=max(0.1, self.cfg.api_probe_timeout_s))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any failure: the key cannot be shown to work
-            was = self.api_ok
-            self.api_ok = False
-            self.api_error = f"{type(exc).__name__}: {exc}"[:200] or type(exc).__name__
+            err = f"{type(exc).__name__}: {exc}"[:200] or type(exc).__name__
+        if self.api_write_probe is not None and self._write_probe_due():
+            await self.probe_write()
+        if not err and self.api_write_probe is not None and self.write_ok is not True:
+            err = f"write capability not proven: {self.write_error}"[:240]
+        was = self.api_ok
+        if err:
+            self.api_ok, self.api_error = False, err
             if was or self.api_probes == 1:
-                self._note("API probe FAILED: the watchdog's key cannot be shown to reach the API", error=self.api_error)
+                self._note("API probe FAILED: the watchdog's key cannot be shown to reach the API / cancel",
+                           error=self.api_error)
             self.write_beat(force=True)
             return False
-        was = self.api_ok
         self.api_ok, self.api_ok_ns, self.api_error = True, self._clock(), ""
         if not was:
-            self._note("API probe OK (the watchdog's key reaches the API)")
+            self._note("API probe OK (the watchdog's key reaches the API" + (
+                " and may cancel)" if self.api_write_probe is not None else ")"))
             self.write_beat(force=True)
+        return True
+
+    def _write_probe_due(self) -> bool:
+        """At start, every ``api_write_probe_interval_s`` while it succeeds, and on every read probe
+        (``api_probe_interval_s``) while it fails (a transient error must not block the runner for
+        a whole write interval)."""
+        if self.write_ok is not True or not self._write_last_ns:
+            return True
+        return self._clock() - self._write_last_ns >= int(self.cfg.api_write_probe_interval_s * NS_PER_S)
+
+    async def probe_write(self) -> bool:
+        """The write-capability probe (review F2): ``api_write_probe`` (``rest_write_probe``: a cancel of
+        a fresh random order id through the scoped write client; 404 = allowed). Updates
+        ``write_ok`` / ``write_ok_ns`` / ``write_error``."""
+        if self.api_write_probe is None:
+            return False
+        self.write_probes += 1
+        self._write_last_ns = self._clock()
+        try:
+            await asyncio.wait_for(self.api_write_probe(), timeout=max(0.1, self.cfg.api_probe_timeout_s))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any failure: cancelling cannot be shown to work
+            was = self.write_ok
+            self.write_ok, self.write_error = False, f"{type(exc).__name__}: {exc}"[:200] or type(exc).__name__
+            if was is not False:
+                self._note("API WRITE probe FAILED: the watchdog's key cannot be shown to be allowed to cancel",
+                           error=self.write_error)
+            return False
+        was = self.write_ok
+        self.write_ok, self.write_ok_ns, self.write_error = True, self._clock(), ""
+        if was is not True:
+            self._note("API WRITE probe OK (a cancel of a non-existent order id answered 404)")
         return True
 
     async def _probe_loop(self, stop: asyncio.Event | None) -> None:
@@ -243,6 +308,7 @@ class Watchdog:
         st.last_hb_ns = int(hb.get("t", 0))
         st.last_state = str(hb.get("state", "running"))
         st.stopping_seen_ns = 0
+        st.back_step_ns = 0
         st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or 10.0)
         st.groups = _groups_of(hb)
         self._note(note, pid=hb.get("pid"), session=hb.get("session"), groups=len(st.groups))
@@ -263,6 +329,7 @@ class Watchdog:
         ident = (hb.get("pid"), hb.get("session")) if hb is not None else None
         if hb is not None:
             st.last_mode = mode
+        prev_raw, st.last_hb_raw = st.last_hb_raw, (t if t is not None else st.last_hb_raw)
         if self._arm_on_start:
             self._arm_on_start = False
             live = (hb is not None and not hb.get("unparsed") and self._relevant(mode)
@@ -280,7 +347,20 @@ class Watchdog:
         if same and not t_ok and "order_groups" in hb:  # type: ignore[operator]
             st.groups = _groups_of(hb)  # type: ignore[arg-type]  # still the freshest list of groups to trigger
         if ours:
-            st.last_hb_ns = max(st.last_hb_ns, t or 0)
+            t = int(t or 0)
+            if (t < st.last_hb_ns and st.last_hb_ns - now > int(c.max_future_s * NS_PER_S) and fresh
+                    and t != prev_raw):
+                # review F3: the wall clock stepped BACK (the stored max now lies in the future) and a NEW
+                # heartbeat of the watched runner, consistent with the new clock, arrived: it is alive
+                self.back_steps += 1
+                self._note("wall clock stepped back: the watched runner's heartbeat time reset to its fresh "
+                           "heartbeat (not fired)", stored_ahead_s=round((st.last_hb_ns - now) / NS_PER_S, 3),
+                           heartbeat_age_s=round((now - t) / NS_PER_S, 3))
+                st.last_hb_ns = t
+            else:
+                st.last_hb_ns = max(st.last_hb_ns, t)
+            if fresh and t != prev_raw and st.last_hb_ns - now <= int(c.max_future_s * NS_PER_S):
+                st.back_step_ns = 0  # a new trusted heartbeat: the runner vouched for itself
             st.last_state = hstate
             st.shutdown_timeout_s = float(hb.get("shutdown_timeout_s") or st.shutdown_timeout_s)
             if "order_groups" in hb:  # the runner deletes its groups at shutdown: follow the heartbeat
@@ -308,8 +388,17 @@ class Watchdog:
                 (st.shutdown_timeout_s + c.stopping_grace_s) * NS_PER_S)
             age = now - st.last_hb_ns
             # absolute age (review NEW-3): a recorded heartbeat now in the future (the watchdog's clock
-            # stepped back) is as untrusted as a stale one
-            if hb is None or age > stale_ns or age < -int(c.max_future_s * NS_PER_S) or stuck:
+            # stepped back) vouches for nothing. Review F3: a live runner's next heartbeat (on the new
+            # clock) resets it above; without one within stale_s of noticing, fire as for a stale one
+            future = age < -int(c.max_future_s * NS_PER_S)
+            if future and not st.back_step_ns:
+                st.back_step_ns = now
+                self._note("the watched runner's last heartbeat time lies in the FUTURE (wall clock stepped back?): "
+                           "firing unless a fresh heartbeat of it arrives within stale_s",
+                           ahead_s=round(-age / NS_PER_S, 3))
+            # the grace runs from the first sight until a NEW trusted heartbeat of the runner (above)
+            future_expired = bool(st.back_step_ns) and now - st.back_step_ns > stale_ns
+            if hb is None or age > stale_ns or future_expired or stuck:
                 st.state = "TRIGGERED"
                 st.triggered_at_ns = now
                 st.successes = 0
@@ -352,7 +441,10 @@ class Watchdog:
         if ok:
             st.successes += 1
             st.last_success_ns = self._clock()
-            self.api_ok, self.api_ok_ns, self.api_error = True, st.last_success_ns, ""  # it did reach the API
+            # it did reach the API (not necessarily write: an empty list needs no cancel, so the write
+            # proof stays with the write probe, review F2)
+            if self.api_write_probe is None or self.write_ok:
+                self.api_ok, self.api_ok_ns, self.api_error = True, st.last_success_ns, ""
             self._note("cancel-all OK", n=st.successes)
         else:
             st.failures += 1
@@ -473,6 +565,51 @@ def rest_api_probe(rest: Any, subaccount: int) -> ProbeFn:
         if not isinstance(body, dict) or not isinstance(body.get("orders", []), list):
             raise ValueError(f"unexpected GET /portfolio/orders body: {str(body)[:120]}")
         return body
+
+    return _probe
+
+
+class WriteProbeError(RuntimeError):
+    """The write-capability probe did not prove the key may cancel (review F2)."""
+
+
+def rest_write_probe(rest: Any, subaccount: int, exchange_index: int) -> ProbeFn:
+    """The watchdog's WRITE capability probe (review F2): ``DELETE /portfolio/events/orders/
+    <fresh uuid4>?subaccount=<n>&exchange_index=<shard>`` (CancelOrderV2, docs/kalshi_specs/
+    openapi.yaml: 404 NotFoundError when no such order exists) through the scoped write client
+    (``KalshiRest(write_subaccount=..)``: an order-reducing write naming our subaccount and a shard
+    passes its guard). The order id is a NEW random uuid4 on every call (no way to pass one in),
+    never a real order id, so the probe can never cancel an order.
+
+    404 -> the key may cancel (returns the evidence). 401 / 403 -> WriteProbeError (no write scope,
+    or the key is not allowed on this subaccount). An unknown outcome (timeout, 5xx), any other
+    status, or a 2xx (an order with a random id cannot exist: never trusted) -> WriteProbeError."""
+    import uuid
+
+    from dh.kalshi.rest import KalshiHTTPError, UnknownOutcome
+
+    if subaccount is None or isinstance(subaccount, bool) or exchange_index is None or isinstance(exchange_index, bool):
+        raise ValueError("rest_write_probe needs an explicit subaccount and exchange shard")
+    sub, shard = int(subaccount), int(exchange_index)
+    if shard < 0:
+        raise ValueError("rest_write_probe needs a concrete exchange shard (auto-routing needs a market ticker)")
+    async def _probe() -> Any:
+        oid = str(uuid.uuid4())  # fresh every call: never a real order id
+        try:
+            res = await rest.cancel_order(oid, subaccount=sub, exchange_index=shard)
+        except KalshiHTTPError as exc:
+            if exc.status == 404:
+                return {"write_ok": True, "order_id": oid, "status": 404}
+            if exc.status in (401, 403):
+                raise WriteProbeError(f"cancel of a non-existent order refused with HTTP {exc.status}: the key has no "
+                                      f"write scope / is not allowed on subaccount {sub} ({str(exc.body)[:120]})") from exc
+            raise WriteProbeError(f"cancel of a non-existent order answered HTTP {exc.status} (expected 404): "
+                                  f"{str(exc.body)[:120]}") from exc
+        if isinstance(res, UnknownOutcome):
+            raise WriteProbeError(f"cancel of a non-existent order: unknown outcome ({res.reason})"[:200])
+        log.critical("watchdog: the write probe's cancel of random order id %s SUCCEEDED (%s): expected 404",
+                     oid, str(res)[:200])
+        raise WriteProbeError(f"cancel of random order id {oid} succeeded (expected 404): not trusted")
 
     return _probe
 

@@ -23,7 +23,8 @@ def _healthy_clock(monkeypatch):
 
 def healthy_watchdog_beat(subaccount: int, now_ns: int) -> dict:
     return {"t": int(now_ns), "pid": 1, "subaccount": int(subaccount), "state": "ARMED", "armed": None,
-            "last_poll_ns": int(now_ns), "api_ok": True, "api_ok_ns": int(now_ns), "step_ok": True}
+            "last_poll_ns": int(now_ns), "api_ok": True, "api_ok_ns": int(now_ns), "step_ok": True,
+            "api_write_ok": True, "api_write_ok_ns": int(now_ns)}
 
 
 @pytest.fixture(autouse=True)
