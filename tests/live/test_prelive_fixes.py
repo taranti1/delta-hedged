@@ -343,7 +343,8 @@ async def test_watchdog_writes_its_own_beat_and_marks_its_exit(tmp_path):
 
 def test_watchdog_beat_problems():
     now = T0
-    good = {"t": now, "pid": 1, "subaccount": 1, "state": "ARMED", "armed": [42, "s"], "api_ok": True, "api_ok_ns": now}
+    good = {"t": now, "pid": 1, "subaccount": 1, "state": "ARMED", "armed": [42, "s"], "api_ok": True, "api_ok_ns": now,
+            "api_write_ok": True}
     assert watchdog_beat_problem(good, now_ns=now, subaccount=1, max_age_s=10, runner=(42, "s")) == ""
     assert "no watchdog beat" in watchdog_beat_problem(None, now_ns=now, subaccount=1, max_age_s=10)
     assert "old" in watchdog_beat_problem(good, now_ns=now + 11 * NS_PER_S, subaccount=1, max_age_s=10)
@@ -366,7 +367,7 @@ async def test_live_start_requires_a_fresh_watchdog_beat_for_its_subaccount(tmp_
     if beat != "missing":
         t = now - (60 * NS_PER_S if beat == "stale" else 0)
         write_heartbeat(wd, {"pid": 9, "subaccount": 0 if beat == "other_subaccount" else 1, "state": "DISARMED",
-                             "armed": None, "api_ok": True, "api_ok_ns": t}, now_ns=t)
+                             "armed": None, "api_ok": True, "api_ok_ns": t, "api_write_ok": True}, now_ns=t)
     app = LiveApp(scfg, lcfg, "live", Overrides(rest=rest, ws_connect=fake.connect, install_signals=False))
     if beat != "fresh":
         assert await app.run(duration_s=0.5) == 2
@@ -383,7 +384,7 @@ async def test_runner_gates_new_orders_while_the_watchdog_is_not_protecting_it()
     has been running a while): gate 'watchdog' + the strategy is told (kalshi.reconcile stale)."""
     s = RecordingStrategy()
     beat = {"t": time.time_ns(), "pid": 1, "subaccount": 0, "state": "ARMED", "armed": None, "api_ok": True,
-            "api_ok_ns": time.time_ns()}
+            "api_ok_ns": time.time_ns(), "api_write_ok": True}
     alive = {"on": False}
     c = replace(cfg(), watchdog=WatchdogCfg(runner_max_age_s=0.3))
     r, _, _ = live_runner(s, config=c, watchdog_reader=lambda: dict(beat, t=time.time_ns()) if alive["on"] else dict(beat))

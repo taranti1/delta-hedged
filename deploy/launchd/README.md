@@ -92,10 +92,27 @@ success older than `watchdog.api_max_age_s` (180 s) or `step_ok: false` like a s
 refused, gate `watchdog`. After installing the agent check `"api_ok": true` in the beat; if it
 is false, `api_error` says why (a `401` = the key itself is rejected).
 
+**Write capability (final check F2).** Reading is not cancelling: a key without the `write`
+scope passes the read. At start and every `watchdog.api_write_probe_interval_s` (600 s; every
+60 s while it fails) the watchdog also sends `DELETE /portfolio/events/orders/<fresh random
+uuid4>?subaccount=1&exchange_index=2` (the first of `venue.exchange_indexes`) through its scoped
+write client. 404 (no such order) = the key may cancel; 401 / 403 (no write scope, key not
+allowed on subaccount 1), any other status, a timeout or (never expected) a 2xx = not proven:
+`"api_ok": false`, `"api_write_ok": false`, reason in `"api_write_error"`. The live runner
+requires `"api_write_ok": true`. The id is a new random uuid4 every time, never a real order id,
+so the probe cannot cancel anything (it costs 2 write tokens every 10 minutes). After installing
+the agent check `"api_write_ok": true` in the beat; a `403` there = recreate the watchdog key
+with `["read","write"]` scopes restricted to subaccount 1 (docs/ACCOUNT_SETUP.md).
+
 **Timestamps.** A beat stamped more than `watchdog.max_future_s` (2 s) in the future is not
 fresh for the runner, and a RUNNER heartbeat stamped in the future is not trusted by the
 watchdog: it never arms on it and it does not refresh the watched runner's liveness, so the
 watchdog fires as for a stale heartbeat (a clock step costs a cancel-all, never a silent switch).
+A BACKWARD wall-clock step on the host (both processes share the clock; final check F3) leaves the
+stored heartbeat time in the future: the watched runner's next fresh heartbeat (same pid +
+session, consistent with the new clock) resets it and the watchdog does not fire (log `wall clock
+stepped back ...`); if no such heartbeat arrives within `watchdog.stale_s` (the runner died at
+the step), it fires.
 
 ```sh
 cd /Users/thomast/Desktop/delta-hedged
@@ -105,7 +122,7 @@ plutil -lint ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dh.watchdog.plist
 launchctl print gui/$(id -u)/com.dh.watchdog | grep -E 'state|pid|last exit'
 tail -f data/logs/watchdog.launchd.out     # "watching .../data/run/heartbeat.json (... subaccount 1; cancel by id; beat ...)"
-cat data/run/heartbeat.json.watchdog        # its own beat: refreshed every second; "api_ok": true
+cat data/run/heartbeat.json.watchdog        # its own beat: refreshed every second; "api_ok": true, "api_write_ok": true
 ```
 
 Operate: `launchctl kickstart -k gui/$(id -u)/com.dh.watchdog` (restart; `--arm-on-start`

@@ -27,6 +27,9 @@ LIVE_CONFIRM_FLAG = "--i-understand-this-sends-real-orders"
 # a shared Kalshi account (another live system on subaccount 0): this process may use at most
 # this fraction of the account's REST budget (rate limits are per account)
 SHARED_ACCOUNT_MAX_SHARE = 0.5
+# confirmation rounds of a reconciliation after its first re-read (dh.live.runner._on_reconcile_done):
+# a difference / parked event still open after this many rounds of venue.position_confirm_s ends it
+RECONCILE_CONFIRM_ROUNDS = 3
 
 
 def default_run_dir(platform: str | None = None) -> str:
@@ -204,6 +207,20 @@ class VenueCfg:
     unknown_order_lookup_delay_s: float = 1.0
     unknown_order_lookup_retry_s: float = 2.0
     unknown_order_park_max: int = 1000  # parked events (all orders); more -> the oldest order times out
+    # review F1: an order that can never be proven ours must not loop park -> timeout -> reconcile ->
+    # re-park forever. After its FIRST timeout (a) a REST fill of it read with GET /portfolio/fills?
+    # subaccount=<ours> under the PROVEN restricted key is ours by construction and is delivered
+    # (recorded for replay) instead of re-parked; (c) its market is no longer exempt from the
+    # position-mismatch confirmation; and after unknown_order_max_park_cycles timeouts of the SAME
+    # order the runner halts (Halt(all), reason 'unknown_order_loop', persisted, sticky). Live
+    # requires unknown_order_park_s < RECONCILE_CONFIRM_ROUNDS * position_confirm_s (see
+    # live_config_problems) and unknown_order_max_park_cycles >= 2.
+    unknown_order_max_park_cycles: int = 3
+    # review F1 (b): once per session, this long after our first acknowledged order, GET
+    # /portfolio/orders/{id} (and, if that 404s, the list GET /portfolio/orders?subaccount=<n>&
+    # ticker=<t>) of that order: verify_live 'get_order_by_id_finds_shard_orders' reports whether the
+    # by-id endpoint (no subaccount / exchange_index parameter) sees orders on our shard. 0 = off
+    verify_get_order_after_s: float = 60.0
     reconcile_retry_max_s: float = 30.0
     startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start (live: required)
     # Kalshi may cancel orders placed within 1 min of a BULK cancel-all (DELETE /portfolio/events/
@@ -321,6 +338,13 @@ class WatchdogCfg:
     api_probe_interval_s: float = 60.0
     api_probe_timeout_s: float = 10.0
     api_max_age_s: float = 180.0
+    # WRITE capability (review F2): reading is not cancelling (a key without the write scope passes
+    # the read probe). At start and every api_write_probe_interval_s (every api_probe_interval_s
+    # while the last one failed) the watchdog sends DELETE /portfolio/events/orders/<fresh uuid4>?
+    # subaccount=<n>&exchange_index=<shard> through its scoped write client: 404 (no such order)
+    # proves the key may cancel; 401 / 403 (or anything else) sets api_ok false with the reason. The
+    # id is a NEW random uuid4 every time (never a real order id), so it can never cancel anything.
+    api_write_probe_interval_s: float = 600.0
     # a beat / heartbeat stamped more than this in the FUTURE is not fresh (review NEW-3): the
     # runner does not trust such a watchdog beat, and the watchdog treats such a runner heartbeat
     # like a stale one (it fires)
@@ -467,6 +491,15 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
         out.append("venue.unknown_order_park_s / unknown_order_lookup_retry_s must be > 0, unknown_order_park_max >= 1 "
                    "and 0 <= unknown_order_lookup_delay_s < unknown_order_park_s (fills of not-yet-known orders are "
                    "parked, looked up, then released or reconciled)")
+    if v.unknown_order_max_park_cycles < 2:
+        out.append("venue.unknown_order_max_park_cycles must be >= 2 (after the first park timeout a REST fill of our "
+                   "subaccount is delivered; a second timeout of the same order is a loop -> halt)")
+    if not v.unknown_order_park_s < RECONCILE_CONFIRM_ROUNDS * v.position_confirm_s:
+        out.append(f"venue.unknown_order_park_s ({v.unknown_order_park_s:g}) must be < {RECONCILE_CONFIRM_ROUNDS} x "
+                   f"venue.position_confirm_s ({v.position_confirm_s:g}): the 'unknown_order' reconciliation ends "
+                   f"(reopening the order gate) {RECONCILE_CONFIRM_ROUNDS} confirmation rounds of position_confirm_s "
+                   "after the re-read that re-parked a timed-out order's events; a longer park would let the runner "
+                   "quote while such an event is still parked (inventory possibly missing a fill)")
     if v.balance_max_failures < 1 or v.exchange_status_max_failures < 1:
         out.append("venue.balance_max_failures and venue.exchange_status_max_failures must be >= 1")
     if cfg.watchdog.runner_max_age_s <= 0:
@@ -476,6 +509,9 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
     if w.api_probe_interval_s <= 0 or w.api_probe_timeout_s <= 0 or w.api_max_age_s <= w.api_probe_interval_s:
         out.append("watchdog: api_probe_interval_s and api_probe_timeout_s must be > 0 and api_max_age_s > "
                    "api_probe_interval_s in live mode (the watchdog must keep proving its key can cancel)")
+    if not w.api_probe_interval_s <= w.api_write_probe_interval_s <= 3600:
+        out.append("watchdog.api_write_probe_interval_s must be in [api_probe_interval_s, 3600] s in live mode (the "
+                   "watchdog must keep proving its key may CANCEL, not only read)")
     if not 0 < w.max_future_s <= 10:
         out.append("watchdog.max_future_s must be in (0, 10] s (a future-stamped beat is never fresh)")
     d = cfg.disk

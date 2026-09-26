@@ -32,7 +32,12 @@ another subaccount, or is not armed on it. The beat also proves CAPABILITY: at s
 watchdog.api_probe_interval_s the watchdog reads GET /portfolio/orders?subaccount=<n>&
 status=resting&limit=1 with its own key; ``api_ok`` false, or a last success older than
 watchdog.api_max_age_s, counts as "not protecting" for the runner (start refused, gate closed).
-A runner heartbeat stamped in the future is treated like a stale one (the watchdog fires).
+It also proves it may CANCEL (review F2): at start and every watchdog.api_write_probe_interval_s
+(every api_probe_interval_s while failing) DELETE /portfolio/events/orders/<fresh random uuid4>?
+subaccount=<n>&exchange_index=<first of venue.exchange_indexes>: 404 = allowed; 401/403 = api_ok
+false (the runner's gate closes). The id is never a real order id: nothing can be cancelled.
+A runner heartbeat stamped in the future is treated like a stale one (the watchdog fires); after a
+backward wall-clock step a fresh heartbeat of the watched runner resets its stored time instead.
 
 Refusals (exit 2; launchd retries): no live config file (no fallback to the example), a
 venue section that does not state venue.subaccount and venue.shared_account explicitly,
@@ -75,6 +80,7 @@ from dh.live.watchdog import (  # noqa: E402
     rest_cancel_all,
     rest_scoped_cancel_all,
     rest_trigger_groups,
+    rest_write_probe,
 )
 
 log = logging.getLogger("watchdog")
@@ -142,6 +148,12 @@ async def amain(args: argparse.Namespace, rest: Any = None) -> int:
         return 2
     sub = lcfg.venue.sub
     bulk = lcfg.venue.bulk_cancel_allowed
+    shards = [x for x in lcfg.venue.exchange_indexes if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
+    if not shards:
+        log.error("refusing to run: venue.exchange_indexes names no exchange shard (the write-capability probe "
+                  "cancels a random order id on one of them)")
+        return 2
+    probe_shard = shards[0]
     hb = _resolve(args.heartbeat or lcfg.paths.heartbeat_file)
     own = rest is None
     try:
@@ -174,7 +186,8 @@ async def amain(args: argparse.Namespace, rest: Any = None) -> int:
 
             wcfg = replace(wcfg, stale_s=float(args.max_age_s))
         wd = Watchdog(hb, cancel, wcfg, arm_on_start=args.arm_on_start, trigger_groups=trigger, subaccount=sub,
-                      bulk=bulk, api_probe=rest_api_probe(rest, sub))
+                      bulk=bulk, api_probe=rest_api_probe(rest, sub),
+                      api_write_probe=rest_write_probe(rest, sub, probe_shard))
         if args.once:
             st = await wd.step()
             log.info("state %s", st)

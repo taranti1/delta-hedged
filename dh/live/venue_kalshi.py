@@ -1265,6 +1265,39 @@ class KalshiVenue:
         self._learn_rows([o])
         return o
 
+    async def find_order(self, oid: str, *, ticker: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Who owns order ``oid`` (read-only, review F1 (b)): GET /portfolio/orders/{oid} (no
+        subaccount / exchange_index parameter: it may not see an order on shard 2) and, when that
+        404s and ``ticker`` is known, the LIST GET /portfolio/orders?subaccount=<ours>&ticker=<t>
+        (every page, every shard, every status) searched for the id. Returns (row or None, via)
+        with via = {"by_id": bool, "by_list": bool | None (not tried), "shard": the row's
+        exchange_index}; raises on anything but a 404 of the by-id read."""
+        from dh.kalshi.normalize import shard_value
+
+        via: dict[str, Any] = {"by_id": False, "by_list": None, "shard": None}
+        row = await self.lookup_order(oid)
+        if row is not None:
+            via["by_id"] = True
+        elif ticker:
+            found = None
+            it = self.rest.iter_orders(subaccount=self.sub, ticker=ticker)
+            try:
+                async for o in it:
+                    if str(o.get("order_id") or "") == oid:
+                        found = o
+                        break
+            finally:
+                aclose = getattr(it, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            via["by_list"] = found is not None
+            if found is not None:
+                self._learn_rows([found])
+                row = found
+        if row is not None:
+            via["shard"] = shard_value(row.get("exchange_index"))
+        return row, via
+
     def _ours(self, ev: KalshiOrderUpdate) -> KalshiOrderUpdate:
         """Venue lookups only ever return our own subaccount's orders: stamp it (the REST
         Order omits subaccount_number for the primary account)."""
