@@ -87,8 +87,14 @@ class FakeRest:
                                                    "price": {"open_dollars": "0.4600", "close_dollars": "0.4600"}, "volume_fp": "3.00", "open_interest_fp": "3.00"}]}
 
     async def get_cfbenchmarks_history(self, index_id, *, timespan=None, timestamp=None, extra_params=None):
+        """The verified passthrough shape: {"data": {"serverTime", "payload": [...]}}, the 5 Hz ticks of
+        [timestamp, timestamp + 1 h). Only 2025-08-05T20:00Z has data here; other hours are empty."""
         self.calls.append(("cf", index_id, timespan, timestamp))
-        return {"payload": [{"value": "115100.5", "time": int(timestamp) - 1000}, {"value": "115101.5", "time": int(timestamp)}]}
+        if timestamp != "2025-08-05T20:00:00.000Z":
+            return {"data": {"serverTime": "x", "payload": []}}
+        h = iso_to_ns(timestamp) // 1_000_000
+        return {"data": {"serverTime": "x", "payload": [{"time": h - 200, "value": "1.00"},  # previous hour: dropped
+                                                        {"time": h, "value": "115100.50"}, {"time": h + 200, "value": "115101.55"}]}}
 
     async def iter_event_fee_changes(self, *a, **kw):
         for ch in ({"id": "f1", "event_ticker": E1["event_ticker"], "series_ticker": "KXBTCD", "fee_type_override": "quadratic",
@@ -111,14 +117,20 @@ class FakeRest:
 
 async def test_download_pipeline_and_resume(tmp_path: Path):
     rest = FakeRest()
-    start, end = iso_to_ns("2025-08-01T00:00:00Z"), iso_to_ns("2025-08-06T00:00:00Z")
-    stats = await dl.download(rest, ["KXBTCD"], start, end, tmp_path, datasets=dl.DATASETS, have_auth=True, log=lambda *_: None)
-    assert stats == {"events": 2, "events_skipped": 0, "markets": 3, "trades": 5, "candles": 2, "brti_ticks": 4, "errors": 0}
+    start, end = iso_to_ns("2025-08-05T18:00:00Z"), iso_to_ns("2025-08-06T00:00:00Z")
+    ev_start = iso_to_ns("2025-08-01T00:00:00Z")
+    now = iso_to_ns("2025-09-01T00:00:00Z")
+    stats = await dl.download(rest, ["KXBTCD"], ev_start, end, tmp_path, datasets=[d for d in dl.DATASETS if d != "brti"],
+                              have_auth=True, now_ns=now, log=lambda *_: None)
+    assert stats == {"events": 2, "events_skipped": 0, "markets": 3, "trades": 5, "candles": 2, "brti_ticks": 0, "errors": 0}
     # E1 settled before the market cutoff -> historical markets; E2 -> live markets
     assert ("hmarkets", E1["event_ticker"]) in rest.calls and ("markets", E2["event_ticker"]) in rest.calls
     assert ("trades", M1B["ticker"], True) not in rest.calls  # zero-volume market skipped
     assert ("trades", M1A["ticker"], False) not in rest.calls  # closed before the trades cutoff
     assert {("trades", M2["ticker"], True), ("trades", M2["ticker"], False)} <= set(rest.calls)  # straddles the cutoff
+    # newest event first (a partial run covers the most recent period)
+    order = [c[1] for c in rest.calls if c[0] in ("markets", "hmarkets")]
+    assert order.index(E2["event_ticker"]) < order.index(E1["event_ticker"])
 
     t = pq.read_table(tmp_path / "trades" / "series=KXBTCD" / f"{E2['event_ticker']}.parquet")
     assert t.schema.equals(dl.TRADE_SCHEMA)
@@ -144,26 +156,67 @@ async def test_download_pipeline_and_resume(tmp_path: Path):
     assert c1[0]["price_mean"] == "0.433333" and c1[0]["volume"] == 1000 and c1[0]["source"] == "historical"
     c2 = pq.read_table(tmp_path / "candles" / "series=KXBTCD" / f"{E2['event_ticker']}.parquet").to_pylist()
     assert c2[0]["yes_bid_close"] == "0.4600" and c2[0]["source"] == "live"
-    br = pq.read_table(tmp_path / "brti" / "series=KXBTCD" / f"{E2['event_ticker']}.parquet").to_pylist()
-    assert [r["value"] for r in br] == [115100.5, 115101.5]
-    cfs = [c for c in rest.calls if c[0] == "cf"]
-    exp_ms = [iso_to_ns(f"2025-08-0{d}T21:00:00Z") // 1_000_000 for d in (4, 5)]
-    assert [(c[2], c[3]) for c in cfs] == [("660s", str(e + 300_000)) for e in exp_ms]
-    assert (tmp_path / "brti" / "series=KXBTCD" / f"{E2['event_ticker']}.raw.json").is_file()
     fees = pq.read_table(tmp_path / "fees" / "event_fee_changes.parquet").to_pylist()
     assert [(f["id"], f["fee_multiplier_override"]) for f in fees] == [("f1", "0.5")]
     inc = pq.read_table(tmp_path / "incentives" / "incentive_programs.parquet").to_pylist()
     assert [i["id"] for i in inc] == ["i1"] and inc[0]["period_reward_centicents"] == 1_000_000
 
-    # second run: everything checkpointed, no market/trade requests
+    # BRTI: hourly CF passthrough calls (timespan=HOUR, timestamp = hour START), newest first
+    st = await dl.download(rest, ["KXBTCD"], start, end, tmp_path, datasets=["brti"], have_auth=True, now_ns=now,
+                           log=lambda *_: None)
+    cfs = [c for c in rest.calls if c[0] == "cf"]
+    assert [c[3] for c in cfs] == [f"2025-08-05T{h:02d}:00:00.000Z" for h in (23, 22, 21, 20, 19, 18)]
+    assert all(c[2] == "HOUR" for c in cfs)
+    assert st["brti_hours"] == 6 and st["brti_ticks"] == 2 and st["brti_empty"] == 5
+    br = pq.read_table(tmp_path / "brti" / "hourly" / "2025-08-05" / "20.parquet").to_pylist()
+    assert br == [{"t_ms": iso_to_ns("2025-08-05T20:00:00Z") // 10**6, "cents": 11510050},
+                  {"t_ms": iso_to_ns("2025-08-05T20:00:00.2Z") // 10**6, "cents": 11510155}]
+    # an empty hour close to "now" is NOT written (CF publication delay), so it is retried later
+    rest_recent = FakeRest()
+    st_r = await dl.download(rest_recent, ["KXBTCD"], start, end, tmp_path / "recent", datasets=["brti"], have_auth=True,
+                             now_ns=iso_to_ns("2025-08-06T00:10:00Z"), log=lambda *_: None)
+    assert not (tmp_path / "recent" / "brti" / "hourly" / "2025-08-05" / "23.parquet").exists()
+    assert st_r["brti_hours"] == 5
+
+    # second run: everything checkpointed, no market/trade/cf requests
     rest2 = FakeRest()
-    stats2 = await dl.download(rest2, ["KXBTCD"], start, end, tmp_path, datasets=dl.DATASETS, have_auth=True, log=lambda *_: None)
+    stats2 = await dl.download(rest2, ["KXBTCD"], ev_start, end, tmp_path, datasets=dl.DATASETS, have_auth=True, now_ns=now,
+                               log=lambda *_: None)
     assert stats2["events_skipped"] == 2 and stats2["events"] == 0
-    assert not any(c[0] in ("trades", "markets", "hmarkets", "cf") for c in rest2.calls)
-    assert ("events", "KXBTCD", "settled", start // 10**9) in rest.calls
+    assert not any(c[0] in ("trades", "markets", "hmarkets") for c in rest2.calls)
+    done_hours = {f"2025-08-05T{h:02d}:00:00.000Z" for h in range(18, 24)}
+    assert not any(c[0] == "cf" and c[3] in done_hours for c in rest2.calls)  # existing hour files are skipped
+    assert ("events", "KXBTCD", "settled", ev_start // 10**9) in rest.calls
     rest3 = FakeRest()
-    await dl.download(rest3, ["KXBTCD"], start, end, tmp_path, datasets=["markets"], event_close_filter=False, log=lambda *_: None)
+    await dl.download(rest3, ["KXBTCD"], ev_start, end, tmp_path, datasets=["markets"], event_close_filter=False, log=lambda *_: None)
     assert ("events", "KXBTCD", "settled", None) in rest3.calls
+
+
+async def test_pacer_spaces_requests_and_backs_off_on_429():
+    now = [0.0]
+    slept: list[float] = []
+
+    async def sleep(dt):
+        slept.append(dt)
+        now[0] += dt
+
+    p = dl.Pacer(rate=5.0, pause_s=5.0, clock=lambda: now[0], sleep=sleep)
+    for _ in range(3):
+        await p.acquire("GET", "/markets")
+    assert slept == [0.2, 0.2]
+    p.on_429("GET")
+    await p.acquire("GET", "/markets")
+    assert slept[-1] >= 5.0 * 0.75
+
+
+def test_estimate_and_checkpoint_log(tmp_path: Path):
+    e = dl.estimate(90, ["KXBTCD", "KXBTC", "KXBTC15M"], rate=5.0, cf_share=0.1)
+    assert e["public_hours"] > 10 and e["brti_hours"] == 1.5
+    ck = dl.Checkpoint(tmp_path / "x.log")
+    ck.mark("a")
+    ck.mark("a")
+    ck.mark("b")
+    assert (tmp_path / "x.log").read_text() == "a\nb\n" and "b" in dl.Checkpoint(tmp_path / "x.log")
 
 
 def test_scripts_help_runs_offline():
@@ -171,3 +224,7 @@ def test_scripts_help_runs_offline():
         r = subprocess.run([sys.executable, str(ROOT / "scripts" / f"{name}.py"), "--help"], capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, (name, r.stderr)
         assert "usage" in r.stdout.lower()
+
+
+def test_plan_parsing():
+    assert dl.parse_plan("KXBTCD:30, KXBTC15M+KXBTC:14,") == [(["KXBTCD"], 30.0), (["KXBTC15M", "KXBTC"], 14.0)]

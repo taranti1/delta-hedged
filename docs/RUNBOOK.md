@@ -231,6 +231,16 @@ record.py, verify_fee_schedule, download_kalshi_history, `dh.live.tools`, the ru
 watchdog), so they all see the same credentials. The key id is redacted from
 `KalshiSigner.__repr__`.
 
+**History download (M1.0).** `scripts/download_kalshi_history.py` sends the public endpoints
+(events, markets, trades, historical markets/trades, series, fee changes) UNSIGNED, so they cost
+no account tokens (paced at `--rate` 5 req/s, pauses on 429), and only the CF Benchmarks
+passthrough signed, on a limiter holding `--cf-share` 0.1 of the account read budget (one 50-token
+call per 2.5 s on the basic tier). Resumable (per-event and per-hour checkpoints), newest first.
+Running instance (2026-09-26): trades/markets `nohup ... --plan "KXBTC15M:7,KXBTC:14,...,KXBTC15M:300"
+--datasets markets,trades,fees,incentives --pid-file data/logs/history.pid >> data/logs/history.out`
+and BRTI `--datasets brti --days 366 --pid-file data/logs/history_brti.pid >> data/logs/history_brti.out`;
+restart the same command to resume. Output `data/external/kalshi/` (~1 GB for the first month).
+
 **Shared account.** This key belongs to the same Kalshi account as the user's other, live
 trading system. REST budgets are per ACCOUNT (docs.kalshi.com "Rate Limits and Tiers": REST
 and FIX drain the same read/write buckets), so `config/kalshi.yaml` sets

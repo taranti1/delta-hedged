@@ -146,7 +146,8 @@ empirical band scale).
 
 ## 5. Final-minute regime
 
-Inside (T-60 s, T] the fair value uses the fixed prints (`SettlementTracker`), so
+Inside [T-60 s, T) (T = close_time; the 60 prints stamped T-60 s .. T-1 s, verified in
+`docs/research/M1_2_SETTLEMENT_CHECK.md`) the fair value uses the fixed prints (`SettlementTracker`), so
 R* = (K n - sum_fixed) / m and sd_R = sigma_S sqrt(tau_first + step((m+1)(2m+1)/(6m) - 1)).
 Default M1 policy: no new quotes on markets with |z| < z_min_final (default 2.5) after
 T - 90 s; existing orders on those markets are canceled at T - 90 s. Far-from-strike markets

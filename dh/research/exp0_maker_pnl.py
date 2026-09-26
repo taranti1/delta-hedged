@@ -72,31 +72,64 @@ def parse_fee_types(items) -> dict[str, tuple[str, float]]:
     return out
 
 
-def maker_fee_per_contract(df: pd.DataFrame, fee_types: dict[str, tuple[str, float]]) -> np.ndarray:
-    """Exact maker fee per contract (dollars) of each print priced as one maker order (module doc)."""
-    from dh.kalshi.fees import FeeEngine
+def default_fee_engine():
+    """The account's fee engine: config/fees.yaml rates with ``fees.balance_precision_dollars`` from
+    config/kalshi.yaml ($0.0001, verified on 40/40 account fills by scripts/verify_fee_schedule.py);
+    falls back to config/fees.yaml alone."""
+    try:
+        from dh.kalshi.config import load_config
 
-    fe = FeeEngine.from_config()
-    scheds: dict[tuple[str, float], object] = {}
+        return load_config(None).fee_engine()
+    except Exception:  # noqa: BLE001 - research fallback (no kalshi config present)
+        from dh.kalshi.fees import FeeEngine
+
+        return FeeEngine.from_config()
+
+
+def maker_fee_per_contract(df: pd.DataFrame, fee_types: dict[str, tuple[str, float]], fee_engine=None) -> np.ndarray:
+    """Exact maker fee per contract (dollars) of each print priced as one maker order (module doc).
+
+    Computed once per distinct (fee type, multiplier, price, size, side); series whose fee type
+    charges no maker fee (``quadratic``: KXBTCD, KXBTC and KXBTC15M on 2026-09-25) cost 0."""
+    fe = fee_engine or default_fee_engine()
     out = np.zeros(len(df))
+    if not len(df):
+        return out
     series = df["ticker"].astype(str).str.split("-").str[0].to_numpy()
-    ftc = df["fee_type"].to_numpy() if "fee_type" in df else None
-    fmc = df["fee_multiplier"].to_numpy() if "fee_multiplier" in df else None
-    for i, (px, qty, side, ser) in enumerate(zip(df["yes_px"].to_numpy(), df["qty"].to_numpy(),
-                                                 df["maker_side"].to_numpy(), series)):
-        ft, m = fee_types.get(ser) or fee_types.get("*") or ("quadratic_with_maker_fees", 1.0)
-        if ftc is not None and isinstance(ftc[i], str) and ftc[i]:
-            ft = ftc[i]
-            m = float(fmc[i]) if fmc is not None and pd.notna(fmc[i]) else 1.0
-        key = (ft, m)
-        sc = scheds.get(key)
-        if sc is None:
-            sc = scheds[key] = fe.schedule_for_spec(ft, m)
-        q = int(qty)
+    ft = np.empty(len(df), dtype=object)
+    fm = np.ones(len(df))
+    for ser in np.unique(series):
+        t, m = fee_types.get(ser) or fee_types.get("*") or ("quadratic_with_maker_fees", 1.0)
+        sel = series == ser
+        ft[sel] = t
+        fm[sel] = m
+    if "fee_type" in df:
+        col = df["fee_type"].to_numpy()
+        has = np.array([isinstance(x, str) and bool(x) for x in col])
+        ft[has] = col[has]
+        if "fee_multiplier" in df:
+            mcol = pd.to_numeric(df["fee_multiplier"], errors="coerce").to_numpy()
+            fm[has] = np.where(np.isfinite(mcol[has]), mcol[has], 1.0)
+    key = pd.DataFrame({"ft": ft, "fm": fm, "px": df["yes_px"].to_numpy(), "qty": df["qty"].to_numpy(),
+                        "side": df["maker_side"].to_numpy()})
+    scheds: dict[tuple[str, float], object] = {}
+    fees: dict[tuple, float] = {}
+    for k in key.drop_duplicates().itertuples(index=False):
+        q = int(k.qty)
         if q <= 0:
             continue
-        net = sc.single_fill_fees(int(px), q, False, "bid" if side == "bought_yes" else "ask").net_micros  # type: ignore[attr-defined]
-        out[i] = net / 1e6 / (q / 100.0)
+        sk = (str(k.ft), float(k.fm))
+        sc = scheds.get(sk)
+        if sc is None:
+            sc = scheds[sk] = fe.schedule_for_spec(*sk)
+        net = sc.single_fill_fees(int(k.px), q, False, "bid" if k.side == "bought_yes" else "ask").net_micros  # type: ignore[attr-defined]
+        fees[(sk[0], sk[1], int(k.px), q, k.side)] = net / 1e6 / (q / 100.0)
+    if fees:
+        idx = pd.MultiIndex.from_frame(key.assign(ft=key.ft.astype(str), fm=key.fm.astype(float),
+                                                  px=key.px.astype(int), qty=key.qty.astype(int)))
+        ser_f = pd.Series(fees)
+        ser_f.index = pd.MultiIndex.from_tuples(list(fees.keys()))
+        out = ser_f.reindex(idx).fillna(0.0).to_numpy(dtype=float)
     return out
 
 

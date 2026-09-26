@@ -1,14 +1,26 @@
 #!/usr/bin/env python
-"""Download settled Kalshi BTC markets + public trades (+ candles, fees, incentives, BRTI).
+"""Download settled Kalshi BTC markets + public trades (+ BRTI history, fees, incentives, candles).
 
-Powers Experiment 0 (maker P&L to settlement from public trades). Resumable: every event is
-checkpointed per dataset; re-running skips finished work.
+Powers Experiment 0 (maker P&L to settlement from public trades) and the M1.2 settlement check.
+Resumable and idempotent: every event (markets + trades) and every BRTI hour is checkpointed;
+re-running skips finished work. Events are processed NEWEST FIRST, so a partial run always
+covers the most recent, contiguous period.
 
-    python scripts/download_kalshi_history.py --start 2025-06-01 --end 2025-07-01
-    python scripts/download_kalshi_history.py --series KXBTCD --start 2025-06-01 --end 2025-06-02 \
-        --datasets markets,trades,candles,fees,incentives,brti
+    python scripts/download_kalshi_history.py --series KXBTCD --days 30
+    python scripts/download_kalshi_history.py --series KXBTCD KXBTC --start 2026-06-25 --end 2026-09-25
+    python scripts/download_kalshi_history.py --datasets brti --days 90          # CF passthrough only
 
-Sources (openapi 3.30.0, see GET /historical/cutoff):
+Two request lanes (docs/research/KALSHI_DOCS_RECONCILIATION.md s.b, finding 15):
+  * PUBLIC endpoints (events, markets, historical markets/trades, trades, series, fee changes,
+    incentives, candles) are sent UNSIGNED: unauthenticated requests do not draw the account's
+    rate-limit tokens, which are shared with other live systems. They are paced at --rate
+    requests/s (default 5; unauthenticated requests do see 429s when unthrottled) with a pause
+    and jittered retries on 429 / 5xx.
+  * The CF Benchmarks passthrough (BRTI history) needs a signature and costs 50 read tokens. It
+    runs on a signed read-only client whose limiter holds --cf-share (default 0.1) of the
+    account's read budget (basic tier 200 tokens/s -> 20 tokens/s -> one call per 2.5 s).
+
+Sources (openapi 3.31.0, GET /historical/cutoff):
   events       GET /events?series_ticker=S&status=settled&min_close_ts=start   (all events)
   markets      GET /historical/markets?event_ticker=E (settled before market_settled_ts)
                else GET /markets?event_ticker=E                 (tries the other if empty)
@@ -18,21 +30,26 @@ Sources (openapi 3.30.0, see GET /historical/cutoff):
   fees         GET /series/{S}, /series/fee_changes?series_ticker=S&show_historical=true,
                GET /events/fee_changes (all pages, filtered to the series)
   incentives   GET /incentive_programs?status=all&type=all (filtered to the series)
-  brti         CF Benchmarks passthrough around each expiration (+/- window), needs auth
+  brti         GET /cfbenchmarks/history/values?id=BRTI&timespan=HOUR&timestamp=<hour START,
+               ISO ms> (VERIFIED 2026-09-25: the body is {"data": {"serverTime", "payload":
+               [{"time": ms, "value": "83737.50"}, ...]}} with the 18,000 5 Hz ticks of
+               [timestamp, timestamp + 1 h); MINUTE / non-aligned timestamps return 400)
 
 Output (Parquet, explicit schemas) under --out (default data/external/kalshi):
   meta/historical_cutoff.json            series/<S>.json      fees/series_fee_changes/<S>.json
   events/series=<S>/events.parquet       markets/series=<S>/<EVENT>.parquet
   trades/series=<S>/<EVENT>.parquet      candles/series=<S>/<EVENT>.parquet
-  brti/series=<S>/<EVENT>.parquet (+ <EVENT>.raw.json with the request and raw body)
+  brti/hourly/<YYYY-MM-DD>/<HH>.parquet  (t_ms int64 CF source time, cents int64; every 5 Hz tick)
   fees/event_fee_changes.parquet         incentives/incentive_programs.parquet
-  _checkpoints/<dataset>-<S>.json
+  _checkpoints/<dataset>-<S>.log         _progress.json
+
+Settlement time: T = close_time (dh.settlement.convention); ``expected_expiration_time`` (close +
+5 min) is kept as metadata only.
 
 Trade schema (exact integer units, dh.core.units):
   trade_id str | ticker str | yes_px int64 (1e-4 $) | qty int64 (0.01 contract) |
   taker_outcome_side str ('yes' = taker bought YES) | taker_book_side str ('bid' == 'yes') |
-  created_time str (as sent) | ts_ms int64 | is_block_trade bool | event_ticker | series_ticker |
-  source ('historical' | 'live')
+  ts_ms int64 | is_block_trade bool | event_ticker | series_ticker | source ('historical' | 'live')
 Maker gross P&L to settlement per trade = qty/100 * ((settle - yes_px) if taker sold YES
 else (yes_px - settle)) / 1e4 dollars, with settle = settlement_px from the markets file.
 """
@@ -42,10 +59,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
 import sys
 import time
 from collections.abc import Iterable
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +87,6 @@ TRADE_SCHEMA = pa.schema(
         ("qty", pa.int64()),
         ("taker_outcome_side", pa.string()),
         ("taker_book_side", pa.string()),
-        ("created_time", pa.string()),
         ("ts_ms", pa.int64()),
         ("is_block_trade", pa.bool_()),
         ("event_ticker", pa.string()),
@@ -147,15 +164,8 @@ CANDLE_SCHEMA = pa.schema(
         ("source", pa.string()),
     ]
 )
-BRTI_SCHEMA = pa.schema(
-    [
-        ("event_ticker", pa.string()),
-        ("index_id", pa.string()),
-        ("expiration_ts_ms", pa.int64()),
-        ("ts_ns", pa.int64()),
-        ("value", pa.float64()),
-    ]
-)
+BRTI_SCHEMA = pa.schema([("t_ms", pa.int64()), ("cents", pa.int64())])
+
 EVENT_FEE_SCHEMA = pa.schema(
     [
         ("id", pa.string()),
@@ -182,12 +192,17 @@ INCENTIVE_SCHEMA = pa.schema(
 
 
 # ============================================================================ io helpers
-def write_parquet(path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
-    """Atomic write (tmp + rename) with an explicit schema (empty tables keep their types)."""
+def write_parquet(path: Path, rows: list[dict[str, Any]] | pa.Table, schema: pa.Schema, *, delta_cols: tuple[str, ...] = ()) -> None:
+    """Atomic write (tmp + rename), zstd, explicit schema (empty tables keep their types).
+    ``delta_cols``: integer columns written with DELTA_BINARY_PACKED (sorted time series)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(rows, schema=schema)
+    table = rows if isinstance(rows, pa.Table) else pa.Table.from_pylist(rows, schema=schema)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    pq.write_table(table, tmp)
+    kw: dict[str, Any] = {"compression": "zstd"}
+    if delta_cols:
+        kw.update(use_dictionary=[c for c in table.column_names if c not in delta_cols],
+                  column_encoding={c: "DELTA_BINARY_PACKED" for c in delta_cols}, compression_level=9)
+    pq.write_table(table, tmp, **kw)
     os.replace(tmp, path)
 
 
@@ -199,20 +214,62 @@ def write_json(path: Path, obj: Any) -> None:
 
 
 class Checkpoint:
-    """Set of finished keys persisted as JSON (atomic rewrite after every mark)."""
+    """Set of finished keys, persisted as an append-only log (one key per line; O(1) per mark).
+    A legacy JSON checkpoint ({"done": [...]}) next to it is read too."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self.path = path.with_suffix(".log") if path.suffix == ".json" else path
         self.done: set[str] = set()
-        if path.is_file():
-            self.done = set(orjson.loads(path.read_bytes()).get("done", []))
+        legacy = self.path.with_suffix(".json")
+        if legacy.is_file():
+            self.done |= set(orjson.loads(legacy.read_bytes()).get("done", []))
+        if self.path.is_file():
+            self.done |= {ln for ln in self.path.read_text().splitlines() if ln}
 
     def __contains__(self, key: str) -> bool:
         return key in self.done
 
     def mark(self, key: str) -> None:
+        if key in self.done:
+            return
         self.done.add(key)
-        write_json(self.path, {"done": sorted(self.done), "updated_ns": time.time_ns()})
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(key + "\n")
+
+
+class Pacer:
+    """Rate limiter for UNSIGNED public requests (KalshiRest ``limiter`` protocol): at most
+    ``rate`` request starts per second; a 429 pauses every request for ``pause_s`` (doubling
+    per consecutive 429, capped at 120 s, reset by the next success window)."""
+
+    def __init__(self, rate: float = 5.0, pause_s: float = 5.0, clock: Any = time.monotonic, sleep: Any = asyncio.sleep) -> None:
+        self.dt = 1.0 / max(rate, 1e-6)
+        self.pause_s = pause_s
+        self._next = 0.0
+        self._streak = 0
+        self._clock = clock
+        self._sleep = sleep
+        self.n = 0
+        self.n_429 = 0
+
+    async def acquire(self, method: str, path: str, n_items: int = 1) -> float:
+        now = self._clock()
+        slot = max(now, self._next)
+        self._next = slot + self.dt
+        wait = slot - now
+        if wait > 0:
+            await self._sleep(wait)
+        self.n += 1
+        if self._streak and self.n % 50 == 0:
+            self._streak = 0
+        return wait
+
+    def on_429(self, method: str) -> None:
+        self.n_429 += 1
+        self._streak += 1
+        pause = min(120.0, self.pause_s * 2 ** (self._streak - 1)) * (0.75 + 0.5 * random.random())
+        self._next = max(self._next, self._clock() + pause)
 
 
 def _dumps(obj: Any) -> str:
@@ -246,7 +303,6 @@ def trade_row(t: dict[str, Any], event_ticker: str, series: str, source: str) ->
         "qty": qty_from_fp(str(t["count_fp"])),
         "taker_outcome_side": outcome,
         "taker_book_side": str(t.get("taker_book_side") or ("bid" if outcome == "yes" else "ask")),
-        "created_time": created,
         "ts_ms": opt_iso_to_ns(created) // NS_PER_MS,
         "is_block_trade": bool(t.get("is_block_trade", False)),
         "event_ticker": event_ticker,
@@ -410,34 +466,86 @@ async def fetch_candles(rest: Any, series: str, m: dict[str, Any], market_source
     return candle_rows(m["ticker"], body, "live")
 
 
-def _fill(template: str, **kw: Any) -> str:
-    return template.format(**kw)
+def iso_ms(t_ns: int) -> str:
+    """UTC ISO-8601 with milliseconds and 'Z' (the CF Benchmarks timestamp format)."""
+    d = datetime.fromtimestamp(t_ns // NS_PER_S, tz=timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{(t_ns // NS_PER_MS) % 1000:03d}Z"
 
 
-async def fetch_brti(
-    rest: Any, event_ticker: str, expiration_ns: int, window_s: int, timespan_tpl: str, timestamp_tpl: str
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """BRTI via the CF passthrough for [T - window - 60 s, T + window]. The passthrough's
-    parameter formats are undocumented: they are templates (see --brti-timespan)."""
-    start_ns = expiration_ns - (window_s + 60) * NS_PER_S
-    end_ns = expiration_ns + window_s * NS_PER_S
-    kw = dict(
-        start_ms=start_ns // NS_PER_MS,
-        end_ms=end_ns // NS_PER_MS,
-        start_s=start_ns // NS_PER_S,
-        end_s=end_ns // NS_PER_S,
-        span_s=(end_ns - start_ns) // NS_PER_S,
-        span_ms=(end_ns - start_ns) // NS_PER_MS,
-    )
-    params = {"timespan": _fill(timespan_tpl, **kw), "timestamp": _fill(timestamp_tpl, **kw)}
-    body = await rest.get_cfbenchmarks_history("BRTI", timespan=params["timespan"], timestamp=params["timestamp"])
+def brti_hour_path(out: Path, hour_ns: int) -> Path:
+    d = datetime.fromtimestamp(hour_ns // NS_PER_S, tz=timezone.utc)
+    return out / "brti" / "hourly" / d.strftime("%Y-%m-%d") / f"{d.hour:02d}.parquet"
+
+
+async def fetch_brti_hour(rest: Any, hour_ns: int) -> tuple[pa.Table, dict[str, int]]:
+    """Every BRTI tick of [hour, hour + 1 h) from the CF passthrough (timespan=HOUR, timestamp =
+    the hour START, verified live). Returns (table t_ms/cents ascending, stats)."""
+    body = await rest.get_cfbenchmarks_history("BRTI", timespan="HOUR", timestamp=iso_ms(hour_ns))
     ticks = cf_history_to_ticks(body, 0, "BRTI")
-    rows = [
-        {"event_ticker": event_ticker, "index_id": t.index_id, "expiration_ts_ms": expiration_ns // NS_PER_MS,
-         "ts_ns": t.ts_exch, "value": t.value}
-        for t in ticks
-    ]
-    return rows, {"event_ticker": event_ticker, "params": params, "body": body}
+    lo, hi = hour_ns // NS_PER_MS, hour_ns // NS_PER_MS + 3_600_000
+    t_ms: list[int] = []
+    cents: list[int] = []
+    off = 0
+    for t in ticks:
+        ms = t.ts_exch // NS_PER_MS
+        if not lo <= ms < hi:
+            continue
+        c = round(t.value * 100)
+        off += abs(t.value * 100 - c) > 1e-4
+        t_ms.append(ms)
+        cents.append(int(c))
+    return pa.table({"t_ms": pa.array(t_ms, pa.int64()), "cents": pa.array(cents, pa.int64())}), {"ticks": len(t_ms), "off_cent": off}
+
+
+async def download_brti(
+    rest: Any, start_ns: int, end_ns: int, out: Path, *, now_ns: int | None = None, recent_delay_s: float = 1800.0,
+    log: Any = print, stats: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Hourly BRTI files for [start, end), newest hour first; an existing file = done. An empty
+    hour ending within ``recent_delay_s`` of now is skipped (CF publication delay), an older
+    empty hour is written empty (an outage is data) and logged."""
+    st = stats if stats is not None else {}
+    for k in ("brti_hours", "brti_ticks", "brti_empty", "brti_errors", "brti_skipped"):
+        st.setdefault(k, 0)
+    now = now_ns if now_ns is not None else time.time_ns()
+    H = 3600 * NS_PER_S
+    h = min(end_ns, now) // H * H - H  # newest complete hour
+    first = start_ns // H * H
+    t_start = time.time()
+    n_new = 0
+    total = max(0, (h - first) // H + 1)
+    while h >= first:
+        path = brti_hour_path(out, h)
+        if path.is_file():
+            st["brti_skipped"] += 1
+            h -= H
+            continue
+        try:
+            table, s1 = await fetch_brti_hour(rest, h)
+        except KalshiHTTPError as exc:
+            st["brti_errors"] += 1
+            log(f"brti {iso_ms(h)}: {exc}")
+            h -= H
+            continue
+        if table.num_rows == 0 and h + H > now - int(recent_delay_s * NS_PER_S):
+            h -= H
+            continue
+        if table.num_rows == 0:
+            st["brti_empty"] += 1
+            log(f"brti {iso_ms(h)}: no ticks (outage?) -> empty file")
+        if s1["off_cent"]:
+            log(f"brti {iso_ms(h)}: {s1['off_cent']} values not on the cent grid (rounded)")
+        write_parquet(path, table, BRTI_SCHEMA, delta_cols=("t_ms", "cents"))
+        st["brti_hours"] += 1
+        st["brti_ticks"] += table.num_rows
+        n_new += 1
+        if n_new % 24 == 0:
+            el = time.time() - t_start
+            done = (min(end_ns, now) // H * H - H - h) // H + 1
+            log(f"brti: {iso_ms(h)} done; {n_new} new hours in {el:.0f}s; "
+                f"ETA {(total - done) * el / max(n_new, 1) / 60:.0f} min for {total - done} hours")
+        h -= H
+    return st
 
 
 # ============================================================================ driver
@@ -451,21 +559,34 @@ async def download(
     datasets: Iterable[str] = DEFAULT_DATASETS,
     skip_zero_volume: bool = True,
     candle_period: int = 1,
-    brti_window_s: int = 300,
-    brti_timespan: str = "{span_s}s",
-    brti_timestamp: str = "{end_ms}",
     max_events: int | None = None,
     concurrency: int = 4,
     have_auth: bool = False,
+    cf_rest: Any = None,
     event_close_filter: bool = True,
+    now_ns: int | None = None,
     log: Any = print,
 ) -> dict[str, int]:
-    """Download everything requested; returns counters. Safe to re-run (checkpoints)."""
+    """Download everything requested; returns counters. Safe to re-run (checkpoints).
+
+    ``rest`` serves the public endpoints (unsigned in the CLI); ``cf_rest`` (signed; defaults to
+    ``rest``) serves the CF passthrough, used only when ``have_auth``. Events are processed
+    newest first."""
     ds = set(datasets)
     unknown = ds - set(DATASETS)
     if unknown:
         raise ValueError(f"unknown datasets {sorted(unknown)}")
     stats = {"events": 0, "events_skipped": 0, "markets": 0, "trades": 0, "candles": 0, "brti_ticks": 0, "errors": 0}
+    cf = cf_rest if cf_rest is not None else rest
+    if "brti" in ds and have_auth:
+        # the signed lane is independent of the event loop below: run it concurrently
+        brti_task = asyncio.ensure_future(download_brti(cf, start_ns, end_ns, out, now_ns=now_ns, log=log, stats=stats))
+    else:
+        brti_task = None
+    if not ({"markets", "trades", "candles", "fees", "incentives"} & ds):
+        if brti_task is not None:
+            await brti_task
+        return stats
     cutoff = await rest.get_historical_cutoff()
     write_json(out / "meta" / "historical_cutoff.json", {"fetched_ns": time.time_ns(), **cutoff})
     market_cut = opt_iso_to_ns(cutoff.get("market_settled_ts"))
@@ -502,25 +623,25 @@ async def download(
             write_json(out / "fees" / "series_fee_changes" / f"{series}.json",
                        await rest.get_series_fee_changes(series, show_historical=True))
         events = await list_events(rest, series, start_ns, end_ns, use_close_filter=event_close_filter)
+        events.reverse()  # newest first: a partial run covers the most recent period
         if max_events is not None:
             events = events[:max_events]
         ev_path = out / "events" / f"series={series}" / "events.parquet"
         existing = {r["event_ticker"]: r for r in (pq.read_table(ev_path).to_pylist() if ev_path.is_file() else [])}
         existing.update({e["event_ticker"]: event_row(e) for e in events})
         write_parquet(ev_path, [existing[k] for k in sorted(existing)], EVENT_SCHEMA)
-        log(f"{series}: {len(events)} events in range")
-
-        ck_mt = Checkpoint(out / "_checkpoints" / f"events-{series}.json")
-        ck_c = Checkpoint(out / "_checkpoints" / f"candles-{series}.json")
-        ck_b = Checkpoint(out / "_checkpoints" / f"brti-{series}.json")
-        for ev in events:
+        ck_mt = Checkpoint(out / "_checkpoints" / f"events-{series}.log")
+        ck_c = Checkpoint(out / "_checkpoints" / f"candles-{series}.log")
+        todo = [e for e in events if (bool({"markets", "trades"} & ds) and e["event_ticker"] not in ck_mt)
+                or ("candles" in ds and e["event_ticker"] not in ck_c)]
+        stats["events_skipped"] += len(events) - len(todo)
+        log(f"{series}: {len(events)} events in range, {len(todo)} to do")
+        t0 = time.time()
+        n0 = stats["trades"]
+        for i, ev in enumerate(todo):
             et = ev["event_ticker"]
             need_mt = bool({"markets", "trades"} & ds) and et not in ck_mt
             need_c = "candles" in ds and et not in ck_c
-            need_b = "brti" in ds and have_auth and et not in ck_b
-            if not (need_mt or need_c or need_b):
-                stats["events_skipped"] += 1
-                continue
             try:
                 markets, msrc = await fetch_event_markets(rest, ev, market_cut)
                 markets = [m for m in markets if _in_range(m, start_ns, end_ns, ev)]
@@ -530,18 +651,19 @@ async def download(
                 if need_c:
                     await _candles(rest, series, et, markets, msrc, candle_period, skip_zero_volume, out, sem, stats)
                     ck_c.mark(et)
-                if need_b and markets:
-                    # T = close_time (dh.settlement.convention); expected_expiration_time is close + 5 min
-                    exp_ns = max(opt_iso_to_ns(m.get("close_time")) for m in markets)
-                    rows, raw = await fetch_brti(rest, et, exp_ns, brti_window_s, brti_timespan, brti_timestamp)
-                    write_parquet(out / "brti" / f"series={series}" / f"{et}.parquet", rows, BRTI_SCHEMA)
-                    write_json(out / "brti" / f"series={series}" / f"{et}.raw.json", raw)
-                    stats["brti_ticks"] += len(rows)
-                    ck_b.mark(et)
                 stats["events"] += 1
             except KalshiHTTPError as exc:
                 stats["errors"] += 1
                 log(f"{et}: {exc}")
+            if (i + 1) % 10 == 0 or i + 1 == len(todo):
+                el = time.time() - t0
+                eta = el / (i + 1) * (len(todo) - i - 1)
+                log(f"{series}: {i + 1}/{len(todo)} events (last {et}), {stats['trades'] - n0} trades, "
+                    f"{el / 60:.1f} min, ETA {eta / 60:.1f} min")
+                write_json(out / "_progress.json", {"series": series, "done": i + 1, "todo": len(todo), "last_event": et,
+                                                    "eta_min": round(eta / 60, 1), "stats": stats, "updated_ns": time.time_ns()})
+    if brti_task is not None:
+        await brti_task
     return stats
 
 
@@ -556,21 +678,21 @@ async def _markets_and_trades(
     rest: Any, series: str, et: str, markets: list[dict[str, Any]], msrc: str, trades_cut: int, out: Path,
     ds: set[str], skip_zero_volume: bool, sem: asyncio.Semaphore, stats: dict[str, int],
 ) -> None:
-    write_parquet(out / "markets" / f"series={series}" / f"{et}.parquet", [market_row(m, series, msrc) for m in markets], MARKET_SCHEMA)
+    mrows = [market_row(m, series, msrc) for m in markets]
     stats["markets"] += len(markets)
-    if "trades" not in ds:
-        return
+    if "trades" in ds:
+        async def one(m: dict[str, Any]) -> list[dict[str, Any]]:
+            if skip_zero_volume and m.get("volume_fp") is not None and qty_from_fp(str(m["volume_fp"])) == 0:
+                return []
+            async with sem:
+                return [trade_row(t, et, series, src) for t, src in await fetch_market_trades(rest, m, trades_cut)]
 
-    async def one(m: dict[str, Any]) -> list[dict[str, Any]]:
-        if skip_zero_volume and m.get("volume_fp") is not None and qty_from_fp(str(m["volume_fp"])) == 0:
-            return []
-        async with sem:
-            return [trade_row(t, et, series, src) for t, src in await fetch_market_trades(rest, m, trades_cut)]
-
-    rows = [r for chunk in await asyncio.gather(*(one(m) for m in markets)) for r in chunk]
-    rows.sort(key=lambda r: (r["ts_ms"], r["ticker"], r["trade_id"]))
-    write_parquet(out / "trades" / f"series={series}" / f"{et}.parquet", rows, TRADE_SCHEMA)
-    stats["trades"] += len(rows)
+        rows = [r for chunk in await asyncio.gather(*(one(m) for m in markets)) for r in chunk]
+        rows.sort(key=lambda r: (r["ts_ms"], r["ticker"], r["trade_id"]))
+        write_parquet(out / "trades" / f"series={series}" / f"{et}.parquet", rows, TRADE_SCHEMA)
+        stats["trades"] += len(rows)
+    # markets last: a markets file without its trades file never exists for a finished event
+    write_parquet(out / "markets" / f"series={series}" / f"{et}.parquet", mrows, MARKET_SCHEMA)
 
 
 async def _candles(
@@ -594,11 +716,22 @@ def _date_ns(s: str) -> int:
     return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp()) * NS_PER_S
 
 
+def estimate(days: float, series: Iterable[str], rate: float, cf_share: float = 0.1, read_budget: float = 200.0) -> dict[str, Any]:
+    """Rough wall-clock estimate from request counts measured 2026-09-25 (one day of data):
+    KXBTCD ~1,100 public requests (646 traded markets, ~310k trades), KXBTC ~500 (344 markets,
+    ~17k trades), KXBTC15M ~3,600 (96 markets, ~3.4M trades), plus 24 CF calls (50 tokens each)."""
+    per_day = {"KXBTCD": 1100, "KXBTC": 500, "KXBTC15M": 3600}
+    req = sum(per_day.get(s, 1000) for s in series) * days
+    cf_s = 24 * days * 50 / (cf_share * read_budget)
+    return {"public_requests": int(req), "public_hours": round(req / rate / 3600, 1), "brti_hours": round(cf_s / 3600, 1)}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--series", nargs="+", default=["KXBTCD", "KXBTC", "KXBTC15M"])
-    ap.add_argument("--start", required=True, help="UTC date YYYY-MM-DD (inclusive)")
-    ap.add_argument("--end", required=True, help="UTC date YYYY-MM-DD (exclusive)")
+    ap.add_argument("--start", default=None, help="UTC date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--end", default=None, help="UTC date YYYY-MM-DD (exclusive; default: tomorrow)")
+    ap.add_argument("--days", type=float, default=None, help="instead of --start: the last N days up to --end")
     ap.add_argument("--out", type=Path, default=None, help="output root (default: config history.out_dir)")
     ap.add_argument("--datasets", default=",".join(DEFAULT_DATASETS), help=f"comma list of {','.join(DATASETS)}")
     ap.add_argument("--config", default=None, help="kalshi config YAML (default config/kalshi.yaml or example)")
@@ -606,37 +739,100 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--base-url", default=None, help="override REST base URL")
     ap.add_argument("--include-zero-volume", action="store_true", help="also query trades/candles of untraded markets")
     ap.add_argument("--candle-period", type=int, default=1, choices=[1, 60, 1440])
-    ap.add_argument("--brti-window-s", type=int, default=300)
-    ap.add_argument("--brti-timespan", default="{span_s}s", help="template: {start_ms},{end_ms},{start_s},{end_s},{span_s},{span_ms}")
-    ap.add_argument("--brti-timestamp", default="{end_ms}", help="template, see --brti-timespan")
     ap.add_argument("--max-events", type=int, default=None, help="per series (smoke runs)")
     ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--rate", type=float, default=5.0, help="public (unsigned) requests per second")
+    ap.add_argument("--cf-share", type=float, default=0.1, help="fraction of the account read budget for the CF passthrough")
+    ap.add_argument("--estimate", action="store_true", help="print the time estimate and exit (no requests)")
+    ap.add_argument("--plan", default=None,
+                    help="sequential steps SERIES[+SERIES]:DAYS,... (e.g. 'KXBTCD:30,KXBTC15M:14,KXBTCD:90'), each the last "
+                         "DAYS up to --end; later steps skip what earlier ones finished. Overrides --series/--days/--start")
+    ap.add_argument("--pid-file", type=Path, default=None, help="write this process id here (removed on exit)")
     ap.add_argument("--no-event-close-filter", action="store_true",
                     help="do not pass min_close_ts to GET /events (page all settled events, filter locally)")
     return ap.parse_args(argv)
 
 
+def _range(args: argparse.Namespace) -> tuple[int, int]:
+    end = _date_ns(args.end) if args.end else _date_ns((datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat())
+    if args.days is not None:
+        return end - int(args.days * 86400) * NS_PER_S, end
+    if not args.start:
+        raise SystemExit("--start or --days is required")
+    return _date_ns(args.start), end
+
+
+def parse_plan(plan: str) -> list[tuple[list[str], float]]:
+    """'KXBTCD:30,KXBTC15M+KXBTC:14' -> [(['KXBTCD'], 30.0), (['KXBTC15M', 'KXBTC'], 14.0)]."""
+    steps = []
+    for item in plan.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        ser, _, days = item.partition(":")
+        steps.append(([x for x in ser.split("+") if x], float(days)))
+    return steps
+
+
 async def amain(args: argparse.Namespace) -> int:
+    if args.pid_file:
+        args.pid_file.parent.mkdir(parents=True, exist_ok=True)
+        args.pid_file.write_text(str(os.getpid()))
+    try:
+        if not args.plan:
+            return await _run_once(args)
+        rc = 0
+        for series, days in parse_plan(args.plan):
+            a = argparse.Namespace(**{**vars(args), "series": series, "days": days, "start": None, "plan": None})
+            print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), f"=== plan step {'+'.join(series)} last {days:g} days",
+                  flush=True)
+            rc |= await _run_once(a)
+        return rc
+    finally:
+        if args.pid_file and args.pid_file.is_file() and args.pid_file.read_text().strip() == str(os.getpid()):
+            args.pid_file.unlink()
+
+
+async def _run_once(args: argparse.Namespace) -> int:
     from dh.kalshi.config import load_config
+    from dh.kalshi.rate_limit import KalshiRateLimiter
     from dh.kalshi.rest import KalshiRest
 
-    cfg = load_config(args.config, env="demo" if args.demo else None)
-    signer = cfg.signer()
+    start_ns, end_ns = _range(args)
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    if args.estimate:
+        print(orjson.dumps(estimate((end_ns - start_ns) / 86400e9, args.series if set(datasets) - {"brti"} else [],
+                                    args.rate, args.cf_share)).decode())
+        return 0
+    cfg = load_config(args.config, env="demo" if args.demo else None)
+    signer = cfg.signer() if "brti" in datasets else None
     if "brti" in datasets and signer is None:
         print(f"brti requested but no credentials ({cfg.credentials_hint()}): skipping BRTI", file=sys.stderr)
     out = args.out or Path(cfg.history.get("out_dir", "data/external/kalshi"))
-    async with KalshiRest(args.base_url or cfg.rest_url, signer, cfg.limiter(), read_only=True, **cfg.rest_kwargs()) as rest:
+    base = args.base_url or cfg.rest_url
+    kw = {**cfg.rest_kwargs(), "max_get_retries": 10, "backoff_max_s": 60.0}
+    log = lambda *a: print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), *a, flush=True)  # noqa: E731
+    log(f"range {iso_ms(start_ns)} .. {iso_ms(end_ns)} series={args.series} datasets={datasets} rate={args.rate}/s "
+        f"estimate={estimate((end_ns - start_ns) / 86400e9, args.series if set(datasets) - {'brti'} else [], args.rate, args.cf_share)}")
+    # public lane: NO signer (unauthenticated requests do not draw the shared account budget)
+    async with KalshiRest(base, None, Pacer(args.rate), read_only=True, **kw) as rest:
+        cf_rest = None
         if signer is not None:
-            await rest.configure_rate_limits()
-        stats = await download(
-            rest, list(args.series), _date_ns(args.start), _date_ns(args.end), out,
-            datasets=datasets, skip_zero_volume=not args.include_zero_volume, candle_period=args.candle_period,
-            brti_window_s=args.brti_window_s, brti_timespan=args.brti_timespan, brti_timestamp=args.brti_timestamp,
-            max_events=args.max_events, concurrency=args.concurrency, have_auth=signer is not None,
-            event_close_filter=not args.no_event_close_filter,
-        )
-    print(orjson.dumps(stats).decode())
+            cf_rest = KalshiRest(base, signer, KalshiRateLimiter(account_share=args.cf_share), read_only=True, **kw)
+            await cf_rest.configure_rate_limits()
+            log("cf lane:", cf_rest.limiter.describe())
+        try:
+            stats = await download(
+                rest, list(args.series), start_ns, end_ns, out,
+                datasets=datasets, skip_zero_volume=not args.include_zero_volume, candle_period=args.candle_period,
+                max_events=args.max_events, concurrency=args.concurrency, have_auth=signer is not None,
+                cf_rest=cf_rest, event_close_filter=not args.no_event_close_filter, log=log,
+            )
+        finally:
+            if cf_rest is not None:
+                await cf_rest.close()
+        log("public lane:", rest.stats, "cf lane:", cf_rest.stats if cf_rest is not None else None)
+    print(orjson.dumps(stats).decode(), flush=True)
     return 1 if stats["errors"] else 0
 
 

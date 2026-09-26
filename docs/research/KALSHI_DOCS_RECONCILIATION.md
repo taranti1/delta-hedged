@@ -13,6 +13,24 @@ Line numbers are for the working tree at about 19:20 UTC; other agents were edit
 `dh/kalshi/rest.py`, `rate_limit.py`, `dh/live/app.py`, `ws.py` and some scripts at the same
 time, so symbol names are given too.
 
+**Status update (later on 2026-09-25):**
+* Finding 2 FIXED and VERIFIED: T = `close_time` everywhere (`dh/settlement/convention.py`,
+  `rest_market_to_spec` refuses a market whose rules-text time differs from close_time;
+  `expected_expiration_time` is metadata only). The settlement window turned out to be
+  **[T-60 s, T)** (the prints stamped T-60 s .. T-1 s), NOT the (close-60 s, close] of section d:
+  that window, which Kalshi's streamed `last_60s_windowed_average_15min` uses, matched 1 of 11
+  recorded expirations; [T-60 s, T) rounded to cents matched all of them and the history
+  (`docs/research/M1_2_SETTLEMENT_CHECK.md`).
+* Finding 3 FIXED: `cf_history_to_ticks` unwraps `{"data": {"payload": [...]}}`; `timestamp` is
+  the hour START (one live call: timestamp 20:00:00.000Z returned 18,000 ticks 20:00:00.000 ..
+  20:59:59.800); `scripts/download_kalshi_history.py` fetches BRTI hour by hour this way.
+* Finding 10 FIXED: the modelled average is rounded to cents before the strike comparison
+  (`SettlementSpec.round_decimals`, `MarketSpec.settle_thresholds`); a missing print inside the
+  window is counted (`WindowState.n_missing`) and pulls at-risk quotes (`brti_gap_in_window`).
+* Finding 15 applied to the history downloader (public GETs unsigned, CF passthrough signed at
+  10 % of the read budget).
+* Section e: observed on the recorder capture, see `docs/research/M1_2_SETTLEMENT_CHECK.md` s.5.
+
 ## 1. Summary of discrepancies
 
 Severity: **breaks-live** = live trading fails or runs with a wrong model; **wrong-assumption**

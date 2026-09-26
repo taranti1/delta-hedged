@@ -18,7 +18,9 @@ section F.
 required level.
 
 - **The settlement rule is modelled exactly.** Kalshi settles on the average of the 60
-  once-per-second BRTI prints in (T-60 s, T], so the model tracks:
+  once-per-second BRTI prints stamped T-60 s .. T-1 s (window [T-60 s, T), T = close_time),
+  rounded to cents [VERIFIED to the cent, `docs/research/M1_2_SETTLEMENT_CHECK.md`], so the
+  model tracks:
   - the prints already fixed;
   - the required remaining average `R* = (K n - sum_fixed) / m`;
   - the exact variance time of the remaining average,

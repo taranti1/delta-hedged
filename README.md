@@ -20,10 +20,14 @@ the 12 core research questions one by one, each with its status and the test tha
 | Gaussian tails understate 3-sd outcomes ~4-5x, so the naive "sell longshots" edge largely disappears | same |
 | Ignoring the 60-print settlement average misprices a 1-sd strike by 4.8c at 2 min and 12c at window open | same |
 | Kalshi streams the settlement benchmark (BRTI, 1 Hz and 5 Hz) on its own WebSocket, with REST history | `docs/kalshi_specs/asyncapi.yaml`, `docs/DATA_SOURCES.md` |
+| [VERIFIED] Settlement convention: `expiration_value` = average of the 60 BRTI prints stamped T-60 s .. T-1 s with T = `close_time` (not `expected_expiration_time` = close + 5 min), rounded half up to cents; identical across KXBTCD/KXBTC/KXBTC15M. Matches 13/13 recorded expirations and 10,015/10,075 in the CF history (the 60 misses are half-cent ties before 2026-08-21, when Kalshi rounded the binary double; explained exactly). Kalshi's streamed `last_60s_windowed_average_15min` is one second off and is NOT the settlement value | `docs/research/M1_2_SETTLEMENT_CHECK.md` |
+| [VERIFIED] KXBTCD, KXBTC and KXBTC15M charge no maker fee today (`quadratic` x1) and the account's balance precision is $0.0001 | `scripts/verify_fee_schedule.py`, `docs/RUNBOOK.md` |
+| [VERIFIED, in-sample, 30/14/7 days] Experiment 0 on 36 M public prints: the average maker nets +0.18c to +0.26c per contract (CIs include 0.15c), last-in-queue fills (policy C) lose 0.6-0.8c; **no segment clears 0.15c under both B and C**, so M1.1 keeps nothing yet (K.1's hard falsification is not met either) | `docs/research/E0_RESULTS.md` |
 | With maker fees, each order pays its exact fee rounded up to the cent, so the cost per contract depends on order size: 0.50-0.60c near 50c, and at least 0.50c for any 2-lot. The quoter prices the exact per-order fee and picks fee-efficient sizes (formula from the fee rules; to be confirmed on live fills in M1.3) | `docs/MODELS.md` s.3, `dh/kalshi/fees.py` |
 
-**Not yet established: whether net edge exists after fills.** That requires Kalshi data, which
-this build environment could not reach. `docs/BUILD_PLAN.md` sections F and K give the
+**Not yet established: whether net edge exists after fills.** Public-tape E0 on one month finds no
+segment that clears the bar for a back-of-queue maker; fill-conditioned evidence (paper mode, M1.4)
+and a longer history (download running) decide it. `docs/BUILD_PLAN.md` sections F and K give the
 fastest safe path to the answer and the exact stop/scale criteria.
 
 ## Layout

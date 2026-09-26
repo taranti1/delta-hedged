@@ -93,7 +93,9 @@ indistinguishable in the test period. Including the no-trade hours changes no co
 
 ## 3. The settlement proxy: what it can and cannot tell us
 
-The contract settles on the mean of 60 one-second BRTI prints in `(T-60s, T]`; the study
+The contract settles on the mean of 60 one-second BRTI prints stamped `T-60s .. T-1s` (window
+`[T-60s, T)`, T = close_time; verified 2026-09-25 in `docs/research/M1_2_SETTLEMENT_CHECK.md`; this
+study was written assuming `(T-60s, T]`, a one-second shift that does not change its conclusions); the study
 uses `A_T = OHLC4` of the Bitstamp candle `[T-60s, T)`. A simulation (Brownian path on a
 0.1-second grid; BRTI = the path at whole seconds; Bitstamp trades = Poisson arrivals with
 bid-ask bounce; `dh/research/fv_study/proxy.py`, `tables/fv_proxy_error.csv`) gives, in units

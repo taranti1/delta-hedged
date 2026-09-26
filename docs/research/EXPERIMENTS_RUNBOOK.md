@@ -199,7 +199,8 @@ the replayed strategy.
   `[split, t1)`.
 * **Settlement prints.** Only `dh.settlement` maps benchmark ticks to window prints
   (`SettlementTracker`: a 1 Hz tick with source time u is the print for second ceil(u), the later
-  of two ticks in one second is kept; window (close - 60 s, close]). The replay, E2's window-average
+  of two ticks in one second is kept; window [close - 60 s, close), the prints stamped close-60 s ..
+  close-1 s, verified in `docs/research/M1_2_SETTLEMENT_CHECK.md`). The replay, E2's window-average
   table and the synthetic recording (whole-second source stamps) do not re-derive it.
 
 ## 3. Runtime and memory
@@ -241,6 +242,11 @@ buckets need >= 20 events under both B and C for any recommendation.
 | E9 | `exp9_multistrike` | >= 7 days | `run_experiment.py e9 [--strikes 1,3,0]` | 6 | `e9_multistrike_variants.csv` ($/day, net c/ct, peak/mean collateral, mean \|D\|, netting ratio, delta turnover per contract), `_paired.csv` (decision CIs), `_regimes.csv` | accept if $/day is up (paired CI over settlement events) and delta turnover per contract is down (paired CI over 1 h blocks) vs the single best strike, under B and C, Holm across variants |
 | E10 | `exp10_capacity` | >= 7 days | `run_experiment.py e10 [--multipliers 1,2,5,10,20,50] [--no-scale-limits]` | 12 | `e10_capacity_by_size.csv` (net c/ct CI, fills/day, contracts/day, share of the QUOTABLE taker flow, inventory sd), `_capacity.csv` (largest clip multiple above 1.0 / 0.75 / 0.5 / 0.05 c and breakeven, point and CI-lower-bound), `_regimes.csv` | measurement: report capacity (no market impact modeled: upper bound) |
 
+E0 at scale on the downloaded history: `python -m dh.research.e0_history --history data/external/kalshi
+--out data/results/e0` (per-cluster sums, policies B = every print and C = last-in-queue prints before
+a trade-through, series x tau x price / |z| segments; results `docs/research/E0_RESULTS.md`). The
+settlement-convention check (M1.2): `python -m dh.research.settlement_check live|history`
+(`docs/research/M1_2_SETTLEMENT_CHECK.md`).
 E0 is `dh.research.exp0_maker_pnl` (public trades vs settlement: `scripts/download_kalshi_history.py`
 tables, no recording needed; `python -m dh.research.exp0_maker_pnl --trades T --markets M [--btc B]
 [--fee-type KXBTCD=quadratic_with_maker_fees ...]`): clusters = expirations, the exact per-order

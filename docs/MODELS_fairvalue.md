@@ -10,13 +10,15 @@ material (section 3 below).
 ## 1. What is priced
 
 A KXBTCD / KXBTC / KXBTC15M market pays $1 if the expiration value `A` beats the strike, where
-`A` is the simple average of `n = 60` once-per-second BRTI prints stamped `T-59s, ..., T`
-(window `(T-60s, T]`, the convention Kalshi documents for `last_60s_windowed_average_15min`),
-**`T` = the market's `close_time`** (not `expected_expiration_time`, which is close + 5 min on
-every KXBTC* market), and the average is **rounded to cents** before the comparison (the
-published `expiration_value` has 2 decimals). Convention: `dh/settlement/convention.py`,
-verified against published `expiration_value`s in `docs/research/M1_2_SETTLEMENT_CHECK.md`.
-Missing or incomplete benchmark data resolves the market No (contract terms).
+`A` is the simple average of the `n = 60` once-per-second BRTI prints whose CF source times are
+`T-60s, T-59s, ..., T-1s` (window **`[T-60s, T)`**: "the sixty seconds of BRTI before" T; the
+print stamped exactly `T` is NOT included), **`T` = the market's `close_time`** (not
+`expected_expiration_time`, which is close + 5 min on every KXBTC* market), and the average is
+**rounded to cents** before the comparison (the published `expiration_value` has 2 decimals).
+Convention: `dh/settlement/convention.py`, verified against published `expiration_value`s in
+`docs/research/M1_2_SETTLEMENT_CHECK.md`. Kalshi's streamed `last_60s_windowed_average_15min`
+averages `T-59s .. T` (one second later) and does NOT equal the expiration value. Missing or
+incomplete benchmark data resolves the market No (contract terms).
 
 | strike_type | YES iff (on the rounded value `round(A, 2)`) | threshold on the unrounded `A` |
 |---|---|---|
@@ -36,7 +38,8 @@ At time `now` the tracker (`SettlementTracker.window_state`) reduces the index h
     WindowState(n_obs, k_fixed, sum_fixed, m_remaining, tau_first_s, step_s)
 
 with `n_obs = k_fixed + m_remaining`, `tau_first_s` the seconds until the first unfixed print
-and `step_s = 1`. Before the window opens `k = 0`, `m = 60`, `tau_first = T - 59s - now`.
+and `step_s = 1`. Before the window opens `k = 0`, `m = 60`, `tau_first = T - 60s - now` (the last
+print is stamped `T - 1s`, so the outcome is known one second before the close).
 
 Settlement arithmetic. With `R` the average of the `m` remaining prints,
 
@@ -48,8 +51,8 @@ zero delta and gamma.
 
 Print selection (details in the module docstring): `IndexTick.ts_exch` (the upstream source
 timestamp) defines the second. 1 Hz print for second `s` = the tick stamped in `(s-1, s]`
-(Kalshi's documented window is `(close - 60 s, close]`; with whole-second stamps this is the
-tick stamped exactly `s`, and of two ticks in one second the later is kept);
+(every recorded 1 Hz tick and every CF-history row used here carries a whole-second stamp, so this
+is the tick stamped exactly `s`; of two ticks in one second the later is kept);
 with only the 5 Hz feed, the last 5 Hz tick at or before `s` (final once a later tick
 arrives). Duplicates are idempotent; conflicting values for the same source timestamp keep the
 first. Missing seconds are counted in `WindowState.n_missing`: incomplete data resolves No, so a
@@ -219,7 +222,7 @@ Approximations and limitations:
    were fitted on Bitstamp 1-minute candles with OHLC4 of the final minute as the settlement
    proxy. Re-fit on captured BRTI 1 Hz data and published `expiration_value`s before relying
    on the tails.
-7. **Settlement convention.** `T = close_time`, window `(T-60s, T]` and cents rounding are
+7. **Settlement convention.** `T = close_time`, window `[T-60s, T)` and cents rounding are
    checked against published `expiration_value`s (`docs/research/M1_2_SETTLEMENT_CHECK.md`).
    How CF Benchmarks / Kalshi treat a missing second is not observable from the API beyond the
    contract's "resolves No"; the strategy therefore pulls at-risk quotes during a gap.

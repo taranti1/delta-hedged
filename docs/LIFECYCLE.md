@@ -6,7 +6,7 @@
 |---|---|---|---|
 | 1 | Ingest Kalshi + external data | adapters -> events | every frame stamped with receive ns and recorded before parsing |
 | 2 | Validate feeds | `RiskEngine.health` | Kalshi books valid (no gap, 5 s since resync); BRTI age (receive *and* source time) <= 3 s near expiry / 10 s overall; runner not lagging, not reconciling, clock within limits; >= 2 fresh external venues only when venues are configured (off in M1: `feeds.only: []`) |
-| 3 | Settlement state | `SettlementTracker` | fixed prints in (T-60, T], required remaining average per strike |
+| 3 | Settlement state | `SettlementTracker` | fixed prints in [T-60, T) (T = close_time; prints stamped T-60 .. T-1 s), required remaining average per strike; a missing print in the window (No-risk) pulls at-risk quotes |
 | 4 | Fair probability | `digital` + band | F, F_lo, F_hi from nowcast S, sigma forecast, window state, tail model |
 | 5 | Delta / gamma | same call | analytic greeks of the averaging-window digital |
 | 6 | Fill probability | `FillIntensityModel` | intensity from segment flow and queue-ahead |

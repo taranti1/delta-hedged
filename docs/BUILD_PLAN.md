@@ -11,7 +11,8 @@ plan is a system that can find out, safely and fast, whether edge exists and how
 ## A. Strategy specification
 
 **What it trades.** Kalshi `KXBTCD` hourly BTC threshold contracts: "the simple average of the
-60 once-per-second CF Benchmarks BRTI prints in (T-60 s, T] is above K". `KXBTC` ranges and
+60 once-per-second CF Benchmarks BRTI prints stamped T-60 s .. T-1 s, rounded to cents, is above
+K", with T = `close_time` [VERIFIED, `docs/research/M1_2_SETTLEMENT_CHECK.md`]. `KXBTC` ranges and
 `KXBTC15M` are supported by the same code but are enabled only if Experiment 0 shows edge there.
 
 **What it does.** A single-threaded, deterministic Strategy (`dh/strategy/mm.py`) repeats the
@@ -131,6 +132,8 @@ Results so far:
   Known answers: an injected linear delta is hedged to zero variance at zero cost and to the known band
   edge at cost c; zero-delta flow never ACCEPTs; above the break-even cost the band never trades. It
   needs real fills (>= 20 settlement events) for a decision.
+- **E0 on real history:** [VERIFIED, in-sample, 1 month] no segment clears 0.15c under B and C
+  (`docs/research/E0_RESULTS.md`). **Settlement convention:** [VERIFIED] (`docs/research/M1_2_SETTLEMENT_CHECK.md`).
 - **E0 and E1:** [BUILT], and the known-answer tests recover injected effects:
   - Maker P&L sign follows flow toxicity.
   - Injected maker lags of 0.3, 1.5 and 4 s give measured half-lives of 0.21, 0.75 and
@@ -174,6 +177,7 @@ Results so far:
 | M1.0 | Deploy on AWS us-east-1: `scripts/record.py` (Kalshi WS for all `KXBTC*` + BRTI 1/5 Hz + venues + Deribit) and `scripts/download_kalshi_history.py` (6-12 months of `KXBTCD`/`KXBTC`/`KXBTC15M` trades and settled markets) | Smoke tests pass; 7 days recorded with fewer than 0.1% sequence gaps |
 | M1.1 | **Experiment 0** on historical trades | Keep only segments whose maker net P&L CI lower bound exceeds 0.15c/contract; stop if none |
 | M1.2 | **Settlement check:** BRTI prints vs every settled `expiration_value` | 99% of events match to $0.01, else fix the convention before any final-minute trading |
+| | *Status 2026-09-26* | **M1.0** [VERIFIED, in progress]: recorder running on this Mac since 2026-09-25 20:17Z (Kalshi WS incl. BRTI 1/5 Hz, 0 sequence gaps so far); history downloader rewritten (public GETs unsigned, CF passthrough at 10 % of the read budget, resumable, newest first) and running: KXBTCD 30 d, KXBTC 14 d, KXBTC15M 7 d done (36 M prints), BRTI hourly back to 2026-03 and continuing to 2025-09. **M1.1** [VERIFIED on that sample, in-sample]: no segment clears 0.15c under both B and C -> the F keep rule selects nothing (STOP for now); K.1's E0 falsification is NOT met (`docs/research/E0_RESULTS.md`). **M1.2** [VERIFIED] PASS: T = close_time, window [T-60 s, T), cents half up: 13/13 live, 10,015/10,075 history (99.4 %; the 60 misses are pre-2026-08-21 half-cent ties, explained exactly) (`docs/research/M1_2_SETTLEMENT_CHECK.md`) |
 | M1.3 | Fee verification (`scripts/verify_fee_schedule.py`) and resolution of each series' `fee_type` | Model matches `fee_cost` on every test fill |
 | M1.4 | **Paper mode** (`scripts/run_live.py --mode paper`): the live strategy against the live book with a conservative (C) simulator | 7 days; shadow net c/contract and markouts by segment |
 | M1.5 | **Live tiny size** (`config/m1.yaml`), for >= 4 weeks and >= 5,000 fills | Section K decision |
@@ -263,7 +267,7 @@ Unit economics per filled contract (cents):
 |---|---|---|---|---|
 | Gross edge vs fair at fill | 0.6 | 1.2 | 2.0 | [ESTIMATE] 1c tick near the money, 2-5c spreads on wings |
 | Adverse selection (60 s markout) | -0.8 | -0.6 | -0.5 | [ESTIMATE]; E3 measures it |
-| Kalshi maker fee, incl. per-order rounding | -0.50 | -0.30 | 0.00 | [VERIFIED formula] 0.0175 x P(1-P) per contract if the series charges makers, then each order's cash is rounded to $0.01, so an order pays its exact fee rounded up to the cent: 0.50-0.60c per contract near 50c, 0.10-0.30c on the wings at 5-10 lots, >= 0.50c for any 2-lot (`docs/MODELS.md` s.3). 0 for `quadratic` series. Some KXBTC series are `quadratic` (other repo's 2026-09-16 fee map); KXBTCD unknown |
+| Kalshi maker fee, incl. per-order rounding | -0.50 | -0.30 | 0.00 | [VERIFIED formula] 0.0175 x P(1-P) per contract if the series charges makers, then each order's cash is rounded to $0.01, so an order pays its exact fee rounded up to the cent: 0.50-0.60c per contract near 50c, 0.10-0.30c on the wings at 5-10 lots, >= 0.50c for any 2-lot (`docs/MODELS.md` s.3). 0 for `quadratic` series. [VERIFIED 2026-09-25, `verify_fee_schedule.py`] KXBTCD, KXBTC and KXBTC15M are all `quadratic` x1 (no maker fee; no scheduled change, no event override in the downloaded month) and the account's balance precision is $0.0001, so the maker fee term is 0 today |
 | Hedge cost | 0 | 0 | -0.05 | [VERIFIED] no hedge at M1/M2 size |
 | **Net per contract** | **-0.7** | **0.3** | **1.45** | Target >= 0.15c; > 0.75c triggers a fill-model audit before belief |
 
@@ -280,8 +284,11 @@ Scale (taker flow is the binding resource, not capital):
 | Peak collateral (about 10x average deployed) | $2k | $5k | $30k |
 | Risk capital for drawdowns (about 20x daily P&L s.d.) | $5k | $15k | $60k |
 
-Volume figures are placeholders. The first week of recording plus the historical downloader
-replaces them with measured `KXBTCD` volume by segment, which E10 then converts into capacity
+Volume figures were placeholders. [VERIFIED 2026-08-27..09-25, public tapes] measured traded volume
+is much larger: KXBTCD ~39 M contracts/day (13.3 M prints in 30 days), KXBTC15M ~247 M/day (7 days),
+KXBTC ~0.9 M/day (14 days); segment shares are in `data/results/e0/e0_B_*.csv`. E0 (maker net
++0.18c to +0.26c per contract on average, negative for last-in-queue fills) says the "share of
+volume in segments with edge" row is the uncertain one, not volume. E10 then converts this into capacity
 at > 1.0c, > 0.75c, > 0.5c, > 0.05c and breakeven. Liquidity-incentive income is excluded
 until actually earned.
 
@@ -289,10 +296,14 @@ until actually earned.
 
 **1. The strategy does not work** (stop, or pivot to incentives-only quoting) if any holds:
 - E0: maker net P&L CI upper bound < 0.15c in every segment of every BTC series.
+  *[2026-09-26: NOT met on 30/14/7 days of KXBTCD/KXBTC/KXBTC15M; only 9 of 297 (B) and 9 of 253
+  (C) segments have an upper bound < 0.15c. But no segment has a lower bound > 0.15c under B and C
+  either, so M1.1 keeps nothing: `docs/research/E0_RESULTS.md`.]*
 - Paper mode (policy C), 7 days: net c/contract CI upper bound < 0.
 - Live M1 after >= 5,000 fills: realized net c/contract CI entirely < 0 in the segments
   predicted best, or live markouts worse than paper by more than 0.5c.
 - Settlement convention cannot be reproduced (no final-minute trading at all).
+  *[2026-09-26: reproduced to the cent, `docs/research/M1_2_SETTLEMENT_CHECK.md`; not triggered.]*
 
 **2. It works but does not scale** if:
 - Live net CI is > 0 at M1 size, but capacity replay (E10, policies B and C, calibrated with live
