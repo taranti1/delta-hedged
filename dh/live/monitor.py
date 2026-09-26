@@ -178,16 +178,27 @@ def read_watchdog_beat(path: str | Path) -> dict[str, Any] | None:
     return rec
 
 
+MAX_FUTURE_S = 2.0  # a beat / heartbeat stamped further in the future than this is not fresh (review NEW-3)
+
+
 def watchdog_beat_problem(beat: dict[str, Any] | None, *, now_ns: int, subaccount: int, max_age_s: float,
-                          runner: tuple[int, str] | None = None) -> str:
+                          runner: tuple[int, str] | None = None, api_max_age_s: float = 180.0,
+                          max_future_s: float = MAX_FUTURE_S) -> str:
     """Why the watchdog cannot be trusted to protect a live runner of ``subaccount`` ('' = it
-    can): no beat, a beat older than ``max_age_s`` (the watchdog is dead, hung or crash-looping),
-    a watchdog that exited, one configured for another subaccount, or (``runner`` given: the
-    live runner's (pid, session), checked once it has been running a while) one not armed on
-    this runner."""
+    can): no beat, a beat older than ``max_age_s`` (the watchdog is dead, hung or crash-looping)
+    or stamped more than ``max_future_s`` in the FUTURE (review NEW-3: the absolute age counts;
+    a clock step or a macOS sleep makes an old beat look new), a watchdog that exited, one
+    configured for another subaccount, one whose own key cannot reach the API (review NEW-2:
+    ``api_ok`` false or missing, or its last successful authenticated probe older than
+    ``api_max_age_s``: liveness is not the ability to cancel), one whose poll keeps failing
+    (``step_ok`` false), or (``runner`` given: the live runner's (pid, session), checked once it
+    has been running a while) one not armed on this runner."""
     if beat is None:
         return "no watchdog beat (is scripts/watchdog.py running on this heartbeat file?)"
     age_s = (now_ns - int(beat.get("t", 0))) / 1e9
+    if age_s < -max_future_s:
+        return (f"watchdog beat stamped {-age_s:.1f}s in the FUTURE (> {max_future_s:g}s skew): a clock step or "
+                "sleep; not trusted as fresh")
     if age_s > max_age_s:
         return f"watchdog beat {age_s:.1f}s old (> {max_age_s:g}s): the watchdog is not running"
     if str(beat.get("state", "")).upper() == "EXITED":
@@ -195,6 +206,18 @@ def watchdog_beat_problem(beat: dict[str, Any] | None, *, now_ns: int, subaccoun
     sub = beat.get("subaccount")
     if sub is None or isinstance(sub, bool) or not isinstance(sub, int) or sub != int(subaccount):
         return f"the watchdog acts for subaccount {sub!r}, this runner trades subaccount {subaccount}"
+    if beat.get("api_ok") is not True:
+        err = str(beat.get("api_error") or "no API probe result in its beat")[:160]
+        return f"the watchdog cannot prove its key reaches the API ({err}): it could not cancel"
+    ok_ns = beat.get("api_ok_ns")
+    if not isinstance(ok_ns, int) or isinstance(ok_ns, bool):
+        return "the watchdog's beat names no successful API probe time"
+    api_age = (now_ns - ok_ns) / 1e9
+    if api_age > api_max_age_s or api_age < -max_future_s:
+        return (f"the watchdog's last successful API probe is {api_age:.0f}s old (limit {api_max_age_s:g}s): "
+                "its key / network may be down")
+    if beat.get("step_ok") is False:
+        return f"the watchdog's poll keeps failing ({str(beat.get('step_error') or '?')[:120]})"
     if runner is not None:
         armed = beat.get("armed")
         if not (isinstance(armed, (list, tuple)) and len(armed) == 2 and armed[0] == runner[0]

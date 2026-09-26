@@ -24,7 +24,18 @@ Data path
     are translated to the strategy's logical id (foreign groups dropped); WS market_position
     snapshots go through the same persistence check as the REST positions instead of reaching
     the strategy; a fill already delivered (WS or REST back-fill, by trade/fill id) is never
-    delivered twice.
+    delivered twice. Own-order filter (review M1 / NEW-1): a fill / order update is ours when its
+    client_order_id has this runner's prefix or its order id is known (our create's ack, an
+    update with our prefix); another client id is FOREIGN (dropped, ERROR). One WITHOUT a client
+    id (optional on WS fills; REST fills never carry one) of an order id not known yet is PARKED
+    (bounded, per order id), never dropped: released right after the item that proves the order
+    ours (the ack, the create reconciliation's update, or a read-only GET /portfolio/orders/{id}
+    showing our prefix on our subaccount), re-stamped at that item's time with the order's
+    client_order_id and recorded on events.live, so replay (which drops the raw copy exactly as
+    live parked it) delivers the same event at the same point. Proven foreign: dropped. Still
+    unknown after ``venue.unknown_order_park_s``: dropped with an ERROR and quoting paused through
+    the reconcile path ('unknown_order': fills, positions, orders re-read; an unexplained
+    position halts as any confirmed mismatch).
   * The consumer task takes items in order and hands events to ``EventPump`` (dh.live.pump),
     which calls ``strategy.on_event`` synchronously, never concurrently, with ``Timer``
     events synthesized on the grid ``k * period_ns`` exactly as the backtest runner does.
@@ -189,6 +200,7 @@ PAUSE_STREAM_REASON = "exchange_pause"  # reconcile reason + gate reason of an e
 MARKET_PAUSE_REASON = "market_pause"  # per-market block after a market-level pause reject
 WATCHDOG_REASON = "watchdog"  # gate + reconcile reason: the watchdog is not protecting this runner
 DISK_REASON = "disk"  # gate + reconcile reason: too little free disk for the session store
+UNKNOWN_ORDER_REASON = "unknown_order"  # reconcile reason: a parked fill / update whose order stayed unknown
 # place-reject reasons that mean the EXCHANGE / trading as a whole is paused (Kalshi's codes are
 # undocumented; never 'market_inactive' / 'market_closed', which follow a market's own close)
 _EXCHANGE_PAUSE_REJECT = re.compile(r"exchange[_ ](is[_ ])?(paused|closed|inactive|unavailable|not[_ ]active)"
@@ -260,6 +272,29 @@ def own_order_ok(ev: Any, id_prefix: str, known_oids: Any) -> bool:
         return True
     oid = str(getattr(ev, "order_id", "") or "")
     return bool(oid) and oid in known_oids
+
+
+def order_row_owner(row: dict[str, Any] | None, id_prefix: str, subaccount: int, *, key_restricted: bool) -> dict[str, Any]:
+    """Who owns the order of a GET /portfolio/orders/{id} lookup (review NEW-1)?
+    {"verdict": "ours" | "foreign" | "not_found", "client_order_id", "detail"}. Ours: the row's
+    client_order_id carries this runner's prefix AND its subaccount is ours (the endpoint takes no
+    subaccount parameter: an absent ``subaccount_number`` means the primary account, or ours when
+    the key is restricted to our subaccount, which Kalshi scopes server-side). Any other client id
+    (or none: our orders always carry one) or another subaccount: foreign."""
+    from dh.kalshi.normalize import subaccount_of
+
+    if row is None:
+        return {"verdict": "not_found", "client_order_id": "", "detail": "GET order: 404"}
+    coid = str(row.get("client_order_id") or "")
+    explicit = row.get("subaccount_number") is not None or row.get("subaccount") is not None
+    sa = subaccount_of(row)
+    sub_ok = sa == int(subaccount) if explicit else (int(subaccount) == 0 or bool(key_restricted))
+    if not sub_ok:
+        return {"verdict": "foreign", "client_order_id": coid,
+                "detail": f"subaccount {sa if explicit else '0 (field absent)'} is not ours ({subaccount})"}
+    if id_prefix and coid.startswith(id_prefix):
+        return {"verdict": "ours", "client_order_id": coid, "detail": "our client_order_id prefix"}
+    return {"verdict": "foreign", "client_order_id": coid, "detail": f"client_order_id {coid!r} lacks {id_prefix!r}"}
 
 
 def note_own_order(ev: Any, known_oids: Any) -> None:
@@ -522,6 +557,19 @@ class LiveRunner:
         self.own_id_prefix = str(own_id_prefix or "")
         self.known_oids = SeenIds()
         self._foreign_logged = 0
+        # review NEW-1: fills / order updates without client_order_id of an order id not known yet
+        # are PARKED (never dropped), keyed by order id, and released once the id is proven ours
+        self._parked: dict[str, list[tuple[Any, str]]] = {}  # oid -> [(event, source)] in arrival order
+        self._parked_since: dict[str, int] = {}  # oid -> ts it was first parked
+        self._parked_ids: set[str] = set()  # fill ids parked (a REST re-read never parks one twice)
+        self._parked_n = 0
+        self._lookups: set[str] = set()  # order ids with a GET /portfolio/orders/{id} in flight
+        self._proven_ours: dict[str, str] = {}  # oid -> client_order_id (lookup), bounded
+        self._proven_foreign = SeenIds(cap=20_000)
+        self._release: list[tuple[Any, str, str]] = []  # (event, source, client_order_id) to deliver now
+        self._unknown_logged = 0
+        self._unk_gen = 0  # generation of the 'unknown_order' reconciliation
+        self._unknown_since = 0  # earliest exchange/receive time of an event dropped as unknown (fills window)
         # the watchdog's liveness (review M3): reader of its beat file, the current problem
         self._watchdog_reader = watchdog_reader
         self._watchdog_problem = ""
@@ -758,6 +806,8 @@ class LiveRunner:
             self._on_side(item)
         else:
             self._on_event(item)
+        if self._release:
+            self._flush_release(item.ts)
 
     def _foreign_order_event(self, ev: Any, source: str) -> None:
         """An own-activity event of an order that is not ours (review M1): dropped, counted and
@@ -773,13 +823,189 @@ class LiveRunner:
                   client_order_id=getattr(ev, "client_order_id", ""), order_id=getattr(ev, "order_id", ""),
                   ticker=getattr(ev, "ticker", ""), n=self._foreign_logged)
 
+    # ------------------------------------------------------------------ unknown orders (review NEW-1)
+    def _note_own(self, ev: Any) -> None:
+        """Remember an event's order id as ours (it passed ``own_order_ok``, or is our create's
+        ack) and release whatever was parked for it, with the event's client_order_id."""
+        note_own_order(ev, self.known_oids)
+        if not self._parked:
+            return
+        oid = str(getattr(ev, "order_id", "") or "")
+        if oid and oid in self._parked:
+            coid = str(getattr(ev, "client_order_id", "") or "")
+            self._release_parked(oid, coid or self._proven_ours.get(oid, ""), f"known:{type(ev).__name__}")
+
+    def _unknown_order_event(self, ev: Any, source: str, ts: int) -> None:
+        """A fill / order update that ``own_order_ok`` did not accept. A client_order_id without our
+        prefix (or an order already proven another system's) is FOREIGN: dropped, counted, ERROR.
+        Without a client id (optional on WS fills, never on REST fills) and with an order id not
+        known yet (it beat our create's response, or the create is being reconciled) it is PARKED
+        and the order looked up; ``_on_order_lookup`` / ``_note_own`` release it, the timeout
+        (``_park_expire``) drops it and pauses quoting through the reconcile path."""
+        coid = str(getattr(ev, "client_order_id", "") or "")
+        oid = str(getattr(ev, "order_id", "") or "")
+        if coid or (oid and oid in self._proven_foreign):
+            if oid:
+                self._proven_foreign.add(oid)
+            self._foreign_order_event(ev, source)
+            return
+        if not oid:  # nothing to look up: unattributable -> treated as unknown (pause and reconcile)
+            self._unknown_dropped([(ev, source)], ts, "no order id")
+            return
+        if oid in self._proven_ours:  # a lookup proved it ours after its earlier events were handled
+            self._release.append((ev, source, self._proven_ours[oid]))
+            return
+        fid = ""
+        if isinstance(ev, KalshiFill):
+            fid = f"{ev.trade_id}|{getattr(ev, 'fill_id', '')}"
+            if fid in self._parked_ids or self.fills_seen.seen(ev):
+                return  # parked already (a REST re-read) or delivered
+        vc = self.cfg.venue
+        while self._parked_n >= max(1, int(vc.unknown_order_park_max)) and self._parked:
+            old = min(self._parked_since, key=self._parked_since.__getitem__)
+            self._park_timeout(old, ts, "park buffer full")
+        first = oid not in self._parked
+        self._parked.setdefault(oid, []).append((ev, source))
+        self._parked_since.setdefault(oid, ts)
+        if fid:
+            self._parked_ids.add(fid)
+        self._parked_n += 1
+        self.metrics.inc("dh_unknown_order_events_parked_total", type=type(ev).__name__, source=source)
+        self.metrics.set("dh_unknown_order_events_parked", float(self._parked_n))
+        self.jlog("order_event_parked", ts, type=type(ev).__name__, source=source, order_id=oid,
+                  ticker=getattr(ev, "ticker", ""), trade_id=getattr(ev, "trade_id", ""))
+        if first and oid not in self._lookups and self.venue is not None and hasattr(self.venue, "lookup_order"):
+            self._lookups.add(oid)
+            self._spawn(self._lookup_order(oid, vc.unknown_order_lookup_delay_s), "order_lookup")
+
+    async def _lookup_order(self, oid: str, delay_s: float) -> None:
+        """GET /portfolio/orders/{oid} (read-only) after ``delay_s`` if the order is still parked
+        (the create response usually releases it first); the verdict goes through the queue."""
+        try:
+            await asyncio.sleep(max(0.0, delay_s))
+            if self._stopping or oid not in self._parked:
+                self._lookups.discard(oid)
+                return
+            try:
+                row = await self.venue.lookup_order(oid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retried while the order is parked
+                self.metrics.inc("dh_order_lookup_errors_total")
+                self.push_side("order_lookup", {"oid": oid, "verdict": "error", "client_order_id": "",
+                                                "detail": f"{type(exc).__name__}: {exc}"[:200]})
+                return
+            self.push_side("order_lookup", {"oid": oid, **order_row_owner(row, self.own_id_prefix, self.subaccount,
+                                                                          key_restricted=self.key_restricted)})
+        except BaseException:
+            self._lookups.discard(oid)
+            raise
+
+    def _on_order_lookup(self, ts: int, p: dict[str, Any]) -> None:
+        oid = str(p.get("oid") or "")
+        self._lookups.discard(oid)
+        verdict = str(p.get("verdict") or "")
+        self.jlog("order_lookup", ts, order_id=oid, verdict=verdict, client_order_id=p.get("client_order_id", ""),
+                  detail=p.get("detail", ""), parked=len(self._parked.get(oid, ())))
+        if verdict == "ours":
+            coid = str(p.get("client_order_id") or "")
+            self._proven_ours[oid] = coid
+            while len(self._proven_ours) > 20_000:
+                self._proven_ours.pop(next(iter(self._proven_ours)))
+            if oid in self._parked:
+                self._release_parked(oid, coid, "lookup")
+        elif verdict == "foreign":
+            self._proven_foreign.add(oid)
+            for ev, source in self._unpark(oid):
+                self._foreign_order_event(ev, source)
+        elif oid in self._parked and not self._stopping and self.venue is not None:
+            # not found yet (a slow shard / read lag) or the read failed: look again while parked
+            self._lookups.add(oid)
+            self._spawn(self._lookup_order(oid, self.cfg.venue.unknown_order_lookup_retry_s), "order_lookup")
+
+    def _unpark(self, oid: str) -> list[tuple[Any, str]]:
+        evs = self._parked.pop(oid, [])
+        self._parked_since.pop(oid, None)
+        self._parked_n -= len(evs)
+        for ev, _ in evs:
+            if isinstance(ev, KalshiFill):
+                self._parked_ids.discard(f"{ev.trade_id}|{getattr(ev, 'fill_id', '')}")
+        self.metrics.set("dh_unknown_order_events_parked", float(self._parked_n))
+        return evs
+
+    def _release_parked(self, oid: str, coid: str, why: str) -> None:
+        evs = self._unpark(oid)
+        if evs:
+            self.metrics.inc("dh_unknown_order_events_released_total", float(len(evs)), why=why.split(":", 1)[0])
+            self._release.extend((ev, source, coid) for ev, source in evs)
+
+    def _flush_release(self, ts: int) -> None:
+        """Deliver released events right after the item that proved their order ours: re-stamped
+        at that item's time, with the order's client_order_id filled in, and RECORDED on
+        events.live (``_inject``). Replay drops the raw copy (unknown order id then, exactly as
+        live did) and delivers the recorded one (our prefix), so the release decision replays."""
+        while self._release:
+            batch, self._release = self._release, []
+            for ev, source, coid in batch:
+                t = max(ts, self.pump.last_ts)
+                ev = dataclasses.replace(ev, ts=t, client_order_id=coid or getattr(ev, "client_order_id", ""))
+                if isinstance(ev, KalshiFill) and self.fills_seen.seen(ev):
+                    self.metrics.inc("dh_duplicate_fills_dropped_total")
+                    continue
+                note_own_order(ev, self.known_oids)
+                if self.venue is not None:
+                    self.venue.observe(ev)
+                if isinstance(ev, KalshiFill) and source == "ws":
+                    te = int(ev.ts_exch or ev.ts)
+                    self._last_ws_fill_exch_ns = max(self._last_ws_fill_exch_ns, te)
+                    self._last_ws_fill_by_ticker[ev.ticker] = max(self._last_ws_fill_by_ticker.get(ev.ticker, 0), te)
+                self.jlog("order_event_released", t, type=type(ev).__name__, source=source, order_id=ev.order_id,
+                          client_order_id=ev.client_order_id, ticker=ev.ticker, trade_id=getattr(ev, "trade_id", ""))
+                self._pre_event(ev)
+                self._inject(ev)
+
+    def _park_expire(self, ts: int) -> None:
+        park_ns = int(self.cfg.venue.unknown_order_park_s * NS_PER_S)
+        for oid, since in list(self._parked_since.items()):
+            if ts - since >= park_ns:
+                self._park_timeout(oid, ts, f"unknown after {self.cfg.venue.unknown_order_park_s:g}s")
+
+    def _park_timeout(self, oid: str, ts: int, why: str) -> None:
+        self._unknown_dropped(self._unpark(oid), ts, why)
+
+    def _unknown_dropped(self, evs: list[tuple[Any, str]], ts: int, why: str) -> None:
+        """Parked events whose order could not be proven ours or foreign: dropped (counted, ERROR)
+        and treated as UNKNOWN: quoting pauses through the reconcile path (gate 'reconciling', the
+        strategy told kalshi.reconcile stale), fills / positions / resting orders are re-read, and a
+        position the fills cannot explain halts trading as any confirmed mismatch does."""
+        if not evs:
+            return
+        for ev, source in evs:
+            self.metrics.inc("dh_unknown_order_events_dropped_total", type=type(ev).__name__, source=source)
+            te = int(getattr(ev, "ts_exch", 0) or getattr(ev, "ts", 0) or ts)
+            self._unknown_since = min(self._unknown_since, te) if self._unknown_since else te
+            self._unknown_logged += 1
+            if self._unknown_logged <= 5 or self._unknown_logged % 100 == 0:
+                log.error("UNKNOWN %s of order %s (%s, %s): not proven ours or foreign (%s): dropped; quoting paused and "
+                          "fills / positions / orders reconciled (%d so far)", type(ev).__name__,
+                          getattr(ev, "order_id", "") or "?", getattr(ev, "ticker", ""), source, why, self._unknown_logged)
+            self.jlog("order_event_unknown_dropped", ts, type=type(ev).__name__, source=source, why=why,
+                      order_id=getattr(ev, "order_id", ""), ticker=getattr(ev, "ticker", ""),
+                      trade_id=getattr(ev, "trade_id", ""))
+        if self.mode != "live" or self.venue is None:
+            return
+        self._unk_gen += 1
+        self._recon_begin(UNKNOWN_ORDER_REASON, ts)
+        self._spawn(self._reconnect_reconcile(self._unk_gen, self._unknown_since or ts, reason=UNKNOWN_ORDER_REASON),
+                    "reconcile_unknown")
+
     def _on_event(self, ev: Event) -> None:
         live = self.mode == "live"
         if live and not own_order_ok(ev, self.own_id_prefix, self.known_oids):
-            self._foreign_order_event(ev, "ws" if not isinstance(ev, KalshiOrderUpdate) else "ws_or_venue")
+            self._unknown_order_event(ev, "ws" if not isinstance(ev, KalshiOrderUpdate) else "ws_or_venue", ev.ts)
             return
         if live:
-            note_own_order(ev, self.known_oids)
+            self._note_own(ev)
         if live and isinstance(ev, KalshiFill) and self.fills_seen.seen(ev):
             # delivered already (a REST back-fill beat the WS message, or a duplicate)
             self.metrics.inc("dh_duplicate_fills_dropped_total")
@@ -960,6 +1186,8 @@ class LiveRunner:
             self.push_side("hold_end")
         if self._market_pause_until:
             self._market_pause_expire(ts)
+        if self._parked:
+            self._park_expire(ts)
         mono_ns = int(self._mono() * NS_PER_S)
         if self.kill_file is not None and mono_ns >= self._next_kill_check:
             self._next_kill_check = mono_ns + int(self.cfg.loop.kill_check_interval_s * NS_PER_S)
@@ -1309,14 +1537,21 @@ class LiveRunner:
         self.jlog("reconcile", ts, action="end", reason=reason)
         self._inject(FeedStatus(ts, 0, RECONCILE_STREAM, "resynced", reason))
 
-    async def _reconnect_reconcile(self, gen: int, since_ns: int) -> None:
-        """After a reconnect: fills since the disconnect (minus a margin), positions and the
-        resting orders, in that order through the queue, then 'reconcile_done'."""
+    def _recon_gen_of(self, reason: str) -> int:
+        """Generation counter of a reconciliation: the unknown-order one has its own (a WS
+        disconnect during it must not orphan its 'reconcile_done')."""
+        return self._unk_gen if reason == UNKNOWN_ORDER_REASON else self._recon_gen
+
+    async def _reconnect_reconcile(self, gen: int, since_ns: int, *, reason: str = "ws_reconnect") -> None:
+        """After a reconnect (or an order that stayed unknown, ``reason`` 'unknown_order'): fills
+        since the disconnect (minus a margin), positions and the resting orders, in that order
+        through the queue, then 'reconcile_done'."""
         v = self.venue
         vc = self.cfg.venue
-        await asyncio.sleep(max(0.0, vc.reconnect_settle_s))
+        if reason == "ws_reconnect":
+            await asyncio.sleep(max(0.0, vc.reconnect_settle_s))
         attempt = 0
-        while not self._stopping and gen == self._recon_gen:
+        while not self._stopping and gen == self._recon_gen_of(reason):
             try:
                 t_fetch = self._clock()
                 rows = await v.fetch_fills(since_ns // NS_PER_S - int(vc.fills_backfill_margin_s))
@@ -1331,15 +1566,15 @@ class LiveRunner:
                           error=f"{type(exc).__name__}: {exc}"[:300])
                 await asyncio.sleep(min(vc.reconcile_retry_max_s, 0.5 * 2 ** min(attempt, 8)))
                 continue
-            if gen != self._recon_gen:
+            if gen != self._recon_gen_of(reason):
                 return
             self.jlog("reconcile_fetch", self._clock(), since_ns=since_ns, fills=len(rows), positions=len(pos),
-                      resting=len(resting))
-            self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": "reconnect",
+                      resting=len(resting), reason=reason)
+            self.push_side("fills", {"rows": rows, "fetched_ns": t_fetch, "why": "reconnect" if reason == "ws_reconnect" else reason,
                                      "since_ns": since_ns - int(vc.fills_backfill_margin_s) * NS_PER_S})
             self._push_positions(pos, as_of)
             self.push_side("resting_all", resting)
-            self.push_side("reconcile_done", {"gen": gen, "reason": "ws_reconnect", "round": 0})
+            self.push_side("reconcile_done", {"gen": gen, "reason": reason, "round": 0})
             return
 
     def _suspect_fills_since_s(self) -> int:
@@ -1349,6 +1584,8 @@ class LiveRunner:
         cands = [s[1] for s in self._pos_suspect.values()]
         if self._ws_down_since:
             cands.append(self._ws_down_since)
+        if self._unknown_since:
+            cands.append(self._unknown_since)
         t = min(cands) if cands else self._clock()
         vc = self.cfg.venue
         return t // NS_PER_S - int(vc.fills_backfill_margin_s + max(0.0, vc.positions_interval_s))
@@ -1381,10 +1618,10 @@ class LiveRunner:
                                  "why": "position_check"})
         return pos, as_of
 
-    async def _confirm_positions(self, gen: int, rnd: int) -> None:
+    async def _confirm_positions(self, gen: int, rnd: int, reason: str = "ws_reconnect") -> None:
         await asyncio.sleep(max(0.0, self.cfg.venue.position_confirm_s))
         attempt = 0
-        while not self._stopping and gen == self._recon_gen:
+        while not self._stopping and gen == self._recon_gen_of(reason):
             try:
                 pos, as_of = await self._fills_then_positions()
             except asyncio.CancelledError:
@@ -1395,18 +1632,25 @@ class LiveRunner:
                 await asyncio.sleep(min(self.cfg.venue.reconcile_retry_max_s, 0.5 * 2 ** min(attempt, 8)))
                 continue
             self._push_positions(pos, as_of)
-            self.push_side("reconcile_done", {"gen": gen, "reason": "ws_reconnect", "round": rnd})
+            self.push_side("reconcile_done", {"gen": gen, "reason": reason, "round": rnd})
             return
 
     def _on_reconcile_done(self, ts: int, d: dict[str, Any]) -> None:
-        if d.get("gen") != self._recon_gen:
-            return  # superseded by a newer disconnect
-        if self._pos_suspect and int(d.get("round", 0)) < 3:
-            # a position still differs: confirm (-> mismatch -> Halt) or clear before quoting
-            self._spawn(self._confirm_positions(self._recon_gen, int(d.get("round", 0)) + 1), "confirm_positions")
+        reason = str(d.get("reason", "ws_reconnect"))
+        gen = self._recon_gen_of(reason)
+        if d.get("gen") != gen:
+            return  # superseded by a newer disconnect / unknown order
+        # a position still differs (or, for an unknown order, events are still parked): confirm
+        # (-> mismatch -> Halt) or clear before quoting
+        pending = bool(self._pos_suspect) or (reason == UNKNOWN_ORDER_REASON and bool(self._parked))
+        if pending and int(d.get("round", 0)) < 3:
+            self._spawn(self._confirm_positions(gen, int(d.get("round", 0)) + 1, reason), "confirm_positions")
             return
-        self._ws_down_since = 0
-        self._recon_end(str(d.get("reason", "ws_reconnect")), ts)
+        if reason == UNKNOWN_ORDER_REASON:
+            self._unknown_since = 0
+        else:
+            self._ws_down_since = 0
+        self._recon_end(reason, ts)
 
     # ================================================================== exchange pauses / collateral
     def verify_live(self, check: str, ok: bool, /, **info: Any) -> None:
@@ -1719,6 +1963,8 @@ class LiveRunner:
             self._ingest_queue_positions(item.ts, list(item.payload or ()))
         elif k == "reconcile_done":
             self._on_reconcile_done(item.ts, dict(item.payload or {}))
+        elif k == "order_lookup":
+            self._on_order_lookup(item.ts, dict(item.payload or {}))
         elif k == "hold":
             self._start_hold(item.ts, int(item.payload["until"]), str(item.payload.get("why", "")))
         elif k == "hold_end":
@@ -1825,6 +2071,10 @@ class LiveRunner:
         cands = {t for t in set(exch) | ours_nonzero
                  if t in self.universe and self.universe[t].close_ts > ts and t not in settled}
         confirm_ns = int(self.cfg.venue.position_confirm_s * NS_PER_S)
+        # review NEW-1: a market with a parked fill / update (order id not proven yet) never
+        # confirms: the event is released, or dropped as unknown (which reconciles), within
+        # venue.unknown_order_park_s, then the normal confirmation applies
+        parked = {str(getattr(ev, "ticker", "")) for evs in self._parked.values() for ev, _ in evs} if self._parked else set()
         for t in sorted(cands):
             ex, ours = int(exch.get(t, 0)), self._position_of(t)
             if ex == ours:
@@ -1843,6 +2093,9 @@ class LiveRunner:
                 self._positions_now.set()  # confirm soon (fills first, then positions)
             elif ts - s[1] >= confirm_ns and (partial or not self._fills_cover(s[1])):
                 self._positions_now.set()  # old enough, but not yet checked against a fills read
+            elif ts - s[1] >= confirm_ns and t in parked:
+                self.metrics.inc("dh_position_confirm_parked_total")
+                self.jlog("position_confirm_parked", ts, ticker=t, exchange=ex, ours=ours, first_seen_ns=s[1])
             elif ts - s[1] >= confirm_ns and self._defer_confirm(t, s[1], as_of_ns, ts):
                 # Kalshi's portfolio data predates the last WebSocket fill OF THIS MARKET: the
                 # snapshot may simply not include it yet -> read again soon instead of halting
@@ -2000,13 +2253,14 @@ class LiveRunner:
                 continue
             ev = dataclasses.replace(ev, trade_id=tid or fid, fill_id=fid, subaccount=self.subaccount)
             if self.mode == "live" and not own_order_ok(ev, self.own_id_prefix, self.known_oids):
-                # a REST fill names no client_order_id: only fills of order ids we know are ours
+                # a REST fill names no client_order_id: a fill of an order id not known yet is parked
+                # and its order looked up (review NEW-1), never dropped as foreign unless proven
                 if ev.ts_exch and ev.ts_exch < self.started_ns:  # an earlier session's fill (restart)
                     self.metrics.inc("dh_fills_before_session_skipped_total")
                     continue
-                self._foreign_order_event(ev, "rest")
+                self._unknown_order_event(ev, "rest", ts)
                 continue
-            note_own_order(ev, self.known_oids)
+            self._note_own(ev)
             self.jlog("fill_backfilled", ts, ticker=ev.ticker, trade_id=ev.trade_id, order_id=ev.order_id, qty=ev.qty)
             self._pre_event(ev)
             self._inject(ev)
@@ -2476,7 +2730,8 @@ class LiveRunner:
                 runner = (os.getpid(), self.session_id)
             try:
                 p = watchdog_beat_problem(reader(), now_ns=now, subaccount=self.subaccount,
-                                          max_age_s=wc.runner_max_age_s, runner=runner)
+                                          max_age_s=wc.runner_max_age_s, runner=runner,
+                                          api_max_age_s=wc.api_max_age_s, max_future_s=wc.max_future_s)
             except Exception as exc:  # noqa: BLE001 - an unreadable beat vouches for nothing
                 p = f"watchdog beat unreadable ({type(exc).__name__}: {exc})"[:200]
             if p != last:
@@ -2846,6 +3101,10 @@ class LiveRunner:
                 await asyncio.wait_for(asyncio.shield(self._consumer_task), timeout=tmo / 2)
             except Exception:  # noqa: BLE001 - includes TimeoutError
                 self._consumer_task.cancel()
+        if self._parked:  # review NEW-1: never silently: the next session re-reads positions at start
+            log.error("shutdown with %d own-activity event(s) of %d unknown order(s) still parked: %s", self._parked_n,
+                      len(self._parked), sorted(self._parked)[:10])
+            self.jlog("order_events_parked_at_shutdown", ts, orders=sorted(self._parked)[:50], n=self._parked_n)
         self.persist_risk_state(self._clock(), fsync=True)
         # 2. live: finish in-flight writes, cancel everything, verify, delete the group
         cancel_ok = True
@@ -2966,7 +3225,7 @@ def _action_fields(a: Action) -> dict[str, Any]:
 
 
 __all__ = ["CLOCK_SOURCES", "DARWIN_CLOCK_SOURCES", "DISK_REASON", "LAG_STREAM", "MARKET_PAUSE_REASON", "META_STREAM",
-           "PAPER_STREAM", "PAUSE_STREAM_REASON", "RECONCILE_STREAM", "RESULT_STREAM", "WATCHDOG_REASON", "LagMeter",
+           "PAPER_STREAM", "PAUSE_STREAM_REASON", "RECONCILE_STREAM", "RESULT_STREAM", "UNKNOWN_ORDER_REASON", "WATCHDOG_REASON", "LagMeter",
            "LiveRunner", "OrderGate", "Result", "SeenIds", "Side", "Timer", "Wake", "effective_fee", "is_pause_reject",
-           "note_own_order", "own_event_ok", "own_order_ok", "own_series_ok", "own_subaccount_ok", "pause_reject_scope",
+           "note_own_order", "order_row_owner", "own_event_ok", "own_order_ok", "own_series_ok", "own_subaccount_ok", "pause_reject_scope",
            "trusted_clock_sources"]

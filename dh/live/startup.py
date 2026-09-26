@@ -100,9 +100,11 @@ async def verify_key_restriction(rest: Any, key_id: str, subaccount: int,
 
     POSITIVE proof (review M1): a read-only probe the restricted key must be REFUSED,
     ``GET /portfolio/balance?subaccount=0`` (another subaccount's balance; Kalshi: naming any
-    other subaccount is rejected for a restricted key), must answer HTTP 401 or 403. A 2xx
-    (the key can read subaccount 0: unrestricted) refuses the start; any other failure
-    (5xx, 429, network) proves nothing and refuses too (retry the start later).
+    other subaccount is rejected for a restricted key), must answer HTTP 403 (a scope refusal).
+    A 2xx (the key can read subaccount 0: unrestricted) refuses the start; a 401 is an
+    AUTHENTICATION failure (key rejected, signature / clock wrong), not a scope refusal, and
+    refuses too ("key rejected, not proven restricted", review NEW-6); any other failure (5xx,
+    429, network) proves nothing and refuses too (retry the start later).
     Secondary evidence, never a substitute: GET /api_keys, when it lists the key, must show it
     restricted to ``subaccount`` (a listed unrestricted key or another subaccount refuses);
     GET /api_keys failing is expected for a restricted key and only noted. The balance bodies'
@@ -134,10 +136,14 @@ async def verify_key_restriction(rest: Any, key_id: str, subaccount: int,
     try:
         await rest.get_balance(subaccount=PROBE_SUBACCOUNT)
     except KalshiHTTPError as exc:
-        if exc.status in (401, 403):
-            return True, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} refused with HTTP {exc.status} (the key "
+        if exc.status == 403:
+            return True, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} refused with HTTP 403 (the key "
                           f"cannot read another subaccount); " + "; ".join(notes))
-        return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} failed with HTTP {exc.status}, not 401/403: "
+        if exc.status == 401:
+            return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} answered HTTP 401: key rejected, not "
+                           f"proven restricted (an authentication failure is not a scope refusal: check the key, its "
+                           f"signature and the clock, then retry); " + "; ".join(notes))
+        return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} failed with HTTP {exc.status}, not 403: "
                        f"no proof the key is restricted (retry the start); " + "; ".join(notes))
     except Exception as exc:  # noqa: BLE001 - network / transport: no proof
         return False, (f"GET /portfolio/balance?subaccount={PROBE_SUBACCOUNT} failed ({type(exc).__name__}): no proof the "

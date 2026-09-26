@@ -683,8 +683,10 @@ def test_ws_fill_probe_settles_the_subaccount_field_once():
     p("kalshi.ws", 1, b'{"type":"orderbook_delta","sid":1,"seq":1,"msg":{}}')
     p("kalshi.ws", 2, orjson.dumps({"type": "fill", "sid": 9, "msg": {"trade_id": "t", "exchange_index": 2}}))
     p("kalshi.ws", 3, orjson.dumps({"type": "fill", "sid": 9, "msg": {"trade_id": "u", "subaccount": 1}}))
-    assert len(written) == 3 and len(seen) == 1
+    assert len(written) == 3 and len(seen) == 2
     assert seen[0][0] == "ws_fill_subaccount_field" and seen[0][1] is True and seen[0][2]["present"] is False
+    # review NEW-1: whether WS fills carry client_order_id (optional in the asyncapi) is recorded too
+    assert seen[1][0] == "ws_fill_client_order_id" and seen[1][1] is False
     # a full-account key: only a fill of OUR order (client_order_id prefix) settles it
     seen.clear()
     q = WsFillProbe(lambda s, t, d: None, R(), 1, False, "dhm1-abc")

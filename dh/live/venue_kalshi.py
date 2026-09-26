@@ -429,14 +429,31 @@ class KalshiVenue:
         return len(self._tasks)
 
     async def wait_idle(self, timeout_s: float) -> bool:
-        """Wait until every in-flight request task finished (True) or the timeout (False)."""
+        """Wait until every in-flight request task finished (True) or the timeout (False). The
+        calling task itself is never waited for (review NEW-5: a kill running INSIDE a venue task
+        would otherwise wait the full timeout on itself)."""
+        me = asyncio.current_task()
         deadline = self._mono() + timeout_s
-        while self._tasks:
+        while True:
+            pending = {t for t in self._tasks if t is not me}
+            if not pending:
+                return True
             left = deadline - self._mono()
             if left <= 0:
                 return False
-            await asyncio.wait(set(self._tasks), timeout=left)
-        return True
+            await asyncio.wait(pending, timeout=left)
+
+    def _cancel_and_track(self, acts: Sequence[CancelOrder]) -> set[asyncio.Task[Any]]:
+        """``cancel_orders`` returning the request tasks it started (a scoped cancel-all round
+        waits for its own cancels only, never for itself or unrelated requests)."""
+        before = set(self._tasks)
+        self.cancel_orders(acts)
+        return set(self._tasks) - before
+
+    async def _wait_tasks(self, tasks: set[asyncio.Task[Any]], timeout_s: float) -> None:
+        tasks = {t for t in tasks if t is not asyncio.current_task() and not t.done()}
+        if tasks and timeout_s > 0:
+            await asyncio.wait(tasks, timeout=timeout_s)
 
     async def close(self) -> None:
         """Stop background work (in-flight requests are awaited by the runner first)."""
@@ -742,7 +759,13 @@ class KalshiVenue:
         """Shared-account cancel-all: GET /portfolio/orders?status=resting&subaccount=<ours> and a
         batch cancel BY ID (every item names our subaccount and the order's own shard), repeated
         until the list is empty or after ``rounds`` (venue.cancel_rounds). Returns the orders
-        still resting ([] = confirmed clean). Raises when the list cannot be read."""
+        still resting ([] = confirmed clean). Raises when the list cannot be read.
+
+        Each round waits (at most ``wait_s``) for ITS OWN cancel requests only (review NEW-5: run
+        inside a venue task, as on the kill / halt paths, waiting for every venue task included
+        itself and always took the full ``wait_s``). A create still in flight lands on the next
+        round's list; the order-group trigger (``latch_kill``, first on every terminal path)
+        rejects it on arrival; shutdown waits for in-flight requests before its own pass."""
         n_rounds = max(1, int(self.cfg.cancel_rounds if rounds is None else rounds))
         self.stats.bump("cancel_all_scoped")
         for rnd in range(n_rounds):
@@ -751,9 +774,10 @@ class KalshiVenue:
                 self._log("cancel_all", reason=reason, scoped=True, rounds=rnd)
                 return []
             self._log("cancel_all_round", reason=reason, scoped=True, n=len(left), round=rnd + 1)
-            self.cancel_orders([CancelOrder(str(o.get("client_order_id") or ""), str(o.get("ticker") or ""),
-                                            str(o["order_id"]), reason=f"cancel_all:{reason}") for o in left if o.get("order_id")])
-            await self.wait_idle(wait_s)
+            mine = self._cancel_and_track([CancelOrder(str(o.get("client_order_id") or ""), str(o.get("ticker") or ""),
+                                                       str(o["order_id"]), reason=f"cancel_all:{reason}")
+                                           for o in left if o.get("order_id")])
+            await self._wait_tasks(mine, wait_s)
             await self._sleep(0.5 * (rnd + 1))
         left = await self.resting_orders()
         if left:
@@ -820,9 +844,10 @@ class KalshiVenue:
             if not left:
                 return []
             self._log("cancel_all_leftovers", reason=reason, n=len(left), attempt=attempt + 1)
-            self.cancel_orders([CancelOrder(str(o.get("client_order_id") or ""), str(o.get("ticker") or ""),
-                                            str(o["order_id"]), reason=f"verify:{reason}") for o in left if o.get("order_id")])
-            await self.wait_idle(wait_s)
+            mine = self._cancel_and_track([CancelOrder(str(o.get("client_order_id") or ""), str(o.get("ticker") or ""),
+                                                       str(o["order_id"]), reason=f"verify:{reason}")
+                                           for o in left if o.get("order_id")])
+            await self._wait_tasks(mine, wait_s)
             await self._sleep(0.5 * (attempt + 1))
         return await self.resting_orders()
 
@@ -1222,6 +1247,23 @@ class KalshiVenue:
         if ev.status == "resting" and ev.order_id:
             self.check_order(ev.client_order_id or a.client_order_id, ev.order_id, a.ticker, recancel=True, reason="revived")
             self.cancel_orders([CancelOrder(ev.client_order_id or a.client_order_id, a.ticker, ev.order_id, reason="revived")])
+
+    async def lookup_order(self, oid: str) -> dict[str, Any] | None:
+        """Read-only GET /portfolio/orders/{oid} (review NEW-1: who owns an order a fill names?).
+        The endpoint takes no subaccount parameter: the ROW's ``subaccount_number`` is checked by
+        the caller (a key restricted to our subaccount cannot see another subaccount's orders).
+        Returns the Order row, None on 404; raises on anything else."""
+        try:
+            body = await self.rest.get_order(oid)
+        except KalshiHTTPError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        o = body.get("order") if isinstance(body, dict) else None
+        if not isinstance(o, dict):
+            raise ValueError(f"GET /portfolio/orders/{oid}: no order object")
+        self._learn_rows([o])
+        return o
 
     def _ours(self, ev: KalshiOrderUpdate) -> KalshiOrderUpdate:
         """Venue lookups only ever return our own subaccount's orders: stamp it (the REST

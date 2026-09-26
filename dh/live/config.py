@@ -145,7 +145,8 @@ class VenueCfg:
     # The API key(s) are restricted to ``subaccount`` (Kalshi scopes the private WebSocket
     # channels server-side): a fill / user_order / market_position without a subaccount field is
     # this subaccount's. Proven at live start-up: GET /portfolio/balance?subaccount=0 must be
-    # REFUSED (401/403) with the runner key (GET /api_keys is secondary evidence).
+    # REFUSED with HTTP 403 with the runner key (401 = key rejected: refused, not proof; GET
+    # /api_keys is secondary evidence).
     key_restricted_to_subaccount: bool = False
     # The only way to trade the PRIMARY account (subaccount 0): an explicit opt-in, and only on
     # an account shared with nobody (shared_account: false).
@@ -190,6 +191,19 @@ class VenueCfg:
     fills_backfill_margin_s: float = 120.0  # look-back overlap of every fill back-fill
     fills_backfill_min_age_s: float = 10.0  # periodic pass: leave younger fills to the WebSocket
     reconnect_settle_s: float = 2.0  # after a WS reconnect, let subscriptions settle, then reconcile
+    # Own-order filter (review NEW-1): a fill / order update WITHOUT client_order_id whose order id
+    # is not known yet (it beat the create response, or its create is being reconciled; REST fills
+    # never carry the client id) is PARKED, never dropped: released to the strategy as soon as the
+    # order id is known (create ack, reconciliation, or GET /portfolio/orders/{id} showing our
+    # client_order_id prefix on our subaccount, looked up after unknown_order_lookup_delay_s and
+    # every unknown_order_lookup_retry_s). Proven foreign (another client id / subaccount):
+    # dropped with an ERROR. Still unknown after unknown_order_park_s (or the buffer is full):
+    # dropped with an ERROR and quoting paused through the reconcile path (fills, positions, orders
+    # re-read) instead of silently dropping.
+    unknown_order_park_s: float = 10.0
+    unknown_order_lookup_delay_s: float = 1.0
+    unknown_order_lookup_retry_s: float = 2.0
+    unknown_order_park_max: int = 1000  # parked events (all orders); more -> the oldest order times out
     reconcile_retry_max_s: float = 30.0
     startup_cancel_all: bool = True  # clean slate: cancel leftover resting orders at start (live: required)
     # Kalshi may cancel orders placed within 1 min of a BULK cancel-all (DELETE /portfolio/events/
@@ -298,6 +312,19 @@ class WatchdogCfg:
     # this, and blocks new orders (gate 'watchdog', quotes pulled) while the beat is older, names
     # another subaccount, or (after this long in 'running') is not armed on this runner
     runner_max_age_s: float = 10.0
+    # CAPABILITY, not just liveness (review NEW-2): the watchdog proves its own key reaches the API
+    # with a read-only authenticated probe (GET /portfolio/orders?subaccount=<n>&status=resting&
+    # limit=1) at start and every api_probe_interval_s (each attempt bounded by
+    # api_probe_timeout_s); its beat carries api_ok + the last success time. The LIVE RUNNER treats
+    # api_ok false / missing, or a last success older than api_max_age_s, as "not protecting"
+    # (start refused, gate 'watchdog' closed)
+    api_probe_interval_s: float = 60.0
+    api_probe_timeout_s: float = 10.0
+    api_max_age_s: float = 180.0
+    # a beat / heartbeat stamped more than this in the FUTURE is not fresh (review NEW-3): the
+    # runner does not trust such a watchdog beat, and the watchdog treats such a runner heartbeat
+    # like a stale one (it fires)
+    max_future_s: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -435,11 +462,22 @@ def live_config_problems(cfg: LiveConfig) -> list[str]:
         out.append("venue.exchange_status_interval_s must be > 0 in live mode (trading pauses must be detected)")
     if v.balance_interval_s <= 0:
         out.append("venue.balance_interval_s must be > 0 in live mode (the shard balance must be re-checked)")
+    if v.unknown_order_park_s <= 0 or v.unknown_order_park_max < 1 or v.unknown_order_lookup_retry_s <= 0 \
+            or not 0 <= v.unknown_order_lookup_delay_s < v.unknown_order_park_s:
+        out.append("venue.unknown_order_park_s / unknown_order_lookup_retry_s must be > 0, unknown_order_park_max >= 1 "
+                   "and 0 <= unknown_order_lookup_delay_s < unknown_order_park_s (fills of not-yet-known orders are "
+                   "parked, looked up, then released or reconciled)")
     if v.balance_max_failures < 1 or v.exchange_status_max_failures < 1:
         out.append("venue.balance_max_failures and venue.exchange_status_max_failures must be >= 1")
     if cfg.watchdog.runner_max_age_s <= 0:
         out.append("watchdog.runner_max_age_s must be > 0 in live mode (the runner trades only while the watchdog is "
                    "alive)")
+    w = cfg.watchdog
+    if w.api_probe_interval_s <= 0 or w.api_probe_timeout_s <= 0 or w.api_max_age_s <= w.api_probe_interval_s:
+        out.append("watchdog: api_probe_interval_s and api_probe_timeout_s must be > 0 and api_max_age_s > "
+                   "api_probe_interval_s in live mode (the watchdog must keep proving its key can cancel)")
+    if not 0 < w.max_future_s <= 10:
+        out.append("watchdog.max_future_s must be in (0, 10] s (a future-stamped beat is never fresh)")
     d = cfg.disk
     if d.check_interval_s <= 0 or d.min_free_gb_gate <= 0 or d.min_free_gb_start < d.min_free_gb_gate:
         out.append("disk: check_interval_s and min_free_gb_gate must be > 0 and min_free_gb_start >= min_free_gb_gate "
