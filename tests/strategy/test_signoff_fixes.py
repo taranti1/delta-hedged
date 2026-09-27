@@ -81,3 +81,25 @@ def test_only_one_opportunity_cost_eviction_until_cancel_ack():
     big = candidate("b", px=4000, size=2, ev_rate=.01, score=.01)
     canceled, placed = cycle(T0 + 4 * NS_PER_S, big)
     assert canceled == ["old2"] and not placed
+
+
+def test_undefined_settlement_window_is_worst_case_risk_not_a_crash():
+    # An expired, not yet settled market with a position whose window prints are gone (or a
+    # benchmark outage over the whole window): window_state raises "every observation was
+    # skipped". Risk must treat the outcome as unknown (full price range), never stop the cycle.
+    d = _driver_with_stale_inflight_order()
+    mm = d.mm
+
+    def undefined(*_a, **_k):
+        raise ValueError("every observation was skipped; settlement undefined")
+
+    ws = mm._risk_window(mm.specs[TICK], T0)
+    assert ws is not None
+    mm.tracker.window_state = undefined
+    assert mm._risk_window(mm.specs[TICK], T0) is None
+    assert mm.stats.reasons.get("risk_window_undefined", 0) >= 1
+    groups = mm._risk_groups(T0, 84000.0, [])
+    g = next(g for g in groups.values() if TICK in g["specs"])
+    assert g["ws"] is None
+    # 4 contracts bought at 99c: the unknown outcome can cost the whole premium
+    assert mm._group_loss(g) >= 3.9

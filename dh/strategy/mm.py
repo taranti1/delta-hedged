@@ -891,7 +891,7 @@ class MarketMaker:
             key = self._settlement_key(spec)
             if key not in groups:
                 groups[key] = {"specs": {}, "positions": {}, "basis": {}, "working": [], "admitted": [],
-                               "spot": spot, "ws": self.tracker.window_state(spec.settlement, spec.expiration_ts, now)}
+                               "spot": spot, "ws": self._risk_window(spec, now)}
             g = groups[key]
             g["specs"][t] = spec
             g["positions"][t] = self._contracts(t)
@@ -902,15 +902,29 @@ class MarketMaker:
                 groups[self._settlement_key(spec)]["working"].append(w)
         return groups
 
+    def _risk_window(self, spec, now):
+        """Settlement window for risk; None when it cannot be reconstructed (every observation
+        skipped, e.g. an expired unsettled market whose prints are gone or a benchmark outage
+        over the whole window). Risk then treats the outcome as unknown instead of crashing."""
+        try:
+            return self.tracker.window_state(spec.settlement, spec.expiration_ts, now)
+        except ValueError:
+            self.stats.bump("risk_window_undefined")
+            return None
+
     def _group_loss(self, group, extra=(), exclude=frozenset()):
         ws = group["ws"]
         working = [(w.ticker, w.book_side, w.worst_case_px / PX_SCALE,
                     w.could_fill_qty / QTY_SCALE)
                    for w in group["working"] if w.client_order_id not in exclude]
+        if ws is None:  # outcome unknown: any settlement average, i.e. the full price range
+            n_obs, sum_fixed, m_remaining, stress = 1, 0.0, 1, max(1.0, self.cfg.risk.stress_move_frac)
+        else:
+            n_obs, sum_fixed, m_remaining = ws.n_obs, ws.sum_fixed, ws.m_remaining
+            stress = self.cfg.risk.stress_move_frac
         return worst_case_loss_with_orders(
             group["specs"], group["positions"], group["basis"], working + group["admitted"] + list(extra),
-            group["spot"], stress_frac=self.cfg.risk.stress_move_frac, n_obs=ws.n_obs,
-            sum_fixed=ws.sum_fixed, m_remaining=ws.m_remaining)
+            group["spot"], stress_frac=stress, n_obs=n_obs, sum_fixed=sum_fixed, m_remaining=m_remaining)
 
     def _reserved_collateral(self) -> float:
         """Conservative funding bound, independent of scenario/risk netting.
