@@ -606,9 +606,9 @@ def build_paper_sim(cfg: PaperCfg, specs: Iterable[MarketSpec], fee_engine: Any)
 
     if cfg.sigma > 0:
         lat = LatencyModel(cfg.seed, submit=LogNormal(cfg.submit_ms, cfg.sigma), response=LogNormal(cfg.response_ms, cfg.sigma),
-                           ws=LogNormal(cfg.ws_ms, cfg.sigma), md=0.0)
+                           ws=LogNormal(cfg.ws_ms, cfg.sigma), md=cfg.md_ms)
     else:
-        lat = LatencyModel.fixed(cfg.submit_ms, cfg.response_ms, cfg.ws_ms, seed=cfg.seed)
+        lat = LatencyModel.fixed(cfg.submit_ms, cfg.response_ms, cfg.ws_ms, md_ms=cfg.md_ms, seed=cfg.seed)
     specs = list(specs)
     fees = PaperFees(fee_engine)
     fees.add_specs(specs)

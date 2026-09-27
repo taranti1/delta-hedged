@@ -8,7 +8,7 @@ CLI:  python scripts/run_experiment.py flow --root data --t0 A --t1 B [--flow-sp
 
 Inputs (all causal):
   trades    public prints from kalshi.ws `trade` frames received in [t0, t1), stamped with the
-            exchange time; prints where WE were the taker (trade_id of one of our private `fill`
+            exchange time for sweep identity and receive time for causal features/exposure; prints where WE were the taker (trade_id of one of our private `fill`
             messages with is_taker) are removed -- they are not external flow. Prints that filled
             our resting orders stay: that flow arrived from other participants.
   markets   the window's markets with a spec that EXPIRED in (t0, t1] (fully observed); exposure
@@ -21,13 +21,15 @@ expiration (<= t1): use it only for replays that start after it (run_replay warn
 ``meta.provenance`` records the fitting window (UTC), the dataset (recording root, window and a
 content hash of the fitting sample) and the fit method (dh.research.calibrate_flow).
 ``flow_segments_train.json`` is the training-period fit that the in-sample / out-of-sample table
-grades (chronological split by expiration, or walk-forward by day). Limitation: recorder
-downtime inside the window is counted as exposure without trades (rates biased low); check the
-recorder's session records before fitting across outages.
+grades (chronological split by expiration, or walk-forward by day). Exposure and trades
+are restricted to observed valid-book intervals, fresh public frames (5 s), and fresh BRTI
+(3 s). These fits still use proxy moneyness and cannot be bound to production models.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +41,8 @@ from dh.kalshi.normalize import ws_message_to_events
 from dh.research.calibrate_flow import FlowSplit, calibrate_split, walk_forward_by_day, write_split_report
 from dh.research.exp_common import fmt_ns
 from dh.research.replay_env import Universe, brti_ticks, build_universe, kalshi_ws_streams
-from dh.store.replay import iter_raw
+from dh.store.replay import Normalizers, iter_raw, list_streams
+from dh.research.flow_coverage import healthy_book_intervals, intersect, merge_intervals
 
 MS = 1_000_000
 
@@ -64,9 +67,9 @@ def recorded_trades(root: str | Path, t0: int, t1: int, own_taker_ids: set[str] 
             continue
         for e in evs:
             if isinstance(e, KalshiTrade) and not e.is_block and e.trade_id not in own:
-                rows.append({"ticker": e.ticker, "ts_ms": (e.ts_exch or e.ts) // MS, "yes_px": e.yes_px, "qty": e.qty,
+                rows.append({"ticker": e.ticker, "ts_ms": (e.ts_exch or e.ts) // MS, "ts_recv_ms": rec.t // MS, "yes_px": e.yes_px, "qty": e.qty,
                              "taker_side": e.taker_side, "trade_id": e.trade_id})
-    cols = ["ticker", "ts_ms", "yes_px", "qty", "taker_side", "trade_id"]
+    cols = ["ticker", "ts_ms", "ts_recv_ms", "yes_px", "qty", "taker_side", "trade_id"]
     return pd.DataFrame(rows, columns=cols).drop_duplicates("trade_id").reset_index(drop=True)
 
 
@@ -104,6 +107,15 @@ def flow_inputs(root: str | Path, t0: int, t1: int, *, universe: Universe | None
             recorded_btc(root, t0, t1, cache=uni.cache))
 
 
+def recorded_coverage(root: str | Path, t0: int, t1: int, btc: pd.DataFrame) -> dict:
+    streams = [s for s in list_streams(root) if s == "kalshi.ws" or s == "status" or s.startswith("events.")]
+    coverage = healthy_book_intervals(iter_raw(root, streams, t0, t1), Normalizers(), t0 // MS, t1 // MS)
+    # Reference source and arrival must both be fresh; a late historical tick is not current.
+    fresh = merge_intervals((int(r.close_ts_ms), min(int(r.close_ts_ms) + 3000, int(r.ts_ms) + 3000))
+                            for r in btc.itertuples())
+    return {k: intersect(v, fresh) for k, v in coverage.items()}
+
+
 def fit_flow(root: str | Path, t0: int, t1: int, out: str | Path, *, universe: Universe | None = None,
              train_frac: float = 0.7, walk_forward_days: int = 0, vol_ann: float = 0.40, min_orders: int = 30,
              prior_s: float = 1800.0) -> FlowSplit:
@@ -114,18 +126,25 @@ def fit_flow(root: str | Path, t0: int, t1: int, out: str | Path, *, universe: U
     if not len(markets) or not len(btc):
         raise SystemExit(f"flow: no fully observed markets ({len(markets)}) or no BRTI ticks ({len(btc)}) in "
                          f"{fmt_ns(t0)} .. {fmt_ns(t1)}")
-    kw = dict(vol_ann=vol_ann, min_orders=min_orders, prior_s=prior_s, btc_bar_ms=0)
+    coverage = recorded_coverage(root, t0, t1, btc)
+    if not any(coverage.values()):
+        raise SystemExit("flow: no verified healthy recording exposure (requires snapshots and fresh BRTI)")
+    kw = dict(vol_ann=vol_ann, min_orders=min_orders, prior_s=prior_s, btc_bar_ms=0,
+              coverage=coverage, max_price_age_ms=3000, grid_s=1)
     if walk_forward_days > 0:
         res = walk_forward_by_day(trades, markets, btc, min_train_days=walk_forward_days, **kw)
     else:
         res = calibrate_split(trades, markets, btc, train_frac=train_frac, **kw)
-    res.meta.update({"source": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "trades": len(trades),
+    coverage_hash = hashlib.sha256(json.dumps(coverage, sort_keys=True).encode()).hexdigest()
+    res.meta.update({"coverage_sha256": coverage_hash, "coverage": "valid snapshots + sequence/status health + WS age <=5s + BRTI age <=3s",
+                     "healthy_market_seconds": sum(b-a for v in coverage.values() for a,b in v) / 1000,
+                     "source": str(root), "window": f"{fmt_ns(t0)} .. {fmt_ns(t1)}", "trades": len(trades),
                      "markets_in_window": len(markets), "own_taker_prints_removed":
                      sum(1 for f in uni.own_fills.values() if f.is_taker)})
     src = f"recording {root} [{fmt_ns(t0)} .. {fmt_ns(t1)}]: kalshi.ws public prints + BRTI ticks"
     for prov in (res.provenance, res.provenance_all):
         if prov:
-            prov["dataset_id"] = f"{prov.get('dataset_id', '')} ({src})"
+            prov["dataset_id"] = f"{prov.get('dataset_id', '')} coverage-sha256:{coverage_hash} ({src})"
     write_split_report(res, out, title="Taker-flow calibration from a recording (time split)",
                        note=f"Window {fmt_ns(t0)} .. {fmt_ns(t1)}; {len(trades)} public prints, {len(markets)} fully "
                             "observed markets; BRTI ticks as the point-in-time reference.", synthetic=uni.synthetic)

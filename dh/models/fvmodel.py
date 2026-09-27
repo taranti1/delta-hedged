@@ -17,9 +17,10 @@ Everything is deterministic and driven only by the timestamps passed in.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from dh.core.market import MarketSpec
@@ -77,6 +78,8 @@ class FairValueModel:
     def __init__(self, vol: VolForecaster, tails: TailSchedule | None = None) -> None:
         self.vol = vol
         self.tails = tails or TailSchedule(kind="gauss")
+        self.artifact_hash: str | None = None
+        self.fitted_to_utc = None
 
     # ------------------------------------------------------------------ config
     @classmethod
@@ -101,7 +104,17 @@ class FairValueModel:
         else:
             knots = tuple(sorted((float(h), float(p["nu"]), float(p.get("scale", 1.0))) for h, p in t["by_horizon_s"].items()))
             tails = TailSchedule(knots=knots, kind="student_t")
-        return cls(VolForecaster(vcfg, seasonal), tails)
+        model = cls(VolForecaster(vcfg, seasonal), tails)
+        model.artifact_hash = hashlib.sha256(json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        model.fitted_to_utc = cfg.get("data_end_utc")
+        return model
+
+    def effective_config(self) -> dict:
+        return {"vol": asdict(self.vol.cfg), "seasonal": asdict(self.vol.seasonal), "tail": asdict(self.tails)}
+
+    @property
+    def effective_hash(self) -> str:
+        return hashlib.sha256(json.dumps(self.effective_config(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     # ------------------------------------------------------------------ streaming
     def update(self, ts_ns: int, price: float) -> None:

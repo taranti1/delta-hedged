@@ -123,13 +123,32 @@ async def cmd_balance(lcfg: Any, rest: Any, out: Any = print, scfg: Any = None) 
     return 0 if bad == 0 else 1
 
 
-def cmd_ledger(log: str, data: str, out: Any = print) -> int:
-    from dh.live.replay import ledger_from_log, load_session, session_specs
+def cmd_ledger(log: str, data: str, out: Any = print, logs_dir: str = "", outcomes_root: str = "") -> int:
+    from dh.live.replay import ledger_from_logs, load_session, session_specs
 
-    info = load_session(_resolve(data), _session_of(log))
-    led = ledger_from_log(_resolve(log), session_specs(info))
-    # Ledger.summary() needs at least one fill (dh.backtest.ledger raises on an empty frame)
-    s = led.summary() if led.fills else {"fills": 0, "note": "no fills in this session"}
+    paths = [_resolve(log)] if not logs_dir else sorted(
+        p for p in _resolve(logs_dir).iterdir()
+        if p.name.startswith("paper-") and p.name.endswith((".jsonl", ".jsonl.gz", ".jsonl.zst")))
+    if not paths:
+        raise ValueError("no paper session logs found")
+    identities = [_session_of(str(p)) for p in paths]
+    if len(identities) != len(set(identities)):
+        raise ValueError("multiple compressed/uncompressed copies of the same session")
+    specs = {}
+    for path in paths:
+        info = load_session(_resolve(data), _session_of(str(path)))
+        if logs_dir and info.mode != "paper":
+            raise ValueError("lifetime --logs-dir audit accepts independent paper sessions only")
+        specs.update({s.ticker: s for s in session_specs(info)})
+    led = ledger_from_logs(paths, list(specs.values()))
+    if outcomes_root:
+        from dh.live.replay import add_downloaded_outcomes
+        add_downloaded_outcomes(led, _resolve(outcomes_root))
+    s = led.summary()
+    s["sessions"] = len(paths)
+    s["duration_basis"] = "sum of complete observed session spans"
+    if logs_dir:
+        s["accounting_basis"] = "independent paper portfolios; all fills joined to known later outcomes"
     out(json.dumps(s, indent=1, default=str))
     return 0
 
@@ -155,13 +174,12 @@ def cmd_replay(log: str, data: str, config: str, out: Any = print, extra_streams
 
 async def cmd_reconcile(log: str, lcfg: Any, rest: Any, out: Any = print) -> int:
     """Exchange fills vs the session log (count, contracts, fees per ticker)."""
-    from dh.live.replay import log_fill_is_new
+    from dh.live.replay import iter_log_records, log_fill_is_new
 
     ours: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     t0 = None
     seen: set[str] = set()
-    for line in _resolve(log).read_text().splitlines():
-        r = json.loads(line)
+    for r in iter_log_records(_resolve(log)):
         if t0 is None and r.get("k") == "session_start":
             t0 = int(r["t"])
         if r.get("k") == "log.fill" and log_fill_is_new(r, seen):
@@ -198,6 +216,9 @@ async def cmd_reconcile(log: str, lcfg: Any, rest: Any, out: Any = print) -> int
 
 def _session_of(log: str) -> str | None:
     stem = Path(log).name
+    for suffix in (".gz", ".zst"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
     return stem[: -len(".jsonl")] if stem.endswith(".jsonl") else None
 
 
@@ -209,15 +230,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--live-config", default="config/live.yaml")
     ap.add_argument("--config", default="config/m1.yaml", help="strategy config (replay)")
     ap.add_argument("--log", default="", help="session JSON log (data/live_logs/<session>.jsonl)")
+    ap.add_argument("--outcomes-root", default="", help="ledger: join known settlements from downloaded Kalshi history")
+    ap.add_argument("--logs-dir", default="", help="ledger: audit every paper session in this directory")
     ap.add_argument("--data", default="", help="session store (default: live config paths.data_root)")
     ap.add_argument("--streams", default="", help="replay: extra recorded event streams (comma list)")
     a = ap.parse_args(argv)
     lcfg = _live_cfg(a.live_config)
     data = a.data or lcfg.paths.data_root
-    if a.command in ("ledger", "replay", "reconcile") and not a.log:
+    if a.command in ("ledger", "replay", "reconcile") and not a.log and not (a.command == "ledger" and a.logs_dir):
         ap.error("--log is required")
     if a.command == "ledger":
-        return cmd_ledger(a.log, data)
+        return cmd_ledger(a.log, data, logs_dir=a.logs_dir, outcomes_root=a.outcomes_root)
     if a.command == "replay":
         return cmd_replay(a.log, data, a.config, extra_streams=tuple(x for x in a.streams.split(",") if x))
 

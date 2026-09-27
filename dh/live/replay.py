@@ -42,6 +42,7 @@ from dh.core.units import NS_PER_MS
 from dh.live.config import PaperCfg
 from dh.live.startup import build_paper_sim, spec_from_dict, warm_fv
 from dh.store.replay import iter_events, iter_raw
+from dh.store.textio import open_text
 
 REPLAY_STREAMS = ("kalshi.ws", "events.live")  # events.live is always merged last (see module docstring)
 
@@ -223,7 +224,9 @@ def replay_session(root: str | Path, scfg: Any, *, session: str | None = None, e
                      id_prefix=info.id_prefix)
     sim = fees = None
     if info.mode == "paper":
-        sim, fees = build_paper_sim(PaperCfg(**(info.paper or {})), info.specs, fee_engine)
+        paper = dict(info.paper or {})
+        paper.setdefault("md_ms", 0.0)  # legacy recordings really used zero public-data delay
+        sim, fees = build_paper_sim(PaperCfg(**paper), info.specs, fee_engine)
     wrapper = UniverseReplay(mm, info.changes, sim, fees, live=(info.mode == "live"), group_map=info.group_map,
                              subaccount=info.subaccount, key_restricted=info.key_restricted, series=info.series,
                              own_id_prefix=info.own_id_prefix)
@@ -246,8 +249,7 @@ def _norm(obj: Any) -> Any:
 def logged_decisions(log_path: str | Path, until_ts: int) -> tuple[list[Any], list[Any]]:
     """(actions, logs) the live strategy emitted, from the runner's JSON log."""
     acts, logs = [], []
-    for line in Path(log_path).read_text().splitlines():
-        r = json.loads(line)
+    for r in iter_log_records(log_path):
         if r.get("t", 0) > until_ts:
             continue
         if r["k"] == "action":
@@ -290,34 +292,153 @@ def log_fill_is_new(rec: dict[str, Any], seen: set[str]) -> bool:
     return True
 
 
-def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
-    """P&L attribution (dh.backtest.ledger.Ledger) straight from a session's JSON log, without
-    re-running the strategy: ``log.fill`` (our fills: paper = simulator, live = exchange),
-    ``log.fv`` (fair values for markouts) and ``log.settle`` (settlement prices). A ``log.fill``
-    whose trade id was already booked is skipped (``log_fill_is_new``; review L1).
+def iter_log_records(path: str | Path):
+    """Stream JSON records; corrupt/truncated lines fail visibly instead of hiding fills."""
+    with open_text(path) as stream:
+        for line in stream:
+            if line.strip():
+                yield orjson.loads(line)
 
-        info = load_session("data/live")
-        led = ledger_from_log("data/live_logs/<session>.jsonl", session_specs(info))
-        print(led.summary())   # net c/contract (event-clustered CI), markouts, $/day, ...
+
+def ledger_from_log(log_path: str | Path, specs: list[MarketSpec]) -> Any:
+    """Bounded-memory two-pass attribution of plain/gzip/zstd session logs."""
+    return ledger_from_logs([log_path], specs)
+
+
+def ledger_from_logs(log_paths: list[str | Path], specs: list[MarketSpec]) -> Any:
+    """Audit independent sessions together, joining later outcomes to earlier fills.
+
+    Session cash/marks in risk seeds are never treated as profit. All fills remain visible,
+    including unresolved inventory. Read each log twice and retain only fair values needed
+    at fills and markout horizons (memory grows with fills, not millions of FV records).
+    Exposure is summed full session duration, including quiet periods. This is an audit of
+    independent paper portfolios, not a claim that their positions were restored on restart.
     """
-    from dh.backtest.ledger import Ledger
+    import bisect
+    from collections import defaultdict
+
+    from dh.backtest.ledger import Ledger, MARKOUT_H_S
     from dh.core.actions import Log
     from dh.core.events import KalshiFill, Settlement
+    from dh.core.units import NS_PER_S
 
+    paths = [Path(p).resolve() for p in log_paths]
+    if len(paths) != len(set(paths)):
+        raise ValueError("a session log was supplied more than once")
     led = Ledger({s.ticker: s.event_ticker for s in specs}, {s.ticker: s.expiration_ts for s in specs})
-    seen: set[str] = set()
-    for line in Path(log_path).read_text().splitlines():
-        r = json.loads(line)
-        k, t = r.get("k", ""), int(r.get("t", 0))
-        if k == "log.fv":
-            led.on_log(t, Log("fv", {"ticker": r["ticker"], "F": r["F"], "delta": r.get("delta", 0.0)}))
-        elif k == "log.fill":
-            if not log_fill_is_new(r, seen):
+    duration = 0
+    bounds = []
+    missing_match_times = incomplete_sessions = 0
+    for path in paths:
+        seen: set[str] = set()  # paper simulator identifiers may repeat in a later session
+        first = last = None
+        complete = False
+        for r in iter_log_records(path):
+            k, t = r.get("k", ""), int(r.get("t", 0))
+            first = t if first is None else min(first, t)
+            last = t if last is None else max(last, t)
+            complete |= k == "session_end"
+            if k == "log.fill" and log_fill_is_new(r, seen):
+                missing_match_times += not bool(r.get("ts_exch"))
+                led.on_event(KalshiFill(t, int(r.get("ts_exch") or 0), r["ticker"],
+                                        str(r.get("trade_id") or ""), "", str(r.get("coid", "")),
+                                        r["side"], int(r["px"]), int(r["qty"]), bool(r.get("taker", False)),
+                                        int(r.get("fee", 0)), 0, False))
+                led.fills[-1].fv_key = f"{path}\0{r['ticker']}"
+            elif k == "log.settle":
+                px = int(r["px"])
+                previous = led.settle.get(r["ticker"])
+                if previous is not None and previous != px / 10_000:
+                    raise ValueError(f"conflicting settlement outcomes for {r['ticker']}")
+                led.on_event(Settlement(t, 0, r["ticker"], "yes" if px > 0 else "no", None, px))
+        if first is not None:
+            duration += max(0, last - first)
+            bounds.append((first, last))
+            incomplete_sessions += not complete
+    led.observation_duration_ns = duration
+    led.audit_notes.update({"sessions": len(paths), "incomplete_sessions": incomplete_sessions,
+                            "fills_without_exchange_timestamp": missing_match_times,
+                            "duration_basis": "sum of observed full-log session spans"})
+    if bounds:
+        led.first_ts = min(x[0] for x in bounds)
+        led.last_ts = max(x[1] for x in bounds)
+
+    targets = defaultdict(set)
+    for f in led.fills:
+        targets[f.fv_key].add(f.ts)
+        targets[f.fv_key].update(f.ts + int(h * NS_PER_S) for h in MARKOUT_H_S)
+    targets = {tk: sorted(ts) for tk, ts in targets.items()}
+    if not targets:
+        return led
+    selected = {}  # (session/ticker, target) -> latest observation at/before target
+
+    def retain(tk, target, previous):
+        if previous is None:
+            return
+        key = (tk, target)
+        if key not in selected or previous[0] > selected[key][0]:
+            selected[key] = previous
+
+    for path in paths:
+        prev, cursors = {}, defaultdict(int)
+        for r in iter_log_records(path):
+            tk = f"{path}\0{r.get('ticker')}"
+            if r.get("k") != "log.fv" or tk not in targets:
                 continue
-            led.on_event(KalshiFill(t, 0, r["ticker"], str(r.get("trade_id") or ""), "", str(r.get("coid", "")),
-                                    r["side"], int(r["px"]), int(r["qty"]), bool(r.get("taker", False)),
-                                    int(r.get("fee", 0)), 0, False))
-        elif k == "log.settle":
-            px = int(r["px"])
-            led.on_event(Settlement(t, 0, r["ticker"], "yes" if px > 0 else "no", None, px))
+            t = int(r["t"])
+            old = prev.get(tk)
+            if old is not None and t < old[0]:
+                raise ValueError(f"out-of-order fair values for {tk} in {path}")
+            ts, i = targets[tk], cursors[tk]
+            j = bisect.bisect_left(ts, t, lo=i)
+            for target in ts[i:j]:
+                retain(tk, target, old)
+            cursors[tk] = j
+            prev[tk] = (t, float(r["F"]), float(r.get("delta", 0.0)))
+        for tk, old in prev.items():
+            for target in targets[tk][cursors[tk]:]:
+                retain(tk, target, old)
+    kept = defaultdict(dict)
+    for (tk, _), value in selected.items():
+        kept[tk][value[0]] = value
+    for tk, observations in kept.items():
+        for t, F, delta in sorted(observations.values()):
+            led.on_log(t, Log("fv", {"ticker": tk, "F": F, "delta": delta}))
     return led
+
+
+def add_downloaded_outcomes(ledger: Any, root: str | Path) -> int:
+    """Join actual downloaded settlements, read-only, to a lifetime audit.
+
+    ``root`` is the history downloader's output directory (containing ``markets``).
+    Only explicit yes/no results with consistent payouts are accepted; conflicts fail
+    visibly. Missing files/results remain unresolved, never valued as zero profit.
+    """
+    import pyarrow.parquet as pq
+
+    from dh.core.units import PX_SCALE
+
+    wanted = {f.ticker for f in ledger.fills}
+    events = {ledger.event_of.get(t) or t.rsplit('-', 1)[0] for t in wanted}
+    found = {}
+    for event in sorted(events):
+        path = Path(root) / 'markets' / f"series={event.split('-', 1)[0]}" / f'{event}.parquet'
+        if not path.is_file():
+            continue
+        rows = pq.ParquetFile(path).read(columns=['ticker', 'result', 'settlement_px']).to_pylist()
+        for row in rows:
+            tk, result = row['ticker'], row['result']
+            if tk not in wanted or result not in ('yes', 'no'):
+                continue
+            px = PX_SCALE if result == 'yes' else 0
+            if row['settlement_px'] is not None and row['settlement_px'] != px:
+                raise ValueError(f'inconsistent downloaded settlement for {tk}')
+            payout = px / PX_SCALE
+            previous = found.get(tk, ledger.settle.get(tk))
+            if previous is not None and previous != payout:
+                raise ValueError(f'conflicting settlement outcomes for {tk}')
+            found[tk] = payout
+    added = sum(t not in ledger.settle for t in found)
+    ledger.settle.update(found)
+    ledger.audit_notes['downloaded_outcomes_added'] = added
+    return added

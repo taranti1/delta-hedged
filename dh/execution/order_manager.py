@@ -121,6 +121,26 @@ class WorkingOrder:
     cancel_sent_ns: int = 0  # when the (last) cancel was requested; 0 = never
 
 
+    @property
+    def could_fill_qty(self) -> int:
+        """Same conservative quantity as OrderManager.worst_case_exposure, per order."""
+        if self.state is OrderState.REJECTED:
+            return 0
+        quantity = self.inflight_fill_qty
+        if self.state in LIVE:
+            quantity += max(0, max(self.total_qty, self.pending_total_qty) - self.filled_qty)
+        elif self.unresolved:
+            quantity += max(0, self.total_qty - self.filled_qty)
+        return quantity
+
+    @property
+    def worst_case_px(self) -> int:
+        """Adverse old/new price while an amend may execute at either price."""
+        if self.pending_px:
+            return max(self.px, self.pending_px) if self.book_side == "bid" else min(self.px, self.pending_px)
+        return self.px
+
+
 @dataclass(slots=True)
 class _Order:
     coid: str

@@ -28,8 +28,10 @@ Decision (docs/BUILD_PLAN.md F, M1.1): keep a segment only if its maker net P&L 
 above 0.15c/contract (with >= 200 settlement events) under BOTH B and C; STOP if none. Bounds
 reported: per-segment 95 % CI and the simultaneous (Bonferroni over every examined segment of
 that policy) bound used with Holm. Everything here is in-sample descriptive statistics over the
-whole period; ``--split`` reports the same segments on the first and second half of the period
-(the second half is the confirmation sample).
+whole period. The chronological split selects on the first half and checks those same
+candidates in the second half. Neither establishes an untouched holdout or executable edge:
+all public-tape results remain exploratory, tradable=false, with explicit cost/provenance
+blockers. Current fee snapshots never establish historical fees before their fetch time.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ from dh.research.exp0_maker_pnl import (
     maker_fee_per_contract,
 )
 from dh.research.exp_common import cluster_mean_ci
+from dh.research.historical_fees import HistoricalFees
+from dh.research.evidence_manifest import input_manifest, manifest_matches
 
 SEC_YR = 365.0 * 24 * 3600
 PX_LABELS = [f"{a / 100:g}-{min(b, 10000) / 100:g}c" for a, b in zip(PRICE_BUCKETS[:-1], PRICE_BUCKETS[1:])]
@@ -97,7 +101,7 @@ def fee_types(root: Path) -> dict[str, tuple[str, float]]:
     for f in sorted((root / "series").glob("*.json")):
         s = json.loads(f.read_text())
         s = s.get("series", s)
-        out[str(s["ticker"])] = (str(s.get("fee_type") or ""), float(s.get("fee_multiplier") or 1.0))
+        out[str(s["ticker"])] = (str(s.get("fee_type") or ""), float(s.get("fee_multiplier") if s.get("fee_multiplier") is not None else 1.0))
     return out
 
 
@@ -136,9 +140,9 @@ def c_flags(t: pd.DataFrame, window_ms: int = 2000) -> np.ndarray:
 
 def event_cells(trades: pd.DataFrame, markets: pd.DataFrame, series: str, ftypes: dict, fe,
                 brti: tuple[np.ndarray, np.ndarray], vol: tuple[np.ndarray, np.ndarray],
-                c_window_ms: int = 2000) -> tuple[pd.DataFrame, dict]:
+                c_window_ms: int = 2000, fee_resolver: HistoricalFees | None = None) -> tuple[pd.DataFrame, dict]:
     """Cells (CELL_KEYS + sums) for one event's trades."""
-    st = {"trades": 0, "blocks": 0, "no_market": 0}
+    st = {"trades": 0, "blocks": 0, "no_market": 0, "unknown_fee_trades": 0}
     if not len(trades):
         return pd.DataFrame(), st
     t = trades.rename(columns={"taker_outcome_side": "taker_side"})
@@ -146,7 +150,9 @@ def event_cells(trades: pd.DataFrame, markets: pd.DataFrame, series: str, ftypes
     if "is_block_trade" in t:
         t = t[~t["is_block_trade"].astype(bool)]
     t = t[t.taker_side.isin(["yes", "no"])]
-    mk = markets[markets.result.isin(["yes", "no"])][["ticker", "result", "strike_type", "floor_strike", "cap_strike", "close_ts_ms"]]
+    cols = ["ticker", "result", "strike_type", "floor_strike", "cap_strike", "close_ts_ms"]
+    cols += [c for c in ("event_ticker",) if c in markets]
+    mk = markets[markets.result.isin(["yes", "no"])][cols]
     t = t[["ticker", "ts_ms", "yes_px", "qty", "taker_side"]].merge(mk, on="ticker", how="inner")
     st["no_market"] = int(len(trades) - st["blocks"] - len(t))
     if not len(t):
@@ -161,6 +167,8 @@ def event_cells(trades: pd.DataFrame, markets: pd.DataFrame, series: str, ftypes
     buy = (t.taker_side == "yes").to_numpy()
     t["maker_side"] = np.where(buy, "sold_yes", "bought_yes")
     gross = np.where(buy, p - settle, settle - p)
+    if fee_resolver is not None:
+        st["unknown_fee_trades"] = int((~fee_resolver.apply(t, series, ftypes)).sum())
     fee = maker_fee_per_contract(t, ftypes, fe)
     contracts = t.qty.to_numpy() / 100.0
     tau = (t.close_ts_ms.to_numpy() - t.ts_ms.to_numpy()) / 1000.0
@@ -252,16 +260,25 @@ def decision(tb: dict[str, pd.DataFrame], tc: dict[str, pd.DataFrame]) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+def confirmed_candidates(train: pd.DataFrame, later: pd.DataFrame) -> list[dict]:
+    """A later-sample winner must have been selected before that sample was examined."""
+    if not len(train) or not len(later):
+        return []
+    selected = train.loc[train.keep, ["table", "segment"]]
+    return selected.merge(later[later.keep], on=["table", "segment"]).to_dict("records")
+
+
 # ============================================================================ driver
 def build_cells(root: Path, series_list: list[str], start_ms: int | None = None, end_ms: int | None = None,
                 c_window_ms: int = 2000, log=print) -> tuple[pd.DataFrame, dict]:
     ftypes = fee_types(root)
+    fee_resolver = HistoricalFees(root)
     fe = default_fee_engine()
     brti = load_brti(root)
     vol = realized_vol(*brti)
     log(f"BRTI prints: {len(brti[0])} seconds" + (f" {pd.Timestamp(brti[0][0], unit='s')} .. {pd.Timestamp(brti[0][-1], unit='s')}" if len(brti[0]) else ""))
     allc = []
-    st_all = {"events": 0, "trades": 0, "blocks": 0, "no_market": 0, "fee_types": {k: list(v) for k, v in ftypes.items()}}
+    st_all = {"events": 0, "trades": 0, "blocks": 0, "no_market": 0, "unknown_fee_trades": 0, "fee_types": {k: list(v) for k, v in ftypes.items()}}
     for s in series_list:
         tdir = root / "trades" / f"series={s}"
         files = sorted(tdir.glob("*.parquet"))
@@ -270,15 +287,15 @@ def build_cells(root: Path, series_list: list[str], start_ms: int | None = None,
             mpath = root / "markets" / f"series={s}" / f.name
             if not mpath.is_file():
                 continue
-            mk = pq.read_table(mpath, columns=["ticker", "result", "strike_type", "floor_strike", "cap_strike", "close_ts_ms"]).to_pandas()
+            mk = pq.read_table(mpath, columns=["ticker", "event_ticker", "result", "strike_type", "floor_strike", "cap_strike", "close_ts_ms"]).to_pandas()
             if not len(mk):
                 continue
             T = int(mk.close_ts_ms.max())
             if (start_ms is not None and T < start_ms) or (end_ms is not None and T >= end_ms):
                 continue
             tr = pq.read_table(f, columns=["ticker", "ts_ms", "yes_px", "qty", "taker_outcome_side", "is_block_trade"]).to_pandas()
-            cells, st = event_cells(tr, mk, s, ftypes, fe, brti, vol, c_window_ms)
-            for k in ("trades", "blocks", "no_market"):
+            cells, st = event_cells(tr, mk, s, ftypes, fe, brti, vol, c_window_ms, fee_resolver)
+            for k in ("trades", "blocks", "no_market", "unknown_fee_trades"):
                 st_all[k] += st[k]
             st_all["events"] += 1
             if len(cells):
@@ -292,11 +309,18 @@ def build_cells(root: Path, series_list: list[str], start_ms: int | None = None,
 def run(root: Path, out: Path, series_list: list[str], n_boot: int = 300, min_events: int = MIN_SEGMENT_EVENTS,
         c_window_ms: int = 2000, split: bool = True, log=print) -> dict:
     out.mkdir(parents=True, exist_ok=True)
+    manifest = input_manifest(root)
     cells, st = build_cells(root, series_list, c_window_ms=c_window_ms, log=log)
     cells.to_parquet(out / "e0_cells.parquet")
-    res = {"stats": st, "fee_notes": fee_notes(root)}
+    res = {"stats": st, "fee_notes": fee_notes(root), "input_manifest": manifest,
+           "tradable": False, "feature_definition": "descriptive spot/realized-vol proxy; not production z",
+           "fee_history_complete": st.get("unknown_fee_trades", 0) == 0,
+           "promotion_status": "exploratory_only", "confirmation_candidates": [],
+           "run_parameters": {"n_boot": n_boot, "min_events": min_events, "c_window_ms": c_window_ms,
+                              "split": split, "series": series_list}}
     if not len(cells):
         res["verdict"] = "INCONCLUSIVE (no data)"
+        (out / "e0_summary.json").write_text(json.dumps(res, indent=1, default=str))
         return res
     cl = cells.cluster.to_numpy()
     res["period_utc"] = [str(pd.Timestamp(int(cl.min()), unit="ms")), str(pd.Timestamp(int(cl.max()), unit="ms"))]
@@ -313,18 +337,28 @@ def run(root: Path, out: Path, series_list: list[str], n_boot: int = 300, min_ev
     res["segments_examined"] = {"B": int(sum(len(t) for t in tb.values())), "C": int(sum(len(t) for t in tc.values()))}
     res["keep"] = dec[dec.keep].to_dict("records") if len(dec) else []
     res["keep_unadjusted"] = dec[dec.keep_unadjusted].to_dict("records") if len(dec) else []
-    res["verdict"] = ("GO: " + ", ".join(f"{r['table']}:{r['segment']}" for r in res["keep"])) if res["keep"] else \
+    res["verdict"] = ("EXPLORATORY CANDIDATES: " + ", ".join(f"{r['table']}:{r['segment']}" for r in res["keep"])) if res["keep"] else \
         "STOP: no segment has a net lower bound > 0.15c/contract under both B and C"
     if split and len(cells):
         mid = int(np.median(np.unique(cl)))
         halves = {}
         for name, sub in (("first", cells[cells.cluster <= mid]), ("second", cells[cells.cluster > mid])):
-            halves[name] = {"B": policy_tables(sub, n_boot, max(20, min_events // 2)),
-                            "C": policy_tables(sub[sub.c_fill], n_boot, max(20, min_events // 2))}
+            halves[name] = {"B": policy_tables(sub, n_boot, min_events),
+                            "C": policy_tables(sub[sub.c_fill], n_boot, min_events)}
             for pol in ("B", "C"):
                 for k, t in halves[name][pol].items():
                     t.to_csv(out / f"e0_{name}_{pol}_{k}.csv", index=False, float_format="%.4f")
         res["split_at_utc"] = str(pd.Timestamp(mid, unit="ms"))
+        train = decision(halves["first"]["B"], halves["first"]["C"])
+        later = decision(halves["second"]["B"], halves["second"]["C"])
+        res["confirmation_candidates"] = confirmed_candidates(train, later)
+    res["inputs_unchanged"] = manifest_matches(root, manifest)
+    res["promotion_blockers"] = ["public tape proxies do not establish executable strategy profit",
+                                  "no preregistered locked policy/untouched holdout attestation"]
+    if not res["fee_history_complete"]:
+        res["promotion_blockers"].append("historical fees unknown for some trades; net figures are estimates")
+    if not res["inputs_unchanged"]:
+        res["promotion_blockers"].append("inputs changed during run; rerun on an immutable snapshot")
     (out / "e0_summary.json").write_text(json.dumps(res, indent=1, default=str))
     return res
 

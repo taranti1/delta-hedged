@@ -55,7 +55,7 @@ def test_markouts_are_nan_when_fair_value_logging_stopped():
     L.on_log(10 * S, Log("fv", {"ticker": "M", "F": 0.5, "delta": 0.0}))
     L.on_event(_fill(11 * S))
     df = L.attribute()
-    assert "mo_0.1s_c" in df and not math.isnan(df["mo_0.1s_c"].iloc[0])  # 1.1 s old FV is fresh
+    assert "mo_0.1s_c" not in df or math.isnan(df["mo_0.1s_c"].iloc[0])  # inadequate subsecond resolution
     assert "mo_60s_c" not in df or math.isnan(df["mo_60s_c"].iloc[0])  # nothing logged near t+60 s
 
 

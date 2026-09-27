@@ -206,6 +206,26 @@ def write_parquet(path: Path, rows: list[dict[str, Any]] | pa.Table, schema: pa.
     os.replace(tmp, path)
 
 
+def valid_parquet(path: Path, schema: pa.Schema, *, nonempty: bool = False) -> bool:
+    """A checkpoint is only a hint: missing, truncated or wrong-schema outputs need repair."""
+    try:
+        f = pq.ParquetFile(path)
+        return f.schema_arrow.equals(schema) and (not nonempty or f.metadata.num_rows > 0)
+    except (OSError, pa.ArrowException):
+        return False
+
+
+def merge_metadata(path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
+    """Upsert fetched identities, retaining all earlier series and historical records."""
+    old = pq.ParquetFile(path).read().to_pylist() if path.is_file() else []
+    def key(r):
+        identity = r.get("id")
+        return ("id", identity) if identity and identity != "None" else ("row", _dumps(r))
+    merged = {key(r): r for r in old}
+    merged.update({key(r): r for r in rows})
+    write_parquet(path, list(merged.values()), schema)
+
+
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -516,7 +536,7 @@ async def download_brti(
     total = max(0, (h - first) // H + 1)
     while h >= first:
         path = brti_hour_path(out, h)
-        if path.is_file():
+        if valid_parquet(path, BRTI_SCHEMA, nonempty=True):
             st["brti_skipped"] += 1
             h -= H
             continue
@@ -603,7 +623,7 @@ async def download(
                     "fee_multiplier_override": _num_str(ch.get("fee_multiplier_override")),
                     "scheduled_ts": ch.get("scheduled_ts"),
                 })
-        write_parquet(out / "fees" / "event_fee_changes.parquet", fee_rows, EVENT_FEE_SCHEMA)
+        merge_metadata(out / "fees" / "event_fee_changes.parquet", fee_rows, EVENT_FEE_SCHEMA)
     if "incentives" in ds:
         inc = []
         async for p in rest.iter_incentive_programs():
@@ -615,11 +635,13 @@ async def download(
                     "end_date": p.get("end_date"), "period_reward_centicents": p.get("period_reward"),
                     "paid_out": p.get("paid_out"), "raw_json": _dumps(p),
                 })
-        write_parquet(out / "incentives" / "incentive_programs.parquet", inc, INCENTIVE_SCHEMA)
+        merge_metadata(out / "incentives" / "incentive_programs.parquet", inc, INCENTIVE_SCHEMA)
 
     for series in series_list:
         if "fees" in ds:
-            write_json(out / "series" / f"{series}.json", await rest.get_series(series))
+            snapshot = {**await rest.get_series(series), "fetched_ns": time.time_ns()}
+            write_json(out / "fees" / "snapshots" / "series" / series / f"{snapshot['fetched_ns']}.json", snapshot)
+            write_json(out / "series" / f"{series}.json", snapshot)
             write_json(out / "fees" / "series_fee_changes" / f"{series}.json",
                        await rest.get_series_fee_changes(series, show_historical=True))
         events = await list_events(rest, series, start_ns, end_ns, use_close_filter=event_close_filter)
@@ -630,27 +652,35 @@ async def download(
         existing = {r["event_ticker"]: r for r in (pq.read_table(ev_path).to_pylist() if ev_path.is_file() else [])}
         existing.update({e["event_ticker"]: event_row(e) for e in events})
         write_parquet(ev_path, [existing[k] for k in sorted(existing)], EVENT_SCHEMA)
-        ck_mt = Checkpoint(out / "_checkpoints" / f"events-{series}.log")
-        ck_c = Checkpoint(out / "_checkpoints" / f"candles-{series}.log")
-        todo = [e for e in events if (bool({"markets", "trades"} & ds) and e["event_ticker"] not in ck_mt)
-                or ("candles" in ds and e["event_ticker"] not in ck_c)]
+        legacy_events = Checkpoint(out / "_checkpoints" / f"events-{series}.log")
+        checkpoints = {d: Checkpoint(out / "_checkpoints" / f"{d}-{series}.log")
+                       for d in ("markets", "trades", "candles")}
+        schemas = {"markets": MARKET_SCHEMA, "trades": TRADE_SCHEMA, "candles": CANDLE_SCHEMA}
+        def needs(et: str, dataset: str) -> bool:
+            path = out / dataset / f"series={series}" / f"{et}.parquet"
+            return dataset in ds and ((et not in checkpoints[dataset] and et not in legacy_events)
+                                      or not valid_parquet(path, schemas[dataset]))
+        todo = [e for e in events if any(needs(e["event_ticker"], d) for d in checkpoints)]
         stats["events_skipped"] += len(events) - len(todo)
         log(f"{series}: {len(events)} events in range, {len(todo)} to do")
         t0 = time.time()
         n0 = stats["trades"]
         for i, ev in enumerate(todo):
             et = ev["event_ticker"]
-            need_mt = bool({"markets", "trades"} & ds) and et not in ck_mt
-            need_c = "candles" in ds and et not in ck_c
+            needed = {d for d in checkpoints if needs(et, d)}
+            need_mt = bool({"markets", "trades"} & needed)
+            need_c = "candles" in needed
             try:
                 markets, msrc = await fetch_event_markets(rest, ev, market_cut)
                 markets = [m for m in markets if _in_range(m, start_ns, end_ns, ev)]
                 if need_mt:
-                    await _markets_and_trades(rest, series, et, markets, msrc, trades_cut, out, ds, skip_zero_volume, sem, stats)
-                    ck_mt.mark(et)
+                    await _markets_and_trades(rest, series, et, markets, msrc, trades_cut, out, needed, skip_zero_volume, sem, stats)
+                    checkpoints["markets"].mark(et)
+                    if "trades" in needed:
+                        checkpoints["trades"].mark(et)
                 if need_c:
                     await _candles(rest, series, et, markets, msrc, candle_period, skip_zero_volume, out, sem, stats)
-                    ck_c.mark(et)
+                    checkpoints["candles"].mark(et)
                 stats["events"] += 1
             except KalshiHTTPError as exc:
                 stats["errors"] += 1

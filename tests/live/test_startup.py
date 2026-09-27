@@ -217,6 +217,8 @@ def test_paper_sim_and_conservative_fees():
     maker = fe.schedule_for_spec("quadratic_with_maker_fees", 1.0).trade_fee_micros(5000, 100, False)
     assert fees(5000, 100, False) == maker > 0  # per-fill fallback: the most expensive schedule
     assert PaperFees(fe)(5000, 100, False) == 0
+
+
     # order-aware fees: each market's own schedule, with Kalshi's per-order balance rounding
     from dh.core.actions import PlaceOrder
 
@@ -232,6 +234,12 @@ def test_paper_sim_and_conservative_fees():
     sim.submit(PlaceOrder("c", specs[0].ticker, "bid", 5000, 100), 0)
     sim.pop_due(10**18)
     assert fees.order_fee(sim._coid["c"].order_id, "bid", 5000, 100, False) == net_b  # noqa: SLF001
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+def test_invalid_paper_market_data_latency_rejected(value):
+    with pytest.raises(ValueError, match="md_ms"):
+        PaperCfg(md_ms=value)
 
 
 def test_live_example_config_loads_and_is_paper():

@@ -69,9 +69,11 @@ class FillRecord:
     delta: float = 0.0
     tau_s: float = math.nan
     markouts: dict[float, float] = field(default_factory=dict)
+    markout_observed_ts: dict[float, int] = field(default_factory=dict)
     settle: float = math.nan
     hedge_alloc_cost: float = 0.0
     hedge_alloc_pnl: float = 0.0
+    fv_key: str | None = None  # log importer: isolate model observations by session
 
     @property
     def gross_edge(self) -> float:
@@ -102,6 +104,8 @@ class Ledger:
         self.hedge_totals: dict[str, float] = {}
         self.first_ts = 0
         self.last_ts = 0
+        self.observation_duration_ns: int | None = None  # complete log sessions, not just fills
+        self.audit_notes: dict = {}
 
     # ------------------------------------------------------------------ ingestion
     def on_event(self, ev) -> None:
@@ -142,15 +146,22 @@ class Ledger:
         for f in self.fills:
             f.F, f.delta = math.nan, 0.0
             f.markouts = {}
+            f.markout_observed_ts = {}
             f.hedge_alloc_cost = 0.0
             f.hedge_alloc_pnl = 0.0
-            cur = self.fv[f.ticker].at(f.ts, self.markout_max_age_ns)
+            series = self.fv[f.fv_key or f.ticker]
+            cur = series.at(f.ts, self.markout_max_age_ns)
             if cur is not None:
                 f.F, f.delta = cur
             for h in MARKOUT_H_S:
-                later = self.fv[f.ticker].at(f.ts + int(h * NS_PER_S), self.markout_max_age_ns)
+                # A stale pre-fill sample cannot establish a subsecond markout. Require
+                # an observation in the latter half of the requested horizon, capped by
+                # the general freshness limit. Sparse logging yields missing evidence.
+                later = series.at(f.ts + int(h * NS_PER_S),
+                                           min(self.markout_max_age_ns, int(h * NS_PER_S / 2)))
                 if later is not None and not math.isnan(f.F):
                     f.markouts[h] = (later[0] - f.F) * f.side
+                    f.markout_observed_ts[h] = series.ts[bisect.bisect_right(series.ts, f.ts + int(h * NS_PER_S)) - 1]
             f.settle = self.settle.get(f.ticker, math.nan)
         self._allocate_hedges()
         rows = []
@@ -164,6 +175,8 @@ class Ledger:
             }
             for h, v in f.markouts.items():
                 r[f"mo_{h:g}s_c"] = 100 * v
+                r[f"mo_{h:g}s_observed_ts"] = f.markout_observed_ts[h]
+                r[f"mo_{h:g}s_age_ms"] = (f.ts + int(h * NS_PER_S) - f.markout_observed_ts[h]) / 1_000_000
             rows.append(r)
         return pd.DataFrame(rows, columns=None if rows else list(ATTRIBUTION_COLUMNS))
 
@@ -225,8 +238,12 @@ class Ledger:
         df = self.attribute() if df is None else df
         done = df[~df.settle.isna()]
         out_h = dict(self.hedge_totals)
-        days = max((self.last_ts - self.first_ts) / (86_400 * NS_PER_S), 1e-9)
-        out: dict = {"fills": len(df), "settled_fills": len(done), "days": days, **{f"hedge_{k}" if not k.startswith("hedge") else k: v for k, v in out_h.items()}}
+        elapsed = self.last_ts - self.first_ts if self.observation_duration_ns is None else self.observation_duration_ns
+        days = max(elapsed, 0) / (86_400 * NS_PER_S)
+        out: dict = {"fills": len(df), "settled_fills": len(done), "unresolved_fills": len(df) - len(done),
+                     "unresolved_contracts": float(df.loc[df.settle.isna(), "contracts"].sum()), "days": days,
+                     **{f"hedge_{k}" if not k.startswith("hedge") else k: v for k, v in out_h.items()}}
+        out.update(self.audit_notes)
         if not len(done):
             return out
         ct = done.contracts.sum()
@@ -238,8 +255,8 @@ class Ledger:
             "gross_edge_c_per_contract": float(np.average(done.gross_edge_c, weights=done.contracts)),
             "fees_c_per_contract": 100 * done.fee.sum() / ct,
             "hedge_cost_c_per_contract": 100 * done.hedge_cost.sum() / ct,
-            "contracts_per_day": ct / days,
-            "net_usd_per_day": net / days,
+            "contracts_per_day": ct / days if days > 0 else math.nan,
+            "net_usd_per_day": net / days if days > 0 else math.nan,
             "profitable_fill_share": float((done.net > 0).mean()),
         })
         for h in MARKOUT_H_S:
@@ -253,14 +270,16 @@ class Ledger:
         cap_hours = float(np.sum(coll * np.maximum(done.tau_s, 0) / 3600.0))
         out["capital_dollar_hours"] = cap_hours
         out["net_per_capital_hour"] = net / cap_hours if cap_hours > 0 else math.nan
-        # event-clustered bootstrap CI of net c/contract
-        g = done.groupby("event").agg(n=("net", "sum"), c=("contracts", "sum"))
-        rng = np.random.default_rng(seed)
-        s, w = g.n.to_numpy(), g.c.to_numpy()
-        k = len(s)
-        bs = [100 * s[i].sum() / w[i].sum() for i in (rng.integers(0, k, k) for _ in range(n_boot)) if w[i].sum() > 0]
-        if bs:
-            lo, hi = np.percentile(bs, [2.5, 97.5])
-            out["net_c_ci95"] = (float(lo), float(hi))
-        out["events"] = k
+        from dh.research.exp_common import ratio_ci, settlement_key
+
+        # All contracts on the same benchmark settlement are one independent cluster,
+        # including different series. One expiration cannot establish a confidence interval.
+        clustered = done.assign(cluster=[str(self.expiration_of[t]) if self.expiration_of.get(t)
+                                         else settlement_key(e) for t, e in zip(done.ticker, done.event)])
+        g = clustered.groupby("cluster").agg(n=("net", "sum"), c=("contracts", "sum"))
+        ci = ratio_ci(100 * g.n.to_numpy(), g.c.to_numpy(), n_boot=n_boot, seed=seed)
+        out["net_c_ci95"] = (ci.lo, ci.hi)
+        out["ci_method"] = ci.method
+        out["events"] = ci.clusters
+        out["inference_sufficient"] = ci.clusters >= 2
         return out

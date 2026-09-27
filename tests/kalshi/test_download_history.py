@@ -184,7 +184,7 @@ async def test_download_pipeline_and_resume(tmp_path: Path):
                                log=lambda *_: None)
     assert stats2["events_skipped"] == 2 and stats2["events"] == 0
     assert not any(c[0] in ("trades", "markets", "hmarkets") for c in rest2.calls)
-    done_hours = {f"2025-08-05T{h:02d}:00:00.000Z" for h in range(18, 24)}
+    done_hours = {"2025-08-05T20:00:00.000Z"}  # nonempty hours only; empty hours retry
     assert not any(c[0] == "cf" and c[3] in done_hours for c in rest2.calls)  # existing hour files are skipped
     assert ("events", "KXBTCD", "settled", ev_start // 10**9) in rest.calls
     rest3 = FakeRest()
@@ -228,3 +228,23 @@ def test_scripts_help_runs_offline():
 
 def test_plan_parsing():
     assert dl.parse_plan("KXBTCD:30, KXBTC15M+KXBTC:14,") == [(["KXBTCD"], 30.0), (["KXBTC15M", "KXBTC"], 14.0)]
+
+
+async def test_markets_only_does_not_checkpoint_trades_and_missing_output_repairs(tmp_path):
+    start, end = iso_to_ns("2025-08-01T00:00:00Z"), iso_to_ns("2025-08-06T00:00:00Z")
+    await dl.download(FakeRest(), ["KXBTCD"], start, end, tmp_path, datasets=["markets"], log=lambda *_: None)
+    r = FakeRest()
+    st = await dl.download(r, ["KXBTCD"], start, end, tmp_path, datasets=["trades"], log=lambda *_: None)
+    assert st["trades"] == 5
+    target = tmp_path / "trades" / "series=KXBTCD" / f"{E1['event_ticker']}.parquet"
+    target.write_bytes(b"truncated")
+    st = await dl.download(FakeRest(), ["KXBTCD"], start, end, tmp_path, datasets=["trades"], log=lambda *_: None)
+    assert st["events"] == 1 and dl.valid_parquet(target, dl.TRADE_SCHEMA)
+
+
+def test_subset_metadata_preserves_other_series_and_history(tmp_path):
+    p = tmp_path / "fees.parquet"
+    dl.merge_metadata(p, [{"id": "old", "event_ticker": "KXBTC-X"}], dl.EVENT_FEE_SCHEMA)
+    dl.merge_metadata(p, [{"id": "new", "event_ticker": "KXBTCD-Y"}], dl.EVENT_FEE_SCHEMA)
+    dl.merge_metadata(p, [], dl.EVENT_FEE_SCHEMA)
+    assert {r['id'] for r in pq.read_table(p).to_pylist()} == {"old", "new"}

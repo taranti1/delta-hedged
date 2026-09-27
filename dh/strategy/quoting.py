@@ -57,6 +57,7 @@ class MarketQuoteContext:
     capacity_contracts: dict[str, float]  # side -> max additional contracts allowed by limits
     existing: dict[str, list[ExistingOrder]] = field(default_factory=dict)
     max_ticks_from_touch: int = 3
+    touch_only: bool = False
     price_floor_px: int = 100
     price_cap_px: int = 9900
     rounding_per_order: float = 0.0  # $ expected balance-rounding fee per order (audit M8)
@@ -97,6 +98,11 @@ def _candidate_prices(ctx: MarketQuoteContext, side: str) -> list[tuple[int, str
     spec, book = ctx.spec, ctx.book
     grid = [p for p in spec.tick_grid() if ctx.price_floor_px <= p <= ctx.price_cap_px]
     bb, ba = book.best_bid(), book.best_ask()
+    if ctx.touch_only:
+        px = bb if side == "bid" else ba
+        opposite = ba if side == "bid" else bb
+        safe = opposite is None or (px is not None and (px < opposite if side == "bid" else px > opposite))
+        return [(px, "touch")] if px in grid and safe else []
     w = ctx.max_ticks_from_touch
     cands: set[int] = set()
     if side == "bid":
@@ -209,8 +215,9 @@ def decide_side(
         for o in existing
     ]
     keep: list[str] = []
-    cancel: list[str] = [e.existing_id for e in ex_evals if e.value < 0.0]
-    good = sorted((e for e in ex_evals if e.value >= 0.0), key=lambda e: e.ev_rate, reverse=True)
+    cancel: list[str] = [e.existing_id for e in ex_evals
+                         if e.value < 0.0 or (ctx.touch_only and e.position != "touch")]
+    good = sorted((e for e in ex_evals if e.existing_id not in cancel), key=lambda e: e.ev_rate, reverse=True)
     top = None
     for e in good:
         if top is None and e.size <= cap_total + 1e-9:
@@ -221,7 +228,10 @@ def decide_side(
     # stays reserved against capacity (audit M1): a replacement must fit beside them
     canceling = sum(e.size for e in ex_evals if e.existing_id in cancel)
     reserved = canceling + (top.size if top is not None else 0.0)
-    size = min(ctx.clip_contracts, cap_total - reserved)
+    # Evaluate the replacement at capacity AFTER the retained quote is canceled.
+    # It may trigger a cancel now, but is only placed when it also fits current exposure.
+    available_now = max(0.0, cap_total - reserved)
+    size = min(ctx.clip_contracts, max(0.0, cap_total - canceling))
     best: QuoteCandidate | None = None
     if size > 1e-9:
         for px, pos in _candidate_prices(ctx, side):
@@ -237,10 +247,11 @@ def decide_side(
                   and best.ev_rate > top.ev_rate * (1.0 + replace_rel) + kappa_replace)
         if better and age >= min_age_ns:
             cancel.append(top.existing_id)
-            place = best
+            if best.size <= available_now + 1e-9:
+                place = best
         else:
             keep.append(top.existing_id)
-    elif best is not None:
+    elif best is not None and best.size <= available_now + 1e-9:
         place = best
     return SideDecision(side, keep, cancel, place, best, ex_evals)
 

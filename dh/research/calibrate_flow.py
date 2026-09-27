@@ -2,7 +2,10 @@
 
 Taker orders are reconstructed from the trade tape: prints with the same
 (ticker, ts_ms, taker_side) are one aggressive order sweeping one or more levels.
-Segments = (tau bucket, |z| bucket, maker side), matching dh.strategy.fill_model.segment_key.
+Segments = (tau bucket, |z| bucket, maker side), with the same bucket labels as
+dh.strategy.fill_model.segment_key. The fixed-volatility spot features are a versioned
+research proxy, not production remaining-average model features; real replay rejects these
+artifacts until a fitter reconstructs the causal production model state.
 
 Exposure (market-seconds per segment) is EXACT in time to expiry: each 60 s cell of a market's
 open window is split at the tau-bucket boundaries (30/60/300/600/1800 s), so every bucket gets
@@ -61,6 +64,7 @@ import pandas as pd
 from dh.research.kalshi_data import DEFAULT_BTC_BAR_MS, normalize_markets, normalize_trades
 from dh.strategy.config import ParamProvenance, utc_from_ms
 from dh.strategy.fill_model import SegmentFlow, segment_key
+from dh.strategy.flow_features import PROXY_FEATURE_VERSION, validate_feature_version
 
 SEC_YR = 365.0 * 24 * 3600
 TAU_BOUNDS = (30.0, 60.0, 300.0, 600.0, 1800.0)
@@ -70,8 +74,12 @@ def taker_orders(trades: pd.DataFrame) -> pd.DataFrame:
     """Group prints into taker orders: ticker, ts_ms, taker_side, contracts, n_prints, yes_px."""
     t = trades.copy()
     t["contracts"] = t.qty / 100.0
-    g = t.groupby(["ticker", "ts_ms", "taker_side"], sort=True).agg(
-        contracts=("contracts", "sum"), n_prints=("contracts", "size"), yes_px=("yes_px", "first"))
+    agg = {"contracts": ("contracts", "sum"), "n_prints": ("contracts", "size"), "yes_px": ("yes_px", "first")}
+    if "ts_recv_ms" in t:
+        # A reconstructed sweep is only fully observable when its last print arrives.
+        # Keep its first receipt too, so a sweep spanning an outage cannot straddle exposure.
+        agg.update(ts_recv_ms=("ts_recv_ms", "max"), ts_recv_first_ms=("ts_recv_ms", "min"))
+    g = t.groupby(["ticker", "ts_ms", "taker_side"], sort=True).agg(**agg)
     return g.reset_index()
 
 
@@ -87,7 +95,7 @@ def split_tau(tau_hi: float, tau_lo: float) -> list[tuple[float, float]]:
 
 
 def exposure_seconds(markets: pd.DataFrame, price_at, vol_ann: float, grid_s: int = 60,
-                     t_min_ms: int | None = None) -> dict:
+                     t_min_ms: int | None = None, coverage: Mapping[str, list[tuple[int, int]]] | None = None) -> dict:
     """Market-seconds per segment; cells start at the market open (or ``t_min_ms`` if later)."""
     exposure: dict[tuple[str, str, str], float] = defaultdict(float)
     for m in markets.itertuples():
@@ -97,20 +105,24 @@ def exposure_seconds(markets: pd.DataFrame, price_at, vol_ann: float, grid_s: in
         start, end = int(m.open_ts_ms), int(m.expiration_ts_ms)
         if t_min_ms is not None:
             start = max(start, int(t_min_ms))
-        for t in range(start, end, grid_s * 1000):
-            S = price_at(t)
-            if S is None:
-                continue
-            t_end = min(t + grid_s * 1000, end)
-            tau_hi, tau_lo = (end - t) / 1000.0, (end - t_end) / 1000.0
-            z = _z(S, float(K), tau_hi, vol_ann)
-            for dur, tau_mid in split_tau(tau_hi, tau_lo):
-                for side in ("bid", "ask"):
-                    exposure[segment_key(tau_mid, z, side)] += dur
+        windows = [(start, end)] if coverage is None else [
+            (max(start, a), min(end, b)) for a, b in coverage.get(m.ticker, []) if max(start, a) < min(end, b)]
+        for lo, hi in windows:
+            for t in range(lo, hi, grid_s * 1000):
+                S = price_at(t)
+                if S is None:
+                    continue
+                t_end = min(t + grid_s * 1000, hi)
+                tau_hi, tau_lo = (end - t) / 1000.0, (end - t_end) / 1000.0
+                K = min((x for x in (m.floor_strike, m.cap_strike) if not pd.isna(x)), key=lambda x: abs(x - S))
+                z = _z(S, float(K), tau_hi, vol_ann)
+                for dur, tau_mid in split_tau(tau_hi, tau_lo):
+                    for side in ("bid", "ask"):
+                        exposure[segment_key(tau_mid, z, side)] += dur
     return exposure
 
 
-def _price_fn(btc: pd.DataFrame, btc_bar_ms: int):
+def _price_fn(btc: pd.DataFrame, btc_bar_ms: int, max_age_ms: int | None = None):
     """Causal scalar lookup (kalshi_data.btc_price_asof convention)."""
     avail = (btc["close_ts_ms"] if "close_ts_ms" in btc else btc["ts_ms"] + int(btc_bar_ms)).to_numpy(dtype=np.int64)
     px = btc["price"].to_numpy(dtype=float)
@@ -119,25 +131,32 @@ def _price_fn(btc: pd.DataFrame, btc_bar_ms: int):
 
     def price_at(ts_ms: int) -> float | None:
         i = int(np.searchsorted(b_ts, ts_ms, side="right")) - 1
-        return float(b_px[i]) if i >= 0 else None
+        return float(b_px[i]) if i >= 0 and (max_age_ms is None or ts_ms - b_ts[i] <= max_age_ms) else None
 
     return price_at
 
 
-def order_sizes(orders: pd.DataFrame, price_at, vol_ann: float, t_min_ms: int | None = None) -> dict:
+def order_sizes(orders: pd.DataFrame, price_at, vol_ann: float, t_min_ms: int | None = None,
+                coverage: Mapping[str, list[tuple[int, int]]] | None = None) -> dict:
     """Taker-order sizes (contracts) per segment of the maker side they fill. ``orders`` =
     taker_orders(...) merged with the market columns (expiration_ts_ms, floor/cap strike)."""
     sizes: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     for r in orders.itertuples():
-        if t_min_ms is not None and r.ts_ms < t_min_ms:
+        observed_ms = int(getattr(r, "ts_recv_ms", r.ts_ms))
+        first_ms = int(getattr(r, "ts_recv_first_ms", observed_ms))
+        if t_min_ms is not None and first_ms < t_min_ms:
+            continue
+        if coverage is not None and not any(a <= int(r.ts_ms) <= first_ms <= observed_ms < b
+                                            for a, b in coverage.get(r.ticker, [])):
             continue
         K = r.floor_strike if not pd.isna(r.floor_strike) else r.cap_strike
-        S = price_at(int(r.ts_ms))
+        S = price_at(observed_ms)
         if S is None or pd.isna(K):
             continue
-        tau = (r.expiration_ts_ms - r.ts_ms) / 1000.0
+        tau = (r.expiration_ts_ms - observed_ms) / 1000.0
         if tau <= 0:
             continue
+        K = min((x for x in (r.floor_strike, r.cap_strike) if not pd.isna(x)), key=lambda x: abs(x - S))
         z = _z(S, float(K), tau, vol_ann)
         # a taker selling YES ('no') hits resting YES bids -> fills makers' BIDS
         maker_side = "bid" if r.taker_side == "no" else "ask"
@@ -169,11 +188,11 @@ def _prepared(trades: pd.DataFrame, markets: pd.DataFrame) -> tuple[pd.DataFrame
 
 
 def flow_stats(orders: pd.DataFrame, markets: pd.DataFrame, price_at, vol_ann: float = 0.40, grid_s: int = 60,
-               t_min_ms: int | None = None) -> FlowStats:
+               t_min_ms: int | None = None, coverage=None) -> FlowStats:
     """FlowStats of ``markets`` (and the orders in them), optionally only from ``t_min_ms`` on."""
     o = orders[orders.ticker.isin(set(markets.ticker))]
-    return FlowStats(exposure=exposure_seconds(markets, price_at, vol_ann, grid_s, t_min_ms),
-                     sizes=order_sizes(o, price_at, vol_ann, t_min_ms), markets=len(markets))
+    return FlowStats(exposure=exposure_seconds(markets, price_at, vol_ann, grid_s, t_min_ms, coverage),
+                     sizes=order_sizes(o, price_at, vol_ann, t_min_ms, coverage), markets=len(markets))
 
 
 def fit_segments(stats: FlowStats, min_orders: int = 30, prior_s: float = 1800.0) -> dict[tuple[str, str, str], SegmentFlow]:
@@ -238,7 +257,7 @@ def dataset_hash(orders: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame 
     """Content hash of a fitting sample: 'sha256:<16 hex>' over the sorted taker orders, the markets
     (ticker, open, expiration, strikes) and the BTC reference rows available before ``until_ms``."""
     h = hashlib.sha256()
-    o = orders[[c for c in ("ticker", "ts_ms", "taker_side", "contracts") if c in orders]]
+    o = orders[[c for c in ("ticker", "ts_ms", "ts_recv_ms", "ts_recv_first_ms", "taker_side", "contracts") if c in orders]]
     h.update(o.sort_values(list(o.columns)).to_csv(index=False).encode())
     m = markets[[c for c in ("ticker", "open_ts_ms", "expiration_ts_ms", "floor_strike", "cap_strike") if c in markets]]
     h.update(m.sort_values("ticker").to_csv(index=False).encode())
@@ -262,7 +281,7 @@ def fit_provenance(orders: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFram
 
 
 def _method(kind: str, *, prior_s: float, min_orders: int, vol_ann: float) -> str:
-    return (f"calibrate_flow.fit_segments: gamma-Poisson shrunk segment rates (prior_s={prior_s:g}, "
+    return (f"features={PROXY_FEATURE_VERSION}; calibrate_flow.fit_segments: gamma-Poisson shrunk segment rates (prior_s={prior_s:g}, "
             f"min_orders={min_orders}, vol_ann={vol_ann:g}); {kind}")
 
 
@@ -335,13 +354,14 @@ class FlowSplit:
 
 def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame, *, train_frac: float = 0.7,
                     split_ms: int | None = None, purge: bool = True, vol_ann: float = 0.40, grid_s: int = 60,
-                    min_orders: int = 30, prior_s: float = 1800.0, btc_bar_ms: int = DEFAULT_BTC_BAR_MS) -> FlowSplit:
+                    min_orders: int = 30, prior_s: float = 1800.0, btc_bar_ms: int = DEFAULT_BTC_BAR_MS, coverage=None,
+                    max_price_age_ms: int | None = None) -> FlowSplit:
     """Chronological split by market expiration: fit on markets expiring at or before ``split_ms``
     (default: the ``train_frac`` quantile of expirations), evaluate in sample (training markets)
     and out of sample (markets expiring later; with ``purge`` only their data from ``split_ms``
     on). Training data all precede the split, so the out-of-sample numbers are causal."""
     orders, mk = _prepared(trades, markets)
-    price_at = _price_fn(btc, btc_bar_ms)
+    price_at = _price_fn(btc, btc_bar_ms, max_price_age_ms)
     exp = np.sort(mk.expiration_ts_ms.to_numpy(dtype=np.int64))
     if split_ms is None:
         if not len(exp):
@@ -349,9 +369,9 @@ def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFra
         split_ms = int(exp[min(len(exp) - 1, max(0, int(math.ceil(train_frac * len(exp))) - 1))])
     train_m = mk[mk.expiration_ts_ms <= split_ms]
     test_m = mk[mk.expiration_ts_ms > split_ms]
-    st_tr = flow_stats(orders, train_m, price_at, vol_ann, grid_s)
-    st_te_full = flow_stats(orders, test_m, price_at, vol_ann, grid_s)
-    st_te = flow_stats(orders, test_m, price_at, vol_ann, grid_s, t_min_ms=split_ms) if purge else st_te_full
+    st_tr = flow_stats(orders, train_m, price_at, vol_ann, grid_s, coverage=coverage)
+    st_te_full = flow_stats(orders, test_m, price_at, vol_ann, grid_s, coverage=coverage)
+    st_te = flow_stats(orders, test_m, price_at, vol_ann, grid_s, t_min_ms=split_ms, coverage=coverage) if purge else st_te_full
     seg = fit_segments(st_tr, min_orders, prior_s)
     tabs = {"in_sample": evaluate_flow(seg, st_tr), "out_of_sample": evaluate_flow(seg, st_te)}
     rows = [{"sample": k, "fit_on": "train", "eval_on": "train" if k == "in_sample" else "test",
@@ -365,7 +385,7 @@ def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFra
     return FlowSplit(seg, pd.DataFrame(rows), per, split_ms=int(split_ms), train_end_ms=int(split_ms),
                      segments_all=fit_segments(st_all, min_orders, prior_s),
                      all_end_ms=all_end,
-                     meta={"method": "chronological", "train_frac": train_frac, "purge": purge,
+                     meta={"feature_version": PROXY_FEATURE_VERSION, "method": "chronological", "train_frac": train_frac, "purge": purge,
                            "train_markets": st_tr.markets, "test_markets": st_te.markets, "btc_bar_ms": btc_bar_ms},
                      provenance=fit_provenance(orders, train_m, btc, to_ms=int(split_ms), btc_bar_ms=btc_bar_ms,
                                                method=_method("training markets of a chronological split by "
@@ -377,13 +397,14 @@ def calibrate_split(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFra
 
 def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.DataFrame, *, min_train_days: int = 1,
                         purge: bool = True, vol_ann: float = 0.40, grid_s: int = 60, min_orders: int = 30,
-                        prior_s: float = 1800.0, btc_bar_ms: int = DEFAULT_BTC_BAR_MS) -> FlowSplit:
+                        prior_s: float = 1800.0, btc_bar_ms: int = DEFAULT_BTC_BAR_MS, coverage=None,
+                    max_price_age_ms: int | None = None) -> FlowSplit:
     """Walk-forward by UTC day of market expiration: for each day after ``min_train_days`` days,
     fit on every market that expired on an earlier day and evaluate on that day's markets (with
     ``purge``, only their data from the day start). Rows: each test day, the pooled out-of-sample
     total, and the in-sample fit on all days for comparison. ``segments`` = fit on all days."""
     orders, mk = _prepared(trades, markets)
-    price_at = _price_fn(btc, btc_bar_ms)
+    price_at = _price_fn(btc, btc_bar_ms, max_price_age_ms)
     day_ms = 86_400_000
     mk = mk.assign(_day=(mk.expiration_ts_ms - 1) // day_ms)
     days = sorted(mk._day.unique())
@@ -391,8 +412,8 @@ def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.Dat
     test: dict[int, FlowStats] = {}
     for d in days:
         m = mk[mk._day == d]
-        full[d] = flow_stats(orders, m, price_at, vol_ann, grid_s)
-        test[d] = flow_stats(orders, m, price_at, vol_ann, grid_s, t_min_ms=int(d * day_ms)) if purge else full[d]
+        full[d] = flow_stats(orders, m, price_at, vol_ann, grid_s, coverage=coverage)
+        test[d] = flow_stats(orders, m, price_at, vol_ann, grid_s, t_min_ms=int(d * day_ms), coverage=coverage) if purge else full[d]
     rows, per = [], []
     cum = FlowStats()
     oos_tabs = []
@@ -422,7 +443,7 @@ def walk_forward_by_day(trades: pd.DataFrame, markets: pd.DataFrame, btc: pd.Dat
                                          vol_ann=vol_ann))
     return FlowSplit(seg_all, pd.DataFrame(rows), pd.concat(per, ignore_index=True), split_ms=None, train_end_ms=end,
                      segments_all=seg_all, all_end_ms=end,
-                     meta={"method": "walk_forward_day", "min_train_days": min_train_days, "purge": purge,
+                     meta={"feature_version": PROXY_FEATURE_VERSION, "method": "walk_forward_day", "min_train_days": min_train_days, "purge": purge,
                            "days": len(days), "btc_bar_ms": btc_bar_ms},
                      provenance=prov, provenance_all=dict(prov))
 
@@ -435,15 +456,17 @@ def save_segments(seg: Mapping[tuple[str, str, str], SegmentFlow], path: str | P
     ``meta.fit_end_ms`` (every training datum precedes it) let a replay check causality."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    body = {"meta": dict(meta or {}),
+    body = {"meta": {"feature_version": PROXY_FEATURE_VERSION, **dict(meta or {})},
             "segments": {"|".join(k): {"rate_contracts_per_s": f.rate_contracts_per_s, "size_mean": f.size_mean,
                                        "size_cv": f.size_cv} for k, f in sorted(seg.items())}}
     p.write_text(json.dumps(body, indent=1, sort_keys=True, default=str))
     return p
 
 
-def load_segments(path: str | Path) -> tuple[dict[tuple[str, str, str], SegmentFlow], dict[str, Any]]:
+def load_segments(path: str | Path, *, expected_feature_version: str | None = None) -> tuple[dict[tuple[str, str, str], SegmentFlow], dict[str, Any]]:
     body = json.loads(Path(path).read_text())
+    if expected_feature_version is not None:
+        validate_feature_version(body.get("meta") or {}, expected_feature_version)
     seg = {tuple(k.split("|")): SegmentFlow(float(v["rate_contracts_per_s"]), float(v["size_mean"]), float(v["size_cv"]))
            for k, v in body.get("segments", {}).items()}
     return seg, dict(body.get("meta") or {})  # type: ignore[return-value]

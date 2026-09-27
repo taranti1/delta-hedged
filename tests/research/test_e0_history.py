@@ -65,3 +65,74 @@ def test_same_millisecond_sweep_is_ordered_by_price():
     cells, _ = event_cells(tr, mk, "KXBTCD", {"KXBTCD": ("quadratic", 1.0)}, None, none, (np.array([]), np.array([])))
     c = cells[cells.c_fill]
     assert c.k.sum() == 1 and c.px_b.tolist() == ["50-65c"]
+
+
+def test_confirmation_does_not_select_a_new_holdout_winner():
+    from dh.research.e0_history import confirmed_candidates
+    train = pd.DataFrame([dict(table="series", segment="A", keep=True), dict(table="series", segment="B", keep=False)])
+    later = pd.DataFrame([dict(table="series", segment="A", keep=False), dict(table="series", segment="B", keep=True)])
+    assert confirmed_candidates(train, later) == []
+    later.loc[0, "keep"] = True
+    assert [x["segment"] for x in confirmed_candidates(train, later)] == ["A"]
+
+
+def test_historical_fees_do_not_backfill_current_schedule(tmp_path):
+    import json
+    from dh.research.historical_fees import HistoricalFees
+    (tmp_path / "series").mkdir()
+    (tmp_path / "series" / "A.json").write_text(json.dumps({"series": {"ticker": "A", "fee_type": "quadratic"},
+                                                          "fetched_ns": 20_000_000_000}))
+    trades = pd.DataFrame({"ts_ms": [10_000, 30_000]})
+    known = HistoricalFees(tmp_path).apply(trades, "A", {"A": ("quadratic", 1.0)})
+    assert known.tolist() == [False, True]
+
+
+def test_manifest_detects_added_and_modified_inputs(tmp_path):
+    from dh.research.evidence_manifest import input_manifest, manifest_matches
+    (tmp_path / "series").mkdir()
+    p = tmp_path / "series" / "x.json"
+    p.write_text("{}")
+    m = input_manifest(tmp_path)
+    assert manifest_matches(tmp_path, m)
+    p.write_text('{"x":1}')
+    assert not manifest_matches(tmp_path, m)
+
+
+def test_implementation_manifest_detects_dirty_cost_changes_without_host_secrets(tmp_path):
+    from dh.research.evidence_manifest import implementation_manifest
+    (tmp_path / "config").mkdir()
+    fee = tmp_path / "config" / "fees.yaml"
+    fee.write_text("rate: 1")
+    (tmp_path / "config" / "kalshi.yaml").write_text("secret: do not hash")
+    before = implementation_manifest(tmp_path)
+    fee.write_text("rate: 2")
+    after = implementation_manifest(tmp_path)
+    assert before != after
+    assert [r["path"] for r in before["files"]] == ["config/fees.yaml"]
+
+
+def test_fee_changes_apply_only_from_effective_time_and_preserve_zero_multiplier(tmp_path):
+    import json
+    from dh.research.historical_fees import HistoricalFees
+    (tmp_path / "series").mkdir()
+    (tmp_path / "series" / "A.json").write_text(json.dumps({"series": {"ticker": "A", "fee_type": "quadratic"}}))
+    p = tmp_path / "fees" / "series_fee_changes"
+    p.mkdir(parents=True)
+    (p / "A.json").write_text(json.dumps({"series_fee_change_arr": [
+        {"scheduled_ts": "1970-01-01T00:00:20Z", "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 0}]}))
+    trades = pd.DataFrame({"ts_ms": [19_999, 20_000, 30_000]})
+    known = HistoricalFees(tmp_path).apply(trades, "A", {"A": ("quadratic", 1.0)})
+    assert known.tolist() == [False, True, True]
+    assert trades.fee_multiplier.tolist() == [1, 0, 0]
+
+
+def test_public_tape_winners_do_not_promote_to_tradable(tmp_path, monkeypatch):
+    import dh.research.e0_history as e0
+    cells = pd.DataFrame({"cluster": [100, 200, 300, 400], "series": "A", "k": 1, "w": 1.0, "c_fill": True})
+    monkeypatch.setattr(e0, "build_cells", lambda *a, **k: (cells, {"unknown_fee_trades": 4}))
+    table = pd.DataFrame([dict(series="A", events=300, maker_net_c=1.0, net_lo_c=.5, net_lo_unadj_c=.6)])
+    monkeypatch.setattr(e0, "policy_tables", lambda *a, **k: {"series": table})
+    result = e0.run(tmp_path / "inputs", tmp_path / "out", ["A"], log=lambda _: None)
+    assert result["keep"] and result["confirmation_candidates"]
+    assert result["tradable"] is False and not result["verdict"].startswith("GO")
+    assert any("historical fees unknown" in s for s in result["promotion_blockers"])

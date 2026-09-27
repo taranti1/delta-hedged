@@ -420,7 +420,8 @@ class LiveApp:
         log_dir = _resolve(paths.log_dir)
         self.jsonlog = JsonLog(log_dir / f"{self.session_id}.jsonl", digest, sha)
         self._log("session_start", mode=mode, session=self.session_id, git_sha=sha, strategy_digest=scfg.digest(),
-                  live_digest=lcfg.digest(), host=socket.gethostname(), pid=os.getpid(), id_prefix=self.id_prefix)
+                  live_digest=lcfg.digest(), host=socket.gethostname(), pid=os.getpid(), id_prefix=self.id_prefix,
+                  hedge_enabled=scfg.hedge.enabled)
         log.info("session %s mode=%s strategy=%s live=%s sha=%s ids=%s-*", self.session_id, mode, scfg.digest(),
                  lcfg.digest(), sha, self.id_prefix)
         store = RiskStateStore(_resolve(paths.risk_state_for(mode)))
@@ -564,7 +565,8 @@ class LiveApp:
                 log.warning("risk state: fill/settlement rows outside %s skipped: %s", list(series), rest_pnl.foreign)
         else:
             seed_ts = self.clock()  # the seed's decision time AND event time (one UTC day, even at midnight)
-        seed = decide_seed(seed_ts, prev_state, rest_pnl, reset=self.reset_daily_halt)
+        seed = decide_seed(seed_ts, prev_state, rest_pnl, reset=self.reset_daily_halt,
+                           independent_paper=(mode == "paper"))
         self.info["risk_seed"] = {"day_start_ns": seed.day_start_ns, "day_pnl_usd": round(seed.day_pnl_usd, 6),
                                   "real_pnl_usd": round(seed.real_pnl_usd, 6), "realized_usd": round(seed.realized_usd, 6),
                                   "mark_usd": round(seed.mark_usd, 6), "budget_base_usd": round(seed.budget_base_usd, 6),

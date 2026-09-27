@@ -117,7 +117,9 @@ PRIOR_METHOD = "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
 
 @dataclass(frozen=True)
 class FairValueCfg:
-    tail: str = "gauss"  # gauss | student_t | vol_mixture (research picks; see docs/research/01)
+    # Legacy compatibility fields below do NOT override the fitted model artifact.
+    # MarketMaker rejects changes to them; select models via fv_model instead.
+    tail: str = "gauss"
     student_nu: float = 5.0
     mixture_cv: float = 0.25
     vol_half_life_s: float = 1800.0  # EWMA half-life on benchmark returns
@@ -136,6 +138,7 @@ class FairValueCfg:
 class QuotingCfg:
     enabled_series: tuple[str, ...] = ("KXBTCD",)
     max_ticks_from_touch: int = 3
+    touch_only: bool = False  # strictly join the current same-side best; no improve/fair-price candidates
     clip_contracts: float = 5.0  # size per quote (contracts)
     v_min_dollars: float = 0.001  # min net value per filled contract to quote (0.1c)
     kappa_replace_per_s: float = 0.0002  # EVrate improvement ($/s) required to cancel/replace

@@ -64,7 +64,7 @@ DEFAULT_GRID: dict[str, dict[str, dict[str, Any]]] = {
     "age_only_5s": {"quoting": {"replace_rel": 0.0, "min_order_age_ms": 5_000, "kappa_replace_per_s": 0.0}},
     "join_only": {"fill": {"improve_rate_mult": 0.0}},
     "improve_x2": {"fill": {"improve_rate_mult": 2.0}},
-    "touch_only": {"quoting": {"max_ticks_from_touch": 0}},
+    "touch_only": {"quoting": {"touch_only": True}},
     "wide_ladder": {"quoting": {"max_ticks_from_touch": 6}},
 }
 

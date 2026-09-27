@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -298,8 +299,17 @@ class PaperCfg:
     submit_ms: float = 40.0  # lognormal medians (ms); replace with measured RTTs
     response_ms: float = 40.0
     ws_ms: float = 25.0
+    md_ms: float = 25.0  # public market-data receive delay; calibrate from the recorder
     sigma: float = 0.4  # lognormal sigma; 0 = fixed delays
     latency_multiplier: float | None = None  # None = simulator default (1.5 under policy C)
+
+    def __post_init__(self) -> None:
+        for name in ("submit_ms", "response_ms", "ws_ms", "md_ms", "sigma"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"paper.{name} must be finite and nonnegative")
+        if self.latency_multiplier is not None and (not math.isfinite(self.latency_multiplier) or self.latency_multiplier <= 0):
+            raise ValueError("paper.latency_multiplier must be finite and positive")
 
 
 @dataclass(frozen=True)

@@ -57,3 +57,10 @@ python -m dh.research.fv_study.run                           # reproduce the fai
 ```
 
 Live operation: `docs/RUNBOOK.md` (smoke tests -> recorder -> paper mode -> tiny live).
+
+September 27 review fixes, lossless log compression, rebuilt paper accounting, and remaining
+research requirements: [implementation review](docs/research/IMPLEMENTATION_REVIEW_2026_09_27.md).
+Paper restarts now represent independent portfolios; use the lifetime audit to join their
+fills to later outcomes. These fixes do not establish positive edge or change the no-live
+decision. See also [research integrity](docs/research/RESEARCH_INTEGRITY_2026_09_27.md) for
+flow-feature compatibility, recording coverage, historical fees, and evidence gates.

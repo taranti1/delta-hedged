@@ -1325,11 +1325,18 @@ def bind_replay_inputs(uni: Universe, *, fv_config: str | Path | Mapping[str, An
         uni.fv_config, uni.fv_config_source = resolve_fv_config(fv_config)
     if flow_segments is not None:
         if isinstance(flow_segments, Mapping):
+            if not uni.synthetic:
+                raise ValueError("unversioned flow mapping: use a production-feature-versioned artifact")
             uni.flow_segments, uni.flow_meta, uni.flow_source = dict(flow_segments), {}, "given"
         else:
             from dh.research.calibrate_flow import load_segments
 
+            from dh.strategy.flow_features import PRODUCTION_FEATURE_VERSION
+
             seg, meta = load_segments(flow_segments)
+            if not (uni.synthetic and meta.get("synthetic") is True):
+                from dh.strategy.flow_features import validate_feature_version
+                validate_feature_version(meta, PRODUCTION_FEATURE_VERSION)
             uni.flow_segments, uni.flow_meta, uni.flow_source = seg, meta, Path(flow_segments).name
     return uni
 

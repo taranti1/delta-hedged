@@ -1,6 +1,6 @@
 """Risk state carried across restarts (audit live C1; live review N1, N3, N7, N8).
 
-A restart must never hand the strategy a fresh daily-loss budget, forget a Halt or cut a
+A live restart must never hand the strategy a fresh daily-loss budget, forget a Halt or cut a
 pause short. It must not invent losses either: a pessimistic seed halts ordinary restarts for
 the rest of the day.
 
@@ -43,6 +43,10 @@ The seed (dh.core.events.RiskStateSeed, the strategy's first event, recorded for
     realized = min(persisted realized, REST realized)       (live; paper: persisted)
     real     = realized + the FRESH open value                (a persisted mark is never reused)
     seed     = real - budget base                             (what counts toward the loss limit)
+Paper runners explicitly start independent simulated portfolios: their simulator does not
+restore old inventory, so prior cash and marks are excluded together. Halt/pause state is
+still carried. Use the lifetime fill/outcome ledger for paper performance across restarts;
+the new session's risk seed is not cumulative paper profit.
 A halt is carried when its reason is sticky (anything but the daily loss: position
 reconciliation, fee mismatch, the watchdog's cancel-all) or when it was decided on the same
 UTC day: a daily-loss halt ends at midnight even if the halted runner kept running past it.
@@ -63,7 +67,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -776,12 +780,24 @@ class SeedDecision:
     halt_day_ns: int = 0
 
 
-def decide_seed(now_ns: int, prev: RiskState | None, rest_pnl: Any, *, reset: bool = False) -> SeedDecision:
+def decide_seed(now_ns: int, prev: RiskState | None, rest_pnl: Any, *, reset: bool = False,
+                independent_paper: bool = False) -> SeedDecision:
     """Combine the persisted state and the REST derivation (module docstring). ``rest_pnl`` is a
-    DayPnl (anything with ``pnl_usd`` and ``open_usd``) or None (paper)."""
+    DayPnl (anything with ``pnl_usd`` and ``open_usd``) or None. ``independent_paper``
+    starts an independent simulated portfolio: no old inventory is restored, so neither
+    its cash nor its mark can carry over. Halt/pause safety still carries across sessions.
+    Lifetime paper performance must be computed from the complete fill/outcome audit."""
+    if independent_paper:
+        if rest_pnl is not None:
+            raise ValueError("independent paper accounting cannot use live REST P&L")
+        if prev is not None:
+            prev = replace(prev, day_pnl_usd=0.0, realized_usd=0.0, mark_usd=0.0, budget_base_usd=0.0)
     ds = day_start(now_ns)
     same_day = prev is not None and prev.day_start_ns == ds
     notes: list[str] = []
+    if independent_paper:
+        notes.append("independent paper portfolio: prior cash and inventory marks excluded; "
+                     "use the lifetime fill/outcome audit for cross-session performance")
     realized: list[float] = []
     real_caps: list[float] = []
     mark = 0.0

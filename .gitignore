@@ -5,6 +5,7 @@ __pycache__/
 .hypothesis/
 *.egg-info/
 # Captured market data and large research inputs stay local (append-only store).
+data/
 data/raw/
 data/cache/
 data/external/

@@ -49,3 +49,75 @@ def test_block_trades_excluded():
                                 is_block_trade=False) for k in range(50)])
     seg = calibrate(trades, pd.DataFrame([_market(0)]), pd.DataFrame({"ts_ms": [0], "price": [100_000.0]}))
     assert seg[("*", "*", "bid")].size_mean == pytest.approx(1.0)
+
+
+def test_near_cap_range_uses_nearest_boundary():
+    from dh.research.calibrate_flow import order_sizes
+    row = pd.DataFrame([dict(ticker="R", ts_ms=0, expiration_ts_ms=60_000,
+                             floor_strike=80_000, cap_strike=100_000, contracts=1, taker_side="no")])
+    assert list(order_sizes(row, lambda _: 100_000.0, .4)) == [("30-60s", "atm", "bid")]
+
+
+def test_gap_excludes_both_orders_and_exposure_but_quiet_time_counts():
+    from dh.research.calibrate_flow import flow_stats
+    mk = pd.DataFrame([dict(ticker="R", open_ts_ms=0, expiration_ts_ms=60_000,
+                            floor_strike=100_000, cap_strike=np.nan)])
+    orders = pd.DataFrame([dict(ticker="R", ts_ms=t, expiration_ts_ms=60_000,
+                               floor_strike=100_000, cap_strike=np.nan, contracts=1, taker_side="no")
+                           for t in (5_000, 25_000, 45_000)])
+    coverage = {"R": [(0, 20_000), (40_000, 60_000)]}
+    a = flow_stats(orders, mk, lambda _: 100_000.0, grid_s=1, coverage=coverage)
+    assert sum(a.exposure.values()) == 80  # 40 seconds * two sides, including quiet seconds
+    assert sum(map(len, a.sizes.values())) == 2
+    b = flow_stats(orders[orders.ts_ms != 25_000], mk, lambda _: 100_000.0, grid_s=1, coverage=coverage)
+    assert a.exposure == b.exposure and a.sizes == b.sizes
+
+
+def test_flow_proxy_cannot_be_loaded_for_production(tmp_path):
+    from dh.research.calibrate_flow import save_segments, load_segments
+    from dh.strategy.flow_features import PRODUCTION_FEATURE_VERSION
+    p = save_segments({}, tmp_path / "segments.json")
+    with pytest.raises(ValueError, match="incompatible flow features"):
+        load_segments(p, expected_feature_version=PRODUCTION_FEATURE_VERSION)
+
+
+def test_reference_staleness():
+    from dh.research.calibrate_flow import _price_fn
+    f = _price_fn(pd.DataFrame({"ts_ms": [0], "price": [123.0]}), 0, max_age_ms=3000)
+    assert f(2999) == 123 and f(3001) is None
+
+
+def test_delayed_print_health_and_features_use_receive_clock():
+    from dh.research.calibrate_flow import order_sizes
+    # The first print matched during healthy time but arrived during a recording gap.
+    # The second is backlog from the gap and must not count as fresh flow after recovery.
+    # Only the third matched and arrived during the same healthy interval.
+    rows = pd.DataFrame([dict(ticker="R", ts_ms=1000, ts_recv_ms=2500, expiration_ts_ms=60_000,
+                              floor_strike=100_000, cap_strike=np.nan, contracts=9, taker_side="no"),
+                         dict(ticker="R", ts_ms=2500, ts_recv_ms=4500, expiration_ts_ms=60_000,
+                              floor_strike=100_000, cap_strike=np.nan, contracts=7, taker_side="no"),
+                         dict(ticker="R", ts_ms=39_500, ts_recv_ms=40_000, expiration_ts_ms=60_000,
+                              floor_strike=100_000, cap_strike=np.nan, contracts=2, taker_side="no")])
+    queried = []
+    def price(at):
+        queried.append(at)
+        return 100_000.0 if at >= 4000 else 80_000.0
+    result = order_sizes(rows, price, .4, coverage={"R": [(0, 2000), (4000, 60_000)]})
+    assert result == {("<30s", "atm", "bid"): [2]}
+    assert queried == [40_000]
+
+
+def test_reconstructed_sweep_crossing_gap_is_excluded():
+    from dh.research.calibrate_flow import taker_orders, order_sizes
+    prints = pd.DataFrame({"ticker": ["R", "R"], "ts_ms": [1000, 1000], "ts_recv_ms": [1500, 4500],
+                           "taker_side": ["no", "no"], "qty": [100, 200], "yes_px": [5000, 4900]})
+    orders = taker_orders(prints).assign(expiration_ts_ms=60_000, floor_strike=100_000, cap_strike=np.nan)
+    assert orders.iloc[0].ts_recv_ms == 4500 and orders.iloc[0].ts_recv_first_ms == 1500
+    assert not order_sizes(orders, lambda _: 100_000.0, .4, coverage={"R": [(0, 2000), (4000, 6000)]})
+    # With continuous observation the complete sweep becomes observable at its last receipt.
+    queried = []
+    def price(at):
+        queried.append(at)
+        return 100_000.0
+    result = order_sizes(orders, price, .4, coverage={"R": [(0, 6000)]})
+    assert sum(map(sum, result.values())) == 3 and queried == [4500]

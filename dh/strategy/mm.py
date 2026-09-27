@@ -69,8 +69,9 @@ from dh.models.fvmodel import FairValueModel, load_recommended_config
 from dh.models.tails import GAUSS, make_tail
 from dh.settlement.closemark import CloseMark, WindowOutcome, close_mark, evaluate_window
 from dh.settlement.window import SettlementTracker
-from dh.strategy.config import StrategyConfig
+from dh.strategy.config import FairValueCfg, StrategyConfig
 from dh.strategy.fill_model import AdverseSelectionModel, FillIntensityModel, SegmentFlow
+from dh.strategy.flow_features import PRODUCTION_FEATURE_VERSION
 from dh.strategy.hedging import decide_hedge, hedge_cost_frac
 from dh.strategy.quoting import ExistingOrder, MarketQuoteContext, decide_side
 from dh.strategy.risk import RiskEngine
@@ -133,6 +134,13 @@ class MarketMaker:
         requote_move_sigma: float = 2.0,
     ) -> None:
         self.cfg = cfg
+        legacy = FairValueCfg()
+        unsupported = [k for k in ("tail", "student_nu", "mixture_cv", "vol_half_life_s", "use_seasonality",
+                                     "nowcast", "nowcast_beta")
+                       if getattr(cfg.fair_value, k) != getattr(legacy, k)]
+        if unsupported:
+            raise ValueError("Unsupported fair_value overrides: " + ", ".join(unsupported)
+                             + "; use an explicit fitted fv_model or research nowcast implementation")
         self.specs: dict[str, MarketSpec] = {s.ticker: s for s in specs}
         self.books: dict[str, KalshiBook] = {t: KalshiBook(t) for t in self.specs}
         self.ext: dict[str, ExtBook] = {}
@@ -192,7 +200,11 @@ class MarketMaker:
         self.paused: set[str] = set()
         # fee without event overrides (restored when an override is cleared; audit live m7)
         self.base_fee: dict[str, tuple[str, float]] = {t: sp.base_fee for t, sp in self.specs.items()}
-        self.fee_tolerance_micros = 10_000  # one cent of balance rounding per fill
+        self.fee_tolerance_micros = 1  # wire/model micro-dollar precision only
+        self._fee_accumulators: dict = {}
+        self._fee_seen: set[str] = set()
+        self._fee_residual_micros = 0
+        self._retained_candidates: dict = {}
         self.stats = MMStats()
         self.brti_hist: deque[tuple[int, float]] = deque()
 
@@ -267,7 +279,7 @@ class MarketMaker:
         # $ per sqrt(second) for a 1-minute-ahead window; floor from config
         s = self.fv.sigma_abs(now, now + 60 * NS_PER_S, spot) if self.fv.ready else 0.0
         floor = spot * self.cfg.fair_value.vol_floor_ann / math.sqrt(SEC_YR)
-        return max(s, floor)
+        return min(max(s, floor), spot * self.cfg.fair_value.vol_cap_ann / math.sqrt(SEC_YR))
 
     def _contracts(self, ticker: str) -> float:
         return self.om.position(ticker) / QTY_SCALE
@@ -385,9 +397,9 @@ class MarketMaker:
         return out
 
     def _on_order_event(self, ev) -> list[Action]:
-        return self._handle_order_events(self.om.on_event(ev))
+        return self._handle_order_events(self.om.on_event(ev), fill_source=ev if isinstance(ev, KalshiFill) else None)
 
-    def _handle_order_events(self, oes) -> list[Action]:
+    def _handle_order_events(self, oes, fill_source=None) -> list[Action]:
         out: list[Action] = []
         for oe in oes:
             k = oe.kind
@@ -410,7 +422,9 @@ class MarketMaker:
                 fv = self.fvc.get(oe.ticker)
                 out.append(Log("fill", {"ticker": oe.ticker, "coid": oe.client_order_id, "side": oe.book_side,
                                         "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
-                                        "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id}))
+                                        "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id,
+                                        "ts_recv": oe.ts, "ts_exch": getattr(fill_source, "ts_exch", 0),
+                                        "fv_ts": None if fv is None else fv.ts}))
             elif k in ("filled", "canceled", "rejected"):
                 self._queue_pending_since.pop(oe.client_order_id, None)
                 self._own_delta_seen.pop(oe.client_order_id, None)
@@ -512,17 +526,34 @@ class MarketMaker:
 
     def _reconcile_fee(self, ev: KalshiFill) -> list[Action]:
         """Compare the exchange-reported fee of our fill with the fee model (audit M6).
-        The reported fee may include up to one balance unit of rounding (or a rebate)."""
+        Reconcile known trade/net conventions with per-order rounding and rebate carry."""
         sched = self.fee_sched.get(ev.ticker)
         if sched is None:
             return []
-        expected = sched.trade_fee_micros(ev.yes_px, ev.qty, ev.is_taker)
+        aliases = [x for x in (ev.trade_id, ev.fill_id) if x]
+        if any(x in self._fee_seen for x in aliases):
+            return []
+        self._fee_seen.update(aliases)
+        key = (ev.ticker, ev.order_id or ev.client_order_id, ev.book_side)
+        accumulator = self._fee_accumulators.get(key)
+        if accumulator is None:
+            accumulator = self._fee_accumulators[key] = sched.order_accumulator(ev.book_side)
+        accumulator.schedule = sched  # fee overrides preserve this order's rebate carry
+        breakdown = accumulator.apply_fill(ev.yes_px, ev.qty, ev.is_taker, ev.ts_exch or ev.ts)
+        # Recorded WS/REST fee_cost may report trade fees alone or net fees. Accept
+        # those two known conventions, not arbitrary discrepancies within one cent.
+        expected = min((breakdown.trade_micros, breakdown.net_micros),
+                       key=lambda x: abs(ev.fee_micros - x))
         diff = ev.fee_micros - expected
-        if abs(diff) <= self.fee_tolerance_micros:
+        self._fee_residual_micros += abs(diff)
+        precision = sched.rates.balance_precision_micros
+        if abs(diff) <= self.fee_tolerance_micros and self._fee_residual_micros < precision:
             return []
         out: list[Action] = [Log("fees", {"event": "fee_mismatch", "ticker": ev.ticker, "reported": ev.fee_micros,
                                           "expected": expected, "px": ev.yes_px, "qty": ev.qty,
-                                          "taker": ev.is_taker})]
+                                          "trade_fee": breakdown.trade_micros, "net_fee": breakdown.net_micros,
+                                          "cumulative_residual": self._fee_residual_micros,
+                                          "balance_precision": precision, "taker": ev.is_taker})]
         for a in self.risk.on_fee_mismatch(ev.ts, f"{ev.ticker}:{ev.fee_micros}vs{expected}"):
             out += self._apply_risk_action(ev.ts, a)
         return out
@@ -616,6 +647,8 @@ class MarketMaker:
         src = getattr(self, "last_brti_src_ns", 0)
         if src:
             age = max(age, (now - src) / NS_PER_S)  # audit m2: source age counts too
+        if age > self.cfg.fair_value.max_benchmark_age_s:
+            return None, 0.0
         age += 0.25  # relay latency allowance
         return S, self._sigma_1s(now, S) * math.sqrt(age)
 
@@ -623,7 +656,8 @@ class MarketMaker:
         horizon = max(0.0, (spec.expiration_ts - now) / NS_PER_S)
         tail, c = self.fv.tails.at(horizon)
         sig = self.fv.sigma_abs(now, spec.expiration_ts, S) * c
-        sig = max(sig, S * self.cfg.fair_value.vol_floor_ann / math.sqrt(SEC_YR))
+        sig = min(max(sig, S * self.cfg.fair_value.vol_floor_ann / math.sqrt(SEC_YR)),
+                  S * self.cfg.fair_value.vol_cap_ann / math.sqrt(SEC_YR))
         center = digital(spec, ws, S, sig, tail, nowcast_sd=ns_sd)
         lo = hi = center.p_yes
         fvc = self.cfg.fair_value
@@ -642,6 +676,13 @@ class MarketMaker:
         out: list[Action] = []
         self.last_cycle_ns = now
         self.stats.cycles += 1
+        if self.stats.cycles == 1:
+            out.append(Log("effective_model", {"fv_model_hash": self.fv.effective_hash,
+                "fv_artifact_hash": self.fv.artifact_hash, "fv_fitted_to_utc": self.fv.fitted_to_utc,
+                "effective_config": self.fv.effective_config(), "strategy_digest": cfg.digest(),
+                "strategy_implementation": "profit_review_v2", "feature_version": PRODUCTION_FEATURE_VERSION,
+                "nowcast_implementation": type(self).__name__, "nowcast": cfg.fair_value.nowcast,
+                "legacy_tail_field": cfg.fair_value.tail}))
         health = self.risk.health(now)
         # loss limits first and every cycle, healthy or not: a cycle that halts sends no new
         # orders (audit live m5), and losses are checked while quoting is paused too; positions
@@ -658,20 +699,23 @@ class MarketMaker:
             return out
         S, ns_sd = self._nowcast(now)
         if S is None:
+            for w in self.om.working():
+                out += self._cancel(now, w, "benchmark_age")
             return out
         self.last_cycle_spot = S
         # ---------------------------------------------------- per event
-        events: dict[int, list[MarketSpec]] = {}
+        events: dict[str, list[MarketSpec]] = {}
         for t, spec in self.specs.items():
             if t in self.settled or now >= spec.close_ts or spec.series_ticker not in q.enabled_series:
                 continue
             tau = (spec.expiration_ts - now) / NS_PER_S
             if tau <= 0 or tau > q.max_tau_s:
                 continue
-            events.setdefault(spec.expiration_ts, []).append(spec)
+            events.setdefault(self._settlement_key(spec), []).append(spec)
         D = self.hedge_pos
         ctxs: list[tuple[MarketSpec, MarketFV, EventGrid, dict, np.ndarray]] = []
-        for T, specs in sorted(events.items()):
+        for _, specs in sorted(events.items()):
+            T = specs[0].expiration_ts
             ws = self.tracker.window_state(specs[0].settlement, T, now)
             fvs = {s.ticker: self._band(s, ws, S, now, ns_sd) for s in specs}
             for s in specs:
@@ -702,29 +746,20 @@ class MarketMaker:
                                                       "ws": ws, "specs": specs}, base))
         # ---------------------------------------------------- per market-side decisions
         c_h = hedge_cost_frac(cfg.hedge, urgent=False)
-        total_wc = 0.0
-        event_wc: dict[str, float] = {}
-        working_all = [w for w in self.om.working() if w.remaining_qty > 0]
-        for s, f, grid, ev, base in ctxs:
-            e = s.event_ticker
-            if e in event_wc:
-                continue
-            ws = ev["ws"]
-            mine = {x.ticker for x in ev["specs"]}
-            wk = [(w.ticker, w.book_side, w.px / PX_SCALE, w.remaining_qty / QTY_SCALE)
-                  for w in working_all if w.ticker in mine]
-            event_wc[e] = worst_case_loss_with_orders(
-                {x.ticker: x for x in ev["specs"]}, ev["positions"], ev["basis"], wk, S,
-                stress_frac=cfg.risk.stress_move_frac, n_obs=ws.n_obs, sum_fixed=ws.sum_fixed,
-                m_remaining=ws.m_remaining)
-            total_wc += event_wc[e]
-        # events already over their loss limit (e.g. after fills): pull their working orders
+        # Risk covers every unresolved exposure, including closed/disabled/out-of-horizon
+        # markets and terminal orders whose fill messages have not arrived yet.
+        working_all = [w for w in self.om.all_orders()
+                       if w.could_fill_qty > 0]
+        risk_groups = self._risk_groups(now, S, working_all)
+        event_wc = {e: self._group_loss(g) for e, g in risk_groups.items()}
+        total_wc = sum(event_wc.values())
         for e, wc in event_wc.items():
             if wc > cfg.risk.max_event_worst_loss:
                 self.stats.bump("event_over_limit")
                 for w in working_all:
-                    if self.specs[w.ticker].event_ticker == e:
+                    if self._settlement_key(self.specs[w.ticker]) == e:
                         out += self._cancel(now, w, "event_over_limit")
+        self._retained_candidates = {}
         proposals: list[tuple[float, MarketSpec, str, object, MarketFV]] = []
         for s, f, grid, ev, base in ctxs:
             acts, props = self._quote_market(now, s, f, grid, ev, base, S, D, c_h, health)
@@ -735,12 +770,12 @@ class MarketMaker:
             fw = self.fvc.get(w.ticker)
             if fw is None:
                 continue
-            c = (1 if w.book_side == "bid" else -1) * (w.remaining_qty + w.inflight_fill_qty) / QTY_SCALE * fw.delta
+            c = (1 if w.book_side == "bid" else -1) * w.could_fill_qty / QTY_SCALE * fw.delta
             if c > 0:
                 d_up += c
             else:
                 d_dn += c
-        out += self._admit(now, proposals, event_wc, total_wc, d_up, d_dn)
+        out += self._admit(now, proposals, risk_groups, event_wc, total_wc, d_up, d_dn)
         # ---------------------------------------------------- hedge
         if cfg.hedge.enabled and health.hedging_allowed:
             out += self._hedge(now, S, D)
@@ -805,13 +840,16 @@ class MarketMaker:
             tail_budget=cfg.risk.tail_budget, D_btc=D, hedge_cost_frac=c_h, spot=S,
             rho_hedged=cfg.hedge.rho_hedged_fraction if cfg.hedge.enabled else 0.0,
             clip_contracts=q.clip_contracts, capacity_contracts=cap, existing=existing,
-            max_ticks_from_touch=q.max_ticks_from_touch, price_floor_px=q.price_floor_px,
+            max_ticks_from_touch=q.max_ticks_from_touch, touch_only=q.touch_only, price_floor_px=q.price_floor_px,
             price_cap_px=q.price_cap_px, rounding_per_order=q.expected_rounding_per_order,
             order_fee=lambda px, size, side, tk=t: self._order_fee(tk, px, size, side),
         )
         for side in ("bid", "ask"):
             d = decide_side(ctx, side, self.flow, self.adverse, q.v_min_dollars, q.kappa_replace_per_s,
                             replace_rel=q.replace_rel, min_age_ns=q.min_order_age_ms * NS_PER_MS)
+            for candidate in d.existing_eval:
+                if candidate.existing_id in d.keep:
+                    self._retained_candidates[candidate.existing_id] = candidate
             for coid in d.cancel:
                 w = self.om.order(coid)
                 if w is not None:
@@ -822,34 +860,131 @@ class MarketMaker:
                 props.append((d.place.score, s, side, d.place, f))
         return out, props
 
-    def _admit(self, now: int, proposals, event_wc: dict[str, float], total_wc: float, d_up: float,
-               d_dn: float) -> list[Action]:
-        """Greedy cross-market admission by score (EV rate per $ of collateral) under the
-        event/total worst-case loss limits and the portfolio delta limit. Each admitted order
-        adds its maximum loss (bid: px * n, ask: (1 - px) * n) to the headroom accounting.
-        The delta limit is checked against one-sided worst cases that already include every
-        working order (d_up: all delta-increasing orders fill; d_dn: all decreasing ones),
-        so orders blocked in one cycle cannot slip in on the next (audit M2)."""
-        cfg = self.cfg
-        q = cfg.quoting
-        out: list[Action] = []
-        ewc = dict(event_wc)
-        twc = total_wc
-        for score, s, side, cand, f in sorted(proposals, key=lambda p: (-p[0], p[1].ticker, p[2])):
-            px = cand.px / PX_SCALE
-            n = cand.size
-            add = n * (px if side == "bid" else 1.0 - px)
-            e = s.event_ticker
-            if not self.risk.loss_limits_ok(event_worst_loss=ewc.get(e, 0.0) + add, total_worst_loss=twc + add):
-                self.stats.bump("blocked:loss_limit")
+    @staticmethod
+    def _settlement_key(spec: MarketSpec) -> str:
+        st = spec.settlement
+        return f"{spec.expiration_ts}:{st.index_id}:{st.n_obs}:{st.step_ns}:{st.include_close_tick}:{st.round_decimals}"
+
+    def _risk_groups(self, now, spot, working):
+        groups = {}
+        exposed = {w.ticker for w in working}
+        for t, spec in self.specs.items():
+            if t in self.settled:
                 continue
+            tau = (spec.expiration_ts - now) / NS_PER_S
+            eligible = (spec.series_ticker in self.cfg.quoting.enabled_series and now < spec.close_ts
+                        and 0 < tau <= self.cfg.quoting.max_tau_s)
+            if not eligible and t not in exposed and not self._contracts(t):
+                continue
+            key = self._settlement_key(spec)
+            if key not in groups:
+                groups[key] = {"specs": {}, "positions": {}, "basis": {}, "working": [], "admitted": [],
+                               "spot": spot, "ws": self.tracker.window_state(spec.settlement, spec.expiration_ts, now)}
+            g = groups[key]
+            g["specs"][t] = spec
+            g["positions"][t] = self._contracts(t)
+            g["basis"][t] = self._cost_basis(t)
+        for w in working:
+            spec = self.specs.get(w.ticker)
+            if spec is not None and w.ticker not in self.settled:
+                groups[self._settlement_key(spec)]["working"].append(w)
+        return groups
+
+    def _group_loss(self, group, extra=(), exclude=frozenset()):
+        ws = group["ws"]
+        working = [(w.ticker, w.book_side, w.worst_case_px / PX_SCALE,
+                    w.could_fill_qty / QTY_SCALE)
+                   for w in group["working"] if w.client_order_id not in exclude]
+        return worst_case_loss_with_orders(
+            group["specs"], group["positions"], group["basis"], working + group["admitted"] + list(extra),
+            group["spot"], stress_frac=self.cfg.risk.stress_move_frac, n_obs=ws.n_obs,
+            sum_fixed=ws.sum_fixed, m_remaining=ws.m_remaining)
+
+    def _reserved_collateral(self) -> float:
+        """Conservative funding bound, independent of scenario/risk netting.
+
+        Positions reserve the full $1 payout per contract (cost basis can include realized
+        cash, so is unsafe as an available-balance estimate). Every pending order and
+        undelivered fill reserves its standalone YES/NO premium until acknowledged.
+        No account balance or cross-order collateral netting is assumed here.
+        """
+        positions = sum(abs(self._contracts(t)) for t in self.specs if t not in self.settled)
+        orders = sum((w.worst_case_px / PX_SCALE if w.book_side == "bid" else 1 - w.worst_case_px / PX_SCALE)
+                     * w.could_fill_qty / QTY_SCALE
+                     for w in self.om.all_orders() if w.ticker not in self.settled)
+        return positions + orders
+
+    def _admit(self, now: int, proposals, groups, event_wc: dict[str, float], total_wc: float,
+               d_up: float, d_dn: float) -> list[Action]:
+        """Rank opportunities and recompute exact scenario loss over every fill subset.
+
+        Cancellation never releases capacity until acknowledged. A blocked better opportunity
+        can cancel a weaker retained quote; admission is reconsidered with fresh inputs on the
+        next cycle. Queue priority, age and absolute/relative improvement enter that decision.
+        """
+        cfg, q = self.cfg, self.cfg.quoting
+        out: list[Action] = []
+        ewc, twc = dict(event_wc), total_wc
+        collateral = self._reserved_collateral()
+        logged_constraints = set()
+        for score, s, side, cand, f in sorted(proposals, key=lambda p: (-p[0], p[1].ticker, p[2])):
+            n = cand.size
+            e = self._settlement_key(s)
+            order = (s.ticker, side, cand.px / PX_SCALE, n)
+            new_loss = self._group_loss(groups[e], extra=[order])
+            new_total = twc - ewc[e] + new_loss
             c = (1 if side == "bid" else -1) * n * f.delta
             base = d_up if c >= 0 else d_dn
-            if not self.risk.delta_ok(abs(base + c), abs(base)):
-                self.stats.bump("blocked:delta")
+            added_collateral = n * (cand.px / PX_SCALE if side == "bid" else 1 - cand.px / PX_SCALE)
+            reason = ""
+            if collateral + added_collateral > cfg.risk.risk_capital + 1e-9:
+                reason = "collateral"
+            elif not self.risk.loss_limits_ok(event_worst_loss=new_loss, total_worst_loss=new_total):
+                reason = "loss_limit"
+            elif not self.risk.delta_ok(abs(base + c), abs(base)):
+                reason = "delta"
+            if reason:
+                self.stats.bump("blocked:" + reason)
+                # Best rejected opportunity per binding constraint, without recording every loser.
+                if reason not in logged_constraints:
+                    logged_constraints.add(reason)
+                    out.append(Log("opportunity_rejected", {**cand.as_log(), "constraint": reason,
+                                "event_worst_loss": new_loss, "total_worst_loss": new_total,
+                                "required_collateral": collateral + added_collateral,
+                                "capital_budget": cfg.risk.risk_capital}))
+                for coid, old in sorted(self._retained_candidates.items(), key=lambda item: item[1].score):
+                    w = self.om.order(coid)
+                    if (w is None or w.cancel_requested or w.state.name != "RESTING"
+                            or w.inflight_fill_qty > 0 or now - w.created_ns < q.min_order_age_ms * NS_PER_MS
+                            or score <= old.score or cand.ev_rate <= old.ev_rate * (1 + q.replace_rel) + q.kappa_replace_per_s):
+                        continue
+                    old_e = self._settlement_key(self.specs[w.ticker])
+                    excluded = frozenset([coid])
+                    reduced_old = self._group_loss(groups[old_e], exclude=excluded,
+                                                   extra=[order] if old_e == e else [])
+                    trial_event = reduced_old if old_e == e else new_loss
+                    trial_total = twc - ewc[old_e] + reduced_old
+                    if old_e != e:
+                        trial_total += new_loss - ewc[e]
+                    fw = self.fvc.get(w.ticker)
+                    old_delta = 0.0 if fw is None else (1 if w.book_side == "bid" else -1) * old.size * fw.delta
+                    trial_base = base - old_delta if c * old_delta > 0 else base
+                    old_collateral = old.size * (w.px / PX_SCALE if w.book_side == "bid" else 1 - w.px / PX_SCALE)
+                    if (collateral - old_collateral + added_collateral > cfg.risk.risk_capital + 1e-9
+                            or not self.risk.loss_limits_ok(event_worst_loss=trial_event, total_worst_loss=trial_total)
+                            or not self.risk.delta_ok(abs(trial_base + c), abs(trial_base))):
+                        continue
+                    canceled = self._cancel(now, w, "opportunity_cost")
+                    out += canceled
+                    if canceled:
+                        out.append(Log("allocation", {"event": "cancel_for_better_opportunity", "coid": coid,
+                                    "old_ev_rate": old.ev_rate, "candidate": cand.as_log(),
+                                    "constraint": reason, "await_cancel_ack": True}))
+                    break
                 continue
-            ewc[e] = ewc.get(e, 0.0) + add
-            twc += add
+            groups[e]["admitted"].append(order)
+            collateral += added_collateral
+            ewc[e], twc = new_loss, new_total
             if c >= 0:
                 d_up += c
             else:
@@ -866,7 +1001,14 @@ class MarketMaker:
             self.om.request_place(a, now)
             self.stats.quotes_placed += 1
             out.append(a)
-            out.append(Log("quote", cand.as_log()))
+            out.append(Log("quote", {**cand.as_log(), "coid": coid, "ts_decision": now,
+                                     "F": f.F, "F_lo": f.F_lo, "F_hi": f.F_hi, "fv_ts": f.ts,
+                                     "delta": f.delta, "z_near": f.z_near, "sd_R": f.sd_R,
+                                     "tau_s": (s.expiration_ts - now) / NS_PER_S,
+                                     "feature_version": PRODUCTION_FEATURE_VERSION,
+                                     "strategy_digest": cfg.digest(), "fv_model_hash": self.fv.effective_hash,
+                                     "fv_artifact_hash": self.fv.artifact_hash,
+                                     "fv_fitted_to_utc": self.fv.fitted_to_utc}))
         return out
 
     def _expiry_ns(self, now: int, coid: str) -> int:
