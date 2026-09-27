@@ -117,6 +117,7 @@ class MMStats:
 
 class MarketMaker:
     ORDER_GROUP_ID = "dh-main"
+    FEE_STATE_MAX = 50_000  # fee reconciliation memory (fills / orders) kept per session
 
     def __init__(
         self,
@@ -200,11 +201,12 @@ class MarketMaker:
         self.paused: set[str] = set()
         # fee without event overrides (restored when an override is cleared; audit live m7)
         self.base_fee: dict[str, tuple[str, float]] = {t: sp.base_fee for t, sp in self.specs.items()}
-        self.fee_tolerance_micros = 1  # wire/model micro-dollar precision only
-        self._fee_accumulators: dict = {}
-        self._fee_seen: set[str] = set()
-        self._fee_residual_micros = 0
+        self.fee_tolerance_micros = 1  # wire/model micro-dollar precision (plus each fill's rounding part)
+        self._fee_accumulators: dict = {}  # insertion ordered, bounded by FEE_STATE_MAX
+        self._fee_seen: dict[str, None] = {}  # insertion-ordered set, bounded by FEE_STATE_MAX
+        self._fee_residual: dict = {}  # per-order cumulative |reported - expected| (micros)
         self._retained_candidates: dict = {}
+        self._pending_evictions: set[str] = set()  # opportunity_cost cancels awaiting their ack
         self.stats = MMStats()
         self.brti_hist: deque[tuple[int, float]] = deque()
 
@@ -227,8 +229,10 @@ class MarketMaker:
 
     def prune_settled(self, before_ns: int) -> int:
         """Drop state for markets settled before `before_ns` with no position/working orders."""
+        reserved = {w.ticker for w in self.om.all_orders() if w.could_fill_qty > 0}
         drop = [t for t, s in self.specs.items()
-                if t in self.settled and s.expiration_ts < before_ns and not self.om.working(t)]
+                if t in self.settled and s.expiration_ts < before_ns and not self.om.working(t)
+                and t not in reserved]
         for t in drop:
             self.specs.pop(t, None)
             self.close_marks.pop(t, None)
@@ -533,11 +537,14 @@ class MarketMaker:
         aliases = [x for x in (ev.trade_id, ev.fill_id) if x]
         if any(x in self._fee_seen for x in aliases):
             return []
-        self._fee_seen.update(aliases)
+        self._fee_seen.update(dict.fromkeys(aliases))
         key = (ev.ticker, ev.order_id or ev.client_order_id, ev.book_side)
         accumulator = self._fee_accumulators.get(key)
         if accumulator is None:
             accumulator = self._fee_accumulators[key] = sched.order_accumulator(ev.book_side)
+        for d in (self._fee_seen, self._fee_accumulators, self._fee_residual):
+            while len(d) > self.FEE_STATE_MAX:
+                d.pop(next(iter(d)))
         accumulator.schedule = sched  # fee overrides preserve this order's rebate carry
         breakdown = accumulator.apply_fill(ev.yes_px, ev.qty, ev.is_taker, ev.ts_exch or ev.ts)
         # Recorded WS/REST fee_cost may report trade fees alone or net fees. Accept
@@ -545,14 +552,18 @@ class MarketMaker:
         expected = min((breakdown.trade_micros, breakdown.net_micros),
                        key=lambda x: abs(ev.fee_micros - x))
         diff = ev.fee_micros - expected
-        self._fee_residual_micros += abs(diff)
+        residual = self._fee_residual[key] = self._fee_residual.get(key, 0) + abs(diff)
         precision = sched.rates.balance_precision_micros
-        if abs(diff) <= self.fee_tolerance_micros and self._fee_residual_micros < precision:
+        # Per fill: the rounding/rebate part is convention-dependent (same bound as the live
+        # runner's reconcile_fill_fee); per order: small differences may not accumulate to a
+        # balance unit. Never a whole-session sum, which would halt on benign drift.
+        tolerance = max(self.fee_tolerance_micros, abs(breakdown.rounding_micros - breakdown.rebate_micros))
+        if abs(diff) <= tolerance and residual < precision:
             return []
         out: list[Action] = [Log("fees", {"event": "fee_mismatch", "ticker": ev.ticker, "reported": ev.fee_micros,
                                           "expected": expected, "px": ev.yes_px, "qty": ev.qty,
                                           "trade_fee": breakdown.trade_micros, "net_fee": breakdown.net_micros,
-                                          "cumulative_residual": self._fee_residual_micros,
+                                          "order_residual": residual, "tolerance": tolerance,
                                           "balance_precision": precision, "taker": ev.is_taker})]
         for a in self.risk.on_fee_mismatch(ev.ts, f"{ev.ticker}:{ev.fee_micros}vs{expected}"):
             out += self._apply_risk_action(ev.ts, a)
@@ -757,7 +768,8 @@ class MarketMaker:
             if wc > cfg.risk.max_event_worst_loss:
                 self.stats.bump("event_over_limit")
                 for w in working_all:
-                    if self._settlement_key(self.specs[w.ticker]) == e:
+                    spec = self.specs.get(w.ticker)
+                    if spec is not None and self._settlement_key(spec) == e:
                         out += self._cancel(now, w, "event_over_limit")
         self._retained_candidates = {}
         proposals: list[tuple[float, MarketSpec, str, object, MarketFV]] = []
@@ -952,13 +964,24 @@ class MarketMaker:
                                 "event_worst_loss": new_loss, "total_worst_loss": new_total,
                                 "required_collateral": collateral + added_collateral,
                                 "capital_budget": cfg.risk.risk_capital}))
+                # One eviction at a time: a cancel keeps its reservation until acknowledged, so a
+                # candidate still blocked next cycle must not evict a second quote meanwhile.
+                self._pending_evictions = {k for k in self._pending_evictions
+                                           if (pw := self.om.order(k)) is not None and pw.could_fill_qty > 0}
+                if self._pending_evictions:
+                    continue
                 for coid, old in sorted(self._retained_candidates.items(), key=lambda item: item[1].score):
                     w = self.om.order(coid)
                     if (w is None or w.cancel_requested or w.state.name != "RESTING"
                             or w.inflight_fill_qty > 0 or now - w.created_ns < q.min_order_age_ms * NS_PER_MS
                             or score <= old.score or cand.ev_rate <= old.ev_rate * (1 + q.replace_rel) + q.kappa_replace_per_s):
                         continue
-                    old_e = self._settlement_key(self.specs[w.ticker])
+                    old_spec = self.specs.get(w.ticker)
+                    if old_spec is None:
+                        continue
+                    old_e = self._settlement_key(old_spec)
+                    if old_e not in groups:
+                        continue
                     excluded = frozenset([coid])
                     reduced_old = self._group_loss(groups[old_e], exclude=excluded,
                                                    extra=[order] if old_e == e else [])
@@ -977,6 +1000,7 @@ class MarketMaker:
                     canceled = self._cancel(now, w, "opportunity_cost")
                     out += canceled
                     if canceled:
+                        self._pending_evictions.add(coid)
                         out.append(Log("allocation", {"event": "cancel_for_better_opportunity", "coid": coid,
                                     "old_ev_rate": old.ev_rate, "candidate": cand.as_log(),
                                     "constraint": reason, "await_cancel_ack": True}))

@@ -143,12 +143,15 @@ class KalshiExchangeSim:
         latency_multiplier: extra latency scale; default 1.5 for policy C, else 1.0.
         match_window_ns: trade-print <-> book-delta matching window (queue model).
         emit_order_updates: also emit KalshiOrderUpdate (user_orders) messages.
+        queue_hidden_frac / queue_hidden_qty: research stress, undisplayed queue ahead of every
+            arrival (``QueueEstimator`` hidden_frac / hidden_qty, qty in 0.01 contracts); 0 = off.
     """
 
     def __init__(self, latency: LatencyModel, fill_policy: str, fee_fn: FeeFn, seed: int = 0, *,
                  order_fee_fn: Callable[[str, str, int, int, bool], int] | None = None,
                  latency_multiplier: float | None = None, match_window_ns: int = 250_000_000,
-                 emit_order_updates: bool = True, id_prefix: str = "sim") -> None:
+                 emit_order_updates: bool = True, id_prefix: str = "sim",
+                 queue_hidden_frac: float = 0.0, queue_hidden_qty: int = 0) -> None:
         self.policy = normalize_policy(fill_policy)
         mult = latency_multiplier if latency_multiplier is not None else (1.5 if self.policy == "conservative" else 1.0)
         self.latency = latency.fork(seed, latency.multiplier * mult)
@@ -161,7 +164,8 @@ class KalshiExchangeSim:
         self.emit_order_updates = emit_order_updates
         self.id_prefix = id_prefix
         self.queue = QueueEstimator(self.policy, self._level_qty, match_window_ns=match_window_ns,
-                                    exch_offset_ns=self.md_offset)
+                                    exch_offset_ns=self.md_offset, hidden_frac=queue_hidden_frac,
+                                    hidden_qty=queue_hidden_qty)
         self.markets: dict[str, _Market] = {}
         self.orders: dict[str, _SimOrder] = {}  # order_id -> order (all, including done)
         self._resting: dict[str, _SimOrder] = {}  # order_id -> resting order (insertion ordered)

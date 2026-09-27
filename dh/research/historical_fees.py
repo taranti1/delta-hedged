@@ -20,6 +20,11 @@ def _ms(value) -> int | None:
         return None
 
 
+
+def _mult(value) -> float:
+    """fee_multiplier; an explicit null means the default 1 (0 stays 0)."""
+    return 1.0 if value is None else float(value)
+
 class HistoricalFees:
     def __init__(self, root: Path):
         self.series = {}
@@ -30,13 +35,13 @@ class HistoricalFees:
             rows = []
             at = raw.get("fetched_ns")
             if at and obj.get("fee_type"):
-                rows.append((int(at) // 1_000_000, obj["fee_type"], float(obj.get("fee_multiplier", 1.0))))
+                rows.append((int(at) // 1_000_000, obj["fee_type"], _mult(obj.get("fee_multiplier"))))
             changes = root / "fees" / "series_fee_changes" / f"{obj['ticker']}.json"
             if changes.exists():
                 for r in json.loads(changes.read_text()).get("series_fee_change_arr", []):
                     t = _ms(r.get("scheduled_ts"))
                     if t is not None and r.get("fee_type"):
-                        rows.append((t, r["fee_type"], float(r.get("fee_multiplier", 1.0))))
+                        rows.append((t, r["fee_type"], _mult(r.get("fee_multiplier"))))
             self.series[obj["ticker"]] = sorted(set(self.series.get(obj["ticker"], []) + rows))
         p = root / "fees" / "event_fee_changes.parquet"
         self.events = {}

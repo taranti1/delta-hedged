@@ -325,6 +325,9 @@ def ledger_from_logs(log_paths: list[str | Path], specs: list[MarketSpec]) -> An
     paths = [Path(p).resolve() for p in log_paths]
     if len(paths) != len(set(paths)):
         raise ValueError("a session log was supplied more than once")
+    sessions = [p.name.removesuffix(".gz").removesuffix(".zst").removesuffix(".jsonl") for p in paths]
+    if len(sessions) != len(set(sessions)):
+        raise ValueError("multiple compressed/uncompressed copies of the same session")
     led = Ledger({s.ticker: s.event_ticker for s in specs}, {s.ticker: s.expiration_ts for s in specs})
     duration = 0
     bounds = []
@@ -371,6 +374,7 @@ def ledger_from_logs(log_paths: list[str | Path], specs: list[MarketSpec]) -> An
     if not targets:
         return led
     selected = {}  # (session/ticker, target) -> latest observation at/before target
+    following = {}  # (session/ticker, target) -> first observation after it (Ledger bracketing)
 
     def retain(tk, target, previous):
         if previous is None:
@@ -391,15 +395,17 @@ def ledger_from_logs(log_paths: list[str | Path], specs: list[MarketSpec]) -> An
                 raise ValueError(f"out-of-order fair values for {tk} in {path}")
             ts, i = targets[tk], cursors[tk]
             j = bisect.bisect_left(ts, t, lo=i)
+            cur = (t, float(r["F"]), float(r.get("delta", 0.0)))
             for target in ts[i:j]:
                 retain(tk, target, old)
+                following.setdefault((tk, target), cur)
             cursors[tk] = j
-            prev[tk] = (t, float(r["F"]), float(r.get("delta", 0.0)))
+            prev[tk] = cur
         for tk, old in prev.items():
             for target in targets[tk][cursors[tk]:]:
                 retain(tk, target, old)
     kept = defaultdict(dict)
-    for (tk, _), value in selected.items():
+    for (tk, _), value in (*selected.items(), *following.items()):
         kept[tk][value[0]] = value
     for tk, observations in kept.items():
         for t, F, delta in sorted(observations.values()):

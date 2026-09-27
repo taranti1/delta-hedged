@@ -1822,7 +1822,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
                postprocess: Callable[[ReplayResult], None] | None = None,
                fv_config: str | Path | Mapping[str, Any] | None = None,
                flow_segments: str | Path | Mapping[Any, Any] | None = None,
-               prime_search_s: float = 6 * HOUR_S) -> ReplayResult:
+               prime_search_s: float = 6 * HOUR_S, queue_stress: tuple[float, float] = (0.0, 0.0)) -> ReplayResult:
     """Replay MarketMaker + KalshiExchangeSim (+ Ledger) over the recording in [t0, t1).
 
     policy: fill policy A/B/C (optimistic/realistic/conservative); latency: LatencyModel
@@ -1842,6 +1842,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     back ``prime_search_s``; markets that never get a valid book are counted and warned about.
     Ledger rows carry the settlement cluster (``event`` = expiration key; ``event_ticker`` kept),
     regime columns (``day``, ``weekend``, ``rv_1h``) and the status columns of status_columns().
+    queue_stress: (frac, contracts) hidden queue ahead of every order arrival (research stress,
+    ``QueueEstimator`` hidden_frac / hidden_qty); (0, 0) = off. Recorded in the summary.
     Returns ReplayResult(df, summary, ...) (see class doc).
     """
     cfg = cfg or StrategyConfig()
@@ -1880,7 +1882,8 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
     if uni.flow_segments and hasattr(mm, "flow") and uni.flow_meta.get("provenance"):
         mm.flow.segments_provenance = ParamProvenance.from_dict(uni.flow_meta["provenance"])
     scheds = {s.ticker: fee_engine.schedule_for_spec(s.fee_type, s.fee_multiplier) for s in specs}
-    sim = TickerFeeExchangeSim(lat, POLICY_FULL[letter], scheds, seed=seed)
+    sim = TickerFeeExchangeSim(lat, POLICY_FULL[letter], scheds, seed=seed, queue_hidden_frac=float(queue_stress[0]),
+                               queue_hidden_qty=int(round(float(queue_stress[1]) * QTY_SCALE)))
     for s in feed.initial:
         sim.register_market(s)
     all_specs = {r.ticker: r.spec for r in uni.markets.values() if r.spec is not None}
@@ -1998,6 +2001,7 @@ def run_replay(root: str | Path, t0: int, t1: int, cfg: StrategyConfig | None = 
         "public_contracts_quoted": sum(q for t, q in cap.public_qty.items() if t in {s.ticker for s in specs}) / QTY_SCALE,
         "public_contracts_quotable": sum(cap.public_qty_quotable.values()) / QTY_SCALE,
         "latency": describe_latency(lat, uni), "md_latency_ms": lat.dists["md"].median(),
+        "queue_stress": {"hidden_frac": float(queue_stress[0]), "hidden_contracts": float(queue_stress[1])},
         "prime_start": stream.prime_start, "books_unprimed_at_t0": len([t for t in stream.unprimed
                                                                            if t in {s.ticker for s in feed.initial}]),
         "books_never_valid": sorted(set(added) - cap.had_book),

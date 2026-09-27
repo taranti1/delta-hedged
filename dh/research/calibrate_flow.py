@@ -67,6 +67,7 @@ from dh.strategy.fill_model import SegmentFlow, segment_key
 from dh.strategy.flow_features import PROXY_FEATURE_VERSION, validate_feature_version
 
 SEC_YR = 365.0 * 24 * 3600
+EXCH_SKEW_TOL_MS = 1000  # exchange-vs-receive clock skew tolerated for a print's match time
 TAU_BOUNDS = (30.0, 60.0, 300.0, 600.0, 1800.0)
 
 
@@ -146,7 +147,12 @@ def order_sizes(orders: pd.DataFrame, price_at, vol_ann: float, t_min_ms: int | 
         first_ms = int(getattr(r, "ts_recv_first_ms", observed_ms))
         if t_min_ms is not None and first_ms < t_min_ms:
             continue
-        if coverage is not None and not any(a <= int(r.ts_ms) <= first_ms <= observed_ms < b
+        # Receive times decide the healthy interval. The exchange match time only has to fall
+        # inside it up to clock skew (on this host exchange time is often a few ms LATER than
+        # receipt); requiring ts_ms <= receipt dropped most real prints from the numerator
+        # while their exposure stayed in the denominator.
+        if coverage is not None and not any(a <= first_ms <= observed_ms < b
+                                            and a - EXCH_SKEW_TOL_MS <= int(r.ts_ms) < b
                                             for a, b in coverage.get(r.ticker, [])):
             continue
         K = r.floor_strike if not pd.isna(r.floor_strike) else r.cap_strike

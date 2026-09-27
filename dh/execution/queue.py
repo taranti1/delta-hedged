@@ -44,6 +44,7 @@ GET /portfolio/orders/queue_positions. ``QueueCalibrator`` runs all three polici
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
@@ -133,6 +134,7 @@ class QueueOrder:
     seq: int  # arrival order (time priority among our own orders)
     arrival_ts: int
     pending: bool = False  # live mode: waiting for our own positive book delta
+    hidden_ahead: int = 0  # stress only: undisplayed priority ahead of us, depleted by prints only
 
     @property
     def level(self) -> Level:
@@ -177,11 +179,24 @@ class QueueEstimator:
         match_window_ns: int = 250 * NS_PER_MS,
         book_includes_own: bool = False,
         exch_offset_ns: int | None = None,
+        hidden_frac: float = 0.0,
+        hidden_qty: int = 0,
     ) -> None:
         """exch_offset_ns: when set, market events carrying an exchange timestamp (ts_exch) are
         placed on this estimator's clock at ts_exch + exch_offset_ns, and only orders that had
         arrived by then take part in that match (a sweep reported late by the feed cannot fill
-        an order that arrived after the sweep executed). None = use receive time only."""
+        an order that arrived after the sweep executed). None = use receive time only.
+
+        hidden_frac / hidden_qty (research stress, default off): on every (re)arrival an order
+        also gets ``ceil(hidden_frac * displayed queue) + hidden_qty`` of undisplayed priority
+        ahead of it. That hidden queue is never clamped by cancels or snapshots; only prints at
+        our price (after the displayed queue) or a sweep through it (A/B) consume it, so every
+        policy's fills can only decrease (a worse queue position than any displayed-book
+        inference allows)."""
+        if hidden_frac < 0 or hidden_qty < 0:
+            raise ValueError("hidden_frac and hidden_qty must be >= 0")
+        self.hidden_frac = float(hidden_frac)
+        self.hidden_qty = int(hidden_qty)
         self.policy = normalize_policy(policy)
         self.exch_offset_ns = exch_offset_ns
         self._arrivals: list[tuple[int, int]] = []  # (arrival ts, seq), sorted by ts
@@ -217,6 +232,7 @@ class QueueEstimator:
         self._side.setdefault((ticker, book), {}).setdefault(px, []).append(key)
         if not pending:
             o.queue_ahead = self._arrival_queue(o) if queue_ahead is None else max(0, int(queue_ahead))
+            o.hidden_ahead = self._hidden(o.queue_ahead)
         return o
 
     on_own_order = add_order  # name used in docs/INTERFACES.md
@@ -227,6 +243,7 @@ class QueueEstimator:
         if o is not None and o.pending:
             o.pending = False
             o.queue_ahead = self._arrival_queue(o) if queue_ahead is None else max(0, int(queue_ahead))
+            o.hidden_ahead = self._hidden(o.queue_ahead)
 
     def remove_order(self, key: str) -> None:
         o = self.orders.pop(key, None)
@@ -304,6 +321,7 @@ class QueueEstimator:
             if o is not None and o.pending and ev.delta > 0 and o.level == lvl:
                 o.pending = False
                 o.queue_ahead = self._arrival_queue(o)
+                o.hidden_ahead = self._hidden(o.queue_ahead)
             return []  # our own orders are not "others" in the live book
         if ev.delta < 0:
             vol = -ev.delta
@@ -363,9 +381,13 @@ class QueueEstimator:
                     if o.pending or (max_seq is not None and o.seq > max_seq):
                         continue
                     if px == p:
+                        past = vol - o.queue_ahead  # print volume beyond the displayed queue
                         o.queue_ahead = max(0, o.queue_ahead - vol)
+                        if past > 0 and o.hidden_ahead:
+                            o.hidden_ahead = max(0, o.hidden_ahead - past)
                     elif self.policy != "conservative":
                         o.queue_ahead = 0  # price priority: the whole level ahead of us traded
+                        o.hidden_ahead = 0
         return fills
 
     def advance(self, now_ns: int) -> None:
@@ -437,6 +459,11 @@ class QueueEstimator:
     def _pending_total(self, table: dict[Level, deque[_Pend]], lvl: Level) -> int:
         dq = table.get(lvl)
         return sum(it.vol for it in dq) if dq else 0
+
+    def _hidden(self, displayed: int) -> int:
+        if not (self.hidden_frac or self.hidden_qty):
+            return 0
+        return math.ceil(displayed * self.hidden_frac) + self.hidden_qty
 
     def _arrival_queue(self, o: QueueOrder) -> int:
         return max(0, self._level_excl(o.level) - self._pending_total(self._pend_trade, o.level))
@@ -544,7 +571,7 @@ class QueueEstimator:
                 rem = o.remaining - (used.get(k, 0) if used else 0)
                 if rem <= 0:
                     continue
-                q = o.queue_ahead if use_q else 0
+                q = o.queue_ahead + o.hidden_ahead if use_q else 0
                 f = min(rem, max(0, v - (blocked + q + same)))
                 if f > 0:
                     out.append((k, f, mech))

@@ -95,7 +95,7 @@ def latency_from(args, uni=None):
 _REPLAY = {"policies", "warm", "seed", "latency_ms", "quote_period_ms", "max_strikes", "fv_config", "flow_segments", "config"}
 CONSUMES: dict[str, set[str]] = {
     "universe": {"max_strikes", "config"},
-    "replay": _REPLAY,
+    "replay": _REPLAY | {"queue_stress", "prime_search_h"},
     "flow": {"flow_split", "walk_forward_days", "flow_prior_s", "max_strikes", "config"},
     "e1": {"step_ms", "latency_ms", "config", "max_strikes"},
     "e2": _REPLAY | {"step_ms", "split", "no_pnl", "no_replica", "jobs"},
@@ -143,6 +143,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--latency-ms", default="",
                     help="fixed latency 'submit,response,ws[,md]' in ms (default: placeholders; md = the recording's "
                          "measured Kalshi market-data latency, fallback 25 ms)")
+    ap.add_argument("--queue-stress", default="",
+                    help="replay: worse-than-displayed queue position 'FRAC,CONTRACTS': every order arrival also "
+                         "waits behind ceil(FRAC x displayed queue) + CONTRACTS of hidden priority (default off)")
+    ap.add_argument("--prime-search-h", type=float, default=6.0,
+                    help="replay: search back this many hours for each market's last order-book snapshot before t0")
     ap.add_argument("--split", type=float, default=0.5, help="E2/E3: fraction of the window used for fitting")
     ap.add_argument("--grid", default=None, help="E4: JSON string or YAML/JSON file {variant: {section: {field: value}}}")
     ap.add_argument("--multipliers", default="1,2,5,10,20,50", help="E10: clip multiples")
@@ -281,8 +286,14 @@ def main(argv: list[str] | None = None) -> int:
             from dh.research.replay_env import run_replay
 
             o.mkdir(parents=True, exist_ok=True)
+            qs = (0.0, 0.0)
+            if a.queue_stress:
+                qs = tuple(float(x) for x in a.queue_stress.split(","))
+                if len(qs) != 2 or min(qs) < 0:
+                    raise SystemExit("--queue-stress needs FRAC,CONTRACTS >= 0")
             for p in policies:
-                res = run_replay(root, t0, t1, cfg, p, latency=lat, warm=a.warm, seed=a.seed, universe=uni)
+                res = run_replay(root, t0, t1, cfg, p, latency=lat, warm=a.warm, seed=a.seed, universe=uni,
+                                 queue_stress=qs, prime_search_s=a.prime_search_h * 3600.0)
                 res.df.to_csv(o / f"ledger_{p}.csv", index=False, float_format="%.6g")
                 (o / f"summary_{p}.json").write_text(json.dumps(res.summary, indent=2, default=str))
                 s = res.summary

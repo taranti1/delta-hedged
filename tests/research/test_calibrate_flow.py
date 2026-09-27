@@ -121,3 +121,19 @@ def test_reconstructed_sweep_crossing_gap_is_excluded():
         return 100_000.0
     result = order_sizes(orders, price, .4, coverage={"R": [(0, 6000)]})
     assert sum(map(sum, result.values())) == 3 and queried == [4500]
+
+
+def test_exchange_clock_ahead_of_receipt_still_counts_in_the_numerator():
+    # On the recording host the exchange timestamp is often a few ms LATER than receipt; such
+    # prints matched inside the healthy interval and must count (their exposure already does).
+    from dh.research.calibrate_flow import order_sizes
+    rows = pd.DataFrame([dict(ticker="R", ts_ms=40_020, ts_recv_ms=40_000, expiration_ts_ms=60_000,
+                              floor_strike=100_000, cap_strike=np.nan, contracts=3, taker_side="no"),
+                         dict(ticker="R", ts_ms=4_500, ts_recv_ms=4_010, expiration_ts_ms=60_000,
+                              floor_strike=100_000, cap_strike=np.nan, contracts=4, taker_side="no")])
+    result = order_sizes(rows, lambda _: 100_000.0, .4, coverage={"R": [(4000, 60_000)]})
+    assert sorted(sum(result.values(), [])) == [3, 4]
+    # an exchange time far outside the interval (beyond skew) is still backlog, not fresh flow
+    late = rows.assign(ts_ms=[40_020, 2_000])
+    result = order_sizes(late, lambda _: 100_000.0, .4, coverage={"R": [(4000, 60_000)]})
+    assert sum(result.values(), []) == [3]

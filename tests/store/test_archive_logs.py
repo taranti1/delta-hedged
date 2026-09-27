@@ -86,3 +86,20 @@ def test_preexisting_archive_never_overwritten(tmp_path):
         archive_log(p, pause_s=0)
     assert archive.read_bytes() == b"keep me"
     assert p.exists()
+
+
+def test_truncated_zstd_log_fails_instead_of_dropping_its_tail(tmp_path):
+    import zstandard
+
+    from dh.store.textio import open_text
+
+    lines = "".join(f'{{"k": "x", "i": {i}}}\n' for i in range(20_000)).encode()
+    blob = zstandard.ZstdCompressor().compress(lines)
+    whole, cut = tmp_path / "whole.jsonl.zst", tmp_path / "cut.jsonl.zst"
+    whole.write_bytes(blob + zstandard.ZstdCompressor().compress(b'{"k": "tail"}\n'))  # two frames
+    cut.write_bytes(blob[: len(blob) // 2])
+    with open_text(whole) as s:
+        assert sum(1 for _ in s) == 20_001
+    with pytest.raises(ValueError, match="truncated"), open_text(cut) as s:
+        for _ in s:
+            pass

@@ -184,7 +184,7 @@ async def test_download_pipeline_and_resume(tmp_path: Path):
                                log=lambda *_: None)
     assert stats2["events_skipped"] == 2 and stats2["events"] == 0
     assert not any(c[0] in ("trades", "markets", "hmarkets") for c in rest2.calls)
-    done_hours = {"2025-08-05T20:00:00.000Z"}  # nonempty hours only; empty hours retry
+    done_hours = {"2025-08-05T20:00:00.000Z"}  # valid hour files (an old empty hour is a recorded outage)
     assert not any(c[0] == "cf" and c[3] in done_hours for c in rest2.calls)  # existing hour files are skipped
     assert ("events", "KXBTCD", "settled", ev_start // 10**9) in rest.calls
     rest3 = FakeRest()

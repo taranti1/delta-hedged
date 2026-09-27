@@ -72,7 +72,7 @@ def test_fee_reconciliation_accepts_split_fill_carry_and_deduplicates():
     assert not mm.risk.fee_mismatch
 
 
-def test_repeated_micro_fee_residuals_cannot_accumulate_without_bound():
+def test_repeated_micro_fee_residuals_cannot_accumulate_without_bound_within_an_order():
     s = spec()
     mm = MarketMaker(StrategyConfig(), [s])
     expected = mm.fee_sched[s.ticker].trade_fee_micros(4500, 100, False)
@@ -80,14 +80,25 @@ def test_repeated_micro_fee_residuals_cannot_accumulate_without_bound():
     for i in range(precision):
         mm._reconcile_fee(fill(s.ticker, str(i), expected + 1))
     assert mm.risk.fee_mismatch
-    assert mm._fee_residual_micros == precision
+    assert mm._fee_residual[(s.ticker, "order", "bid")] >= precision
 
 
-def test_sub_cent_unexplained_fee_halts():
+def test_micro_fee_residuals_do_not_accumulate_across_orders():
+    # a session-wide sum would halt a long, healthy session on benign one-micro differences
     s = spec()
     mm = MarketMaker(StrategyConfig(), [s])
     expected = mm.fee_sched[s.ticker].trade_fee_micros(4500, 100, False)
-    mm._reconcile_fee(fill(s.ticker, "unexpected", expected + 2000))
+    for i in range(200):
+        mm._reconcile_fee(fill(s.ticker, str(i), expected + 1, order=f"o{i}"))
+    assert not mm.risk.fee_mismatch
+
+
+def test_unexplained_fee_beyond_rounding_tolerance_halts():
+    s = spec()
+    mm = MarketMaker(StrategyConfig(), [s])
+    bd = mm.fee_sched[s.ticker].order_accumulator("bid").apply_fill(4500, 100, False)
+    tolerance = max(1, abs(bd.rounding_micros - bd.rebate_micros))
+    mm._reconcile_fee(fill(s.ticker, "unexpected", max(bd.trade_micros, bd.net_micros) + tolerance + 1))
     assert mm.risk.fee_mismatch
 
 

@@ -54,6 +54,16 @@ class FvSeries:
             return None
         return self.F[i], self.delta[i]
 
+    def bracketed(self, t: int, gap_ns: int) -> tuple[float, float] | None:
+        """Last observation at or before t when the log provably continued across t: the next
+        observation after t follows it within ``gap_ns`` (the strategy's fv logging cadence).
+        The strategy logs on every material move, so between two such observations the logged
+        value stays current (sparse, cadence-driven logging is not missing evidence)."""
+        i = bisect.bisect_right(self.ts, t) - 1
+        if i < 0 or i + 1 >= len(self.ts) or self.ts[i + 1] - self.ts[i] > gap_ns:
+            return None
+        return self.F[i], self.delta[i]
+
 
 @dataclass
 class FillRecord:
@@ -90,7 +100,10 @@ class FillRecord:
 
 class Ledger:
     def __init__(self, event_of: dict[str, str], expiration_of: dict[str, int],
-                 mark_index_id: str = "BRTI", markout_max_age_s: float = 5.0) -> None:
+                 mark_index_id: str = "BRTI", markout_max_age_s: float = 5.0,
+                 fv_log_cadence_s: float = 1.25) -> None:
+        """fv_log_cadence_s: the strategy logs fair value at least every log_fv_every_ns (1 s) and
+        on every move > 0.2c; with a margin, the gap that proves a logged value is still current."""
         self.event_of = event_of
         self.expiration_of = expiration_of
         self.fv: dict[str, FvSeries] = defaultdict(FvSeries)
@@ -101,6 +114,7 @@ class Ledger:
         self.mark_ts: list[int] = []
         self.mark_px: list[float] = []
         self.markout_max_age_ns = int(markout_max_age_s * NS_PER_S)
+        self.fv_log_cadence_ns = int(fv_log_cadence_s * NS_PER_S)
         self.hedge_totals: dict[str, float] = {}
         self.first_ts = 0
         self.last_ts = 0
@@ -157,8 +171,9 @@ class Ledger:
                 # A stale pre-fill sample cannot establish a subsecond markout. Require
                 # an observation in the latter half of the requested horizon, capped by
                 # the general freshness limit. Sparse logging yields missing evidence.
-                later = series.at(f.ts + int(h * NS_PER_S),
-                                           min(self.markout_max_age_ns, int(h * NS_PER_S / 2)))
+                target = f.ts + int(h * NS_PER_S)
+                later = (series.at(target, min(self.markout_max_age_ns, int(h * NS_PER_S / 2)))
+                         or series.bracketed(target, self.fv_log_cadence_ns))
                 if later is not None and not math.isnan(f.F):
                     f.markouts[h] = (later[0] - f.F) * f.side
                     f.markout_observed_ts[h] = series.ts[bisect.bisect_right(series.ts, f.ts + int(h * NS_PER_S)) - 1]
@@ -263,6 +278,7 @@ class Ledger:
             c = f"mo_{h:g}s_c"
             if c in done:
                 ok = done[c].notna()
+                out[f"markout_{h:g}s_n"] = int(ok.sum())
                 if ok.any():
                     out[f"markout_{h:g}s_c"] = float(np.average(done.loc[ok, c], weights=done.loc[ok, "contracts"]))
         # capital: collateral x time to settlement (held to expiry assumption)

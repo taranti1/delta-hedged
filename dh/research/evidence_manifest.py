@@ -47,4 +47,8 @@ def input_manifest(root: Path) -> dict:
 
 
 def manifest_matches(root: Path, manifest: dict) -> bool:
-    return input_manifest(root) == manifest
+    """False (never an exception) when inputs changed, including while being re-hashed."""
+    try:
+        return input_manifest(root) == manifest
+    except (ValueError, OSError):
+        return False

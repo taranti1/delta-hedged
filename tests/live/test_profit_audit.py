@@ -52,9 +52,10 @@ def test_streaming_ledger_preserves_match_times_full_duration_and_sparse_marks(t
     spec = kxbtcd_spec()
     records = [{'k': 'session_start', 't': S}]
     # Thousands of irrelevant FV rows cannot inflate the retained ledger history.
-    records += [{'k': 'log.fv', 't': S + i * 10_000_000, 'ticker': spec.ticker,
+    records += [{'k': 'log.fv', 't': S + i * 1_000_000, 'ticker': spec.ticker,
                  'F': 0.50, 'delta': 0.0} for i in range(1000)]
     records += [
+        {'k': 'log.fv', 't': 10_500_000_000, 'ticker': spec.ticker, 'F': 0.50},
         {'k': 'log.fv', 't': 12 * S, 'ticker': spec.ticker, 'F': 0.40},
         {'k': 'log.fill', 't': 13 * S, 'ts_exch': 11 * S, 'ticker': spec.ticker,
          'trade_id': 'fill', 'side': 'bid', 'px': 4500, 'qty': 100, 'fee': 0},
@@ -65,17 +66,18 @@ def test_streaming_ledger_preserves_match_times_full_duration_and_sparse_marks(t
     led = ledger_from_log(path, [spec])
     df = led.attribute()
     assert df.ts.iloc[0] == 11 * S and df.F.iloc[0] == .50
-    assert 'mo_0.1s_c' not in df  # previous sample cannot demonstrate zero adverse selection
+    # 1.5 s logging gap > cadence: the previous sample cannot demonstrate zero adverse selection
+    assert 'mo_0.1s_c' not in df
     assert df['mo_1s_c'].iloc[0] == pytest.approx(-10.)
     assert df['mo_1s_observed_ts'].iloc[0] == 12 * S
-    assert sum(len(v.ts) for v in led.fv.values()) <= 8
+    assert sum(len(v.ts) for v in led.fv.values()) <= 10
     summary = led.summary()
     assert summary['days'] == pytest.approx(1 / 24)
     assert summary['net_usd_per_day'] == pytest.approx(.55 * 24)
     assert all(math.isnan(x) for x in summary['net_c_ci95'])
     assert not summary['inference_sufficient']
     assert _session_of(str(path)) == 'paper-session'
-    assert len(logged_decisions(path, 10_000 * S)[1]) == 1003
+    assert len(logged_decisions(path, 10_000 * S)[1]) == 1004
 
 
 def test_lifetime_audit_keeps_restart_fills_and_joins_later_outcomes(tmp_path):
@@ -148,3 +150,24 @@ def test_downloaded_outcomes_join_only_explicit_results_and_reject_conflicts(tmp
     outcome('yes', 0)
     with pytest.raises(ValueError, match='inconsistent'):
         add_downloaded_outcomes(led, tmp_path)
+
+
+def test_streaming_ledger_accepts_cadence_bracketed_subsecond_marks(tmp_path):
+    # The strategy logs F every second and on every > 0.2c move: a value followed by the next
+    # log within the cadence is still current, so subsecond markouts are not dropped for sparsity.
+    spec = kxbtcd_spec()
+    records = [{'k': 'session_start', 't': S}]
+    records += [{'k': 'log.fv', 't': S + i * S, 'ticker': spec.ticker, 'F': 0.50} for i in range(11)]
+    records += [
+        {'k': 'log.fill', 't': 11 * S + 200_000_000, 'ts_exch': 11 * S + 100_000_000, 'ticker': spec.ticker,
+         'trade_id': 'fill', 'side': 'bid', 'px': 4500, 'qty': 100, 'fee': 0},
+        {'k': 'log.fv', 't': 12 * S + 200_000_000, 'ticker': spec.ticker, 'F': 0.52},
+        {'k': 'log.settle', 't': 20 * S, 'ticker': spec.ticker, 'px': 10000},
+        {'k': 'session_end', 't': 3601 * S}]
+    path = tmp_path / 'paper-session.jsonl'
+    write_log(path, records)
+    df = ledger_from_log(path, [spec]).attribute()
+    assert df['mo_0.1s_c'].iloc[0] == pytest.approx(0.)
+    assert df['mo_0.5s_c'].iloc[0] == pytest.approx(0.)
+    assert df['mo_1s_c'].iloc[0] == pytest.approx(0.)  # 12.1 s lies in the 11 s -> 12.2 s bracket
+    assert 'mo_5s_c' not in df or math.isnan(df['mo_5s_c'].iloc[0])  # 16.1 s: logging stopped at 12.2 s

@@ -27,14 +27,14 @@ The exposure grid is one second. Input trades retain exchange timestamps for swe
 causal features and health filtering. A sweep is available at its latest receipt, and all
 of its receipts and its exchange match time must lie inside one healthy interval.
 Reconnect backlog from a preceding gap is excluded, rather than assigned fresh flow on
-recovery. Source times later than receipt are conservatively excluded in covered fits. Archive inputs without receipt
+recovery. An exchange match time may lead its receipt by up to 1 s of clock skew (sign-off fix: on this host the exchange stamp is usually a few ms later than receipt, and excluding those prints dropped 60-90 % of real flow from the numerator only). Archive inputs without receipt
 timestamps remain exchange-clock proxies. This does not recover unrecorded messages.
 
 ## History downloads
 
 Markets, trades, and candles have independent checkpoints. Completed files must still
 exist with a readable Parquet footer and matching schema. Legacy checkpoints migrate only
-when the requested output exists and validates. Empty/unreadable BRTI outputs are retried.
+when the requested output exists and validates. Unreadable BRTI outputs are retried; an empty hour file (written only for hours older than the publication delay) is a recorded outage and is not refetched.
 This is a structural check, not proof of complete exchange tape or absence of corrupted
 individual data pages. Reconciliation of trade IDs and exchange volume remains necessary.
 

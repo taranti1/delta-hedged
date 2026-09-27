@@ -114,3 +114,36 @@ Next research work is a fresh paper evaluation with these assumptions recorded, 
 by later-period confirmation of a locked policy. Do not reuse old exploratory “GO” labels,
 proxy flow tables, or in-sample forecast improvements as permission to trade. Preserve
 the existing E0/paper no-live decision and the existing disabled hedge default.
+
+## Independent sign-off review (2026-09-27, after b53216a)
+
+Three further independent reviews (execution/risk, accounting/runtime, research/data) re-read
+b53216a against its surrounding code. Signed off with the following corrections, each with a
+regression test:
+
+| Area | Defect | Correction |
+|---|---|---|
+| Strategy (regression) | `event_over_limit` indexed `self.specs[w.ticker]` for every order with fillable qty, including terminal orders of settled markets that `prune_settled` had already dropped: `KeyError` on every cycle | `prune_settled` keeps any market with an order that can still fill; the risk loops skip unknown specs/groups (`tests/strategy/test_signoff_fixes.py`) |
+| Strategy (F13) | A still-blocked candidate evicted one more retained quote every cycle before the first `opportunity_cost` cancel was acknowledged (lost quotes, nothing placed) | At most one eviction outstanding until its cancel resolves |
+| Strategy (F12) | Fee check: 1-micro tolerance plus a whole-session cumulative residual, halting (sticky across restarts) on benign rounding convention differences never validated against real fills | Per-fill tolerance = the fill's rounding/rebate part (same bound as the live runner's `reconcile_fill_fee`), residual bounded per order, reconciliation state bounded |
+| Ledger (F07) | Subsecond markouts required an observation within h/2; the strategy logs F every 1 s or on > 0.2c moves, so 0.1-1 s markouts survived only when F jumped (biased subset, no count shown) | A logged value bracketed by the next log within the 1.25 s cadence is current; the streaming audit retains that next observation; summaries print `markout_{h}s_n` |
+| Audit (F17) | Duplicate plain/compressed copies rejected only by the CLI; a `.zst` truncated at a line boundary ended silently | `ledger_from_logs` rejects duplicate sessions; the `.zst` reader raises on an unfinished frame |
+| Flow fit (F05/F06) | Numerator required exchange time <= receipt; with this host's clock skew 60-90 % of real taker orders were dropped while exposure stayed in the denominator | Receipt decides coverage; the exchange time may lead it by <= 1 s |
+| Downloader (F09) | Deliberately written old empty BRTI hours were refetched on every run | Valid (schema) hour files are done |
+| Evidence (F10/F16) | `manifest_matches` could raise after a full run; explicit null fee multipliers raised | Returns False; null means the default |
+
+Also added for the next evaluation: `run_experiment.py replay --queue-stress FRAC,CONTRACTS`
+(every order arrival also waits behind undisplayed priority; can only remove fills, property
+test `tests/execution/test_queue_stress.py`) and `--prime-search-h`.
+
+Known and left as is (documented, not defects for the M1 configuration): `touch_only` classifies
+existing orders from a book that includes our own orders in live but not in paper/replay (it is
+off in `config/m1.yaml`; E4 touch-only results would not transfer as-is); new-order loss is
+scored over the ±`stress_move_frac` scenario grid while the collateral cap still bounds far
+strikes; the collateral bound also blocks position-reducing quotes once capital binds; fitted
+flow tables cannot be bound to real replays until a production-state fitter exists.
+
+The rebuilt lifetime paper audit is unchanged in P&L (+$22.6691, +2.06c/contract, CI
+[-2.59, +8.77]c over 38 expirations); with the markout fix, markouts now cover 296-302 of 302
+settled fills and are negative at every horizon (-0.05c at 0.1 s to -1.50c at 60 s): adverse
+selection is present and grows with the horizon.

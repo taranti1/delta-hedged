@@ -536,7 +536,9 @@ async def download_brti(
     total = max(0, (h - first) // H + 1)
     while h >= first:
         path = brti_hour_path(out, h)
-        if valid_parquet(path, BRTI_SCHEMA, nonempty=True):
+        # An empty file is only ever written for an hour older than recent_delay_s (a real
+        # outage is data): it is done. Unreadable / wrong-schema files are fetched again.
+        if valid_parquet(path, BRTI_SCHEMA):
             st["brti_skipped"] += 1
             h -= H
             continue
