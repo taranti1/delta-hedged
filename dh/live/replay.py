@@ -221,7 +221,7 @@ def replay_session(root: str | Path, scfg: Any, *, session: str | None = None, e
     fv = FairValueModel.from_config(load_recommended_config())
     warm_fv(fv, info.fv_points)
     mm = MarketMaker(scfg, info.specs, fv_model=fv, fee_engine=fee_engine, book_includes_own=(info.mode == "live"),
-                     id_prefix=info.id_prefix)
+                     id_prefix=info.id_prefix, queue_diagnostics=bool(info.start.get("queue_diagnostics", False)))
     sim = fees = None
     if info.mode == "paper":
         paper = dict(info.paper or {})

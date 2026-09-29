@@ -66,6 +66,9 @@ Level = tuple[str, str, int]  # (ticker, book 'yes'|'no', px on that book's scal
 QueueFill = tuple[str, int, str]  # (order key, qty, mechanism 'queue'|'sweep'|'cross')
 
 
+POLICY_LETTER = {"optimistic": "A", "realistic": "B", "conservative": "C"}
+
+
 def normalize_policy(policy: str) -> str:
     """'A'|'optimistic' -> 'optimistic', 'B'|'realistic' -> 'realistic', 'C'|... -> 'conservative'."""
     try:
@@ -135,6 +138,7 @@ class QueueOrder:
     arrival_ts: int
     pending: bool = False  # live mode: waiting for our own positive book delta
     hidden_ahead: int = 0  # stress only: undisplayed priority ahead of us, depleted by prints only
+    joined_queue: int = -1  # queue_ahead when the order joined its level (-1 = still pending)
 
     @property
     def level(self) -> Level:
@@ -161,6 +165,9 @@ class QueueCalibrationSample:
     @property
     def error(self) -> int:
         return self.estimated - self.reported
+
+
+CALIBRATION_MAX = 20_000  # exchange queue-position samples kept per estimator (bounded memory)
 
 
 class QueueEstimator:
@@ -210,7 +217,7 @@ class QueueEstimator:
         self._pend_depl: dict[Level, deque[_Pend]] = {}
         self._fifo: deque[_Pend] = deque()
         self._seq = 0
-        self.calibration: list[QueueCalibrationSample] = []
+        self.calibration: deque[QueueCalibrationSample] = deque(maxlen=CALIBRATION_MAX)
         self.stats = {"trade_matched_delta": 0, "delta_matched_trade": 0, "cancel_volume": 0,
                       "stale_trade_volume": 0}
 
@@ -233,6 +240,7 @@ class QueueEstimator:
         if not pending:
             o.queue_ahead = self._arrival_queue(o) if queue_ahead is None else max(0, int(queue_ahead))
             o.hidden_ahead = self._hidden(o.queue_ahead)
+            o.joined_queue = o.queue_ahead
         return o
 
     on_own_order = add_order  # name used in docs/INTERFACES.md
@@ -244,6 +252,7 @@ class QueueEstimator:
             o.pending = False
             o.queue_ahead = self._arrival_queue(o) if queue_ahead is None else max(0, int(queue_ahead))
             o.hidden_ahead = self._hidden(o.queue_ahead)
+            o.joined_queue = o.queue_ahead
 
     def remove_order(self, key: str) -> None:
         o = self.orders.pop(key, None)
@@ -301,6 +310,19 @@ class QueueEstimator:
                 own += ok.remaining
         return o.queue_ahead + own
 
+    def orders_at_or_better(self, ticker: str, book: str, px: int) -> list[QueueOrder]:
+        """Our joined (non-pending) orders on ``book`` at ``px`` or better, best price first."""
+        levels = self._side.get((ticker, book))
+        if not levels:
+            return []
+        return [self.orders[k] for p in sorted(levels, reverse=True) if p >= px
+                for k in levels[p] if not self.orders[k].pending]
+
+    def level_others(self, key: str) -> int | None:
+        """Displayed qty of OTHERS at the order's level (our own orders excluded in live mode)."""
+        o = self.orders.get(key)
+        return None if o is None else self._level_excl(o.level)
+
     # ------------------------------------------------------------------ market data
     def on_snapshot(self, ev: KalshiBookSnapshot) -> None:
         """Fresh book: drop pending matches for the ticker and clamp every queue to its level."""
@@ -322,6 +344,7 @@ class QueueEstimator:
                 o.pending = False
                 o.queue_ahead = self._arrival_queue(o)
                 o.hidden_ahead = self._hidden(o.queue_ahead)
+                o.joined_queue = o.queue_ahead
             return []  # our own orders are not "others" in the live book
         if ev.delta < 0:
             vol = -ev.delta
@@ -595,18 +618,20 @@ class QueueCalibrator:
     exchange-reported queue positions (GET /portfolio/orders/queue_positions)."""
 
     def __init__(self, level_qty: Callable[[str, str, int], int], *, match_window_ns: int = 250 * NS_PER_MS,
-                 book_includes_own: bool = True) -> None:
-        self.estimators = {p: QueueEstimator(p, level_qty, match_window_ns=match_window_ns,
-                                             book_includes_own=book_includes_own) for p in POLICIES}
+                 book_includes_own: bool = True, policies: tuple[str, ...] = POLICIES) -> None:
+        self.estimators = {normalize_policy(p): QueueEstimator(p, level_qty, match_window_ns=match_window_ns,
+                                                               book_includes_own=book_includes_own)
+                           for p in policies}
 
     def add_order(self, key: str, ticker: str, book_side: str, yes_px: int, qty: int, ts: int, *,
                   pending: bool = True) -> None:
         for e in self.estimators.values():
-            e.add_order(key, ticker, book_side, yes_px, qty, ts, pending=pending)
+            if key not in e.orders:
+                e.add_order(key, ticker, book_side, yes_px, qty, ts, pending=pending)
 
-    def activate(self, key: str) -> None:
+    def activate(self, key: str, queue_ahead: int | None = None) -> None:
         for e in self.estimators.values():
-            e.activate(key)
+            e.activate(key, queue_ahead=queue_ahead)
 
     def remove_order(self, key: str) -> None:
         for e in self.estimators.values():
@@ -627,9 +652,21 @@ class QueueCalibrator:
         """Returns each policy's *predicted* fills (compare with the real fills we receive)."""
         return {p: e.on_trade(tr) for p, e in self.estimators.items()}
 
-    def ingest_exchange_queue_position(self, key: str, reported_qty: int, ts: int) -> None:
+    def ingest_exchange_queue_position(self, key: str, reported_qty: int, ts: int) -> dict[str, int]:
+        """Records the sample in every estimator; returns each policy's estimate before it."""
+        out: dict[str, int] = {}
+        for p, e in self.estimators.items():
+            s = e.ingest_exchange_queue_position(key, reported_qty, ts)
+            if s is not None:
+                out[p] = s.estimated
+        return out
+
+    def queue_ahead(self, key: str) -> dict[str, int | None]:
+        return {p: e.queue_ahead(key) for p, e in self.estimators.items()}
+
+    def advance(self, now_ns: int) -> None:
         for e in self.estimators.values():
-            e.ingest_exchange_queue_position(key, reported_qty, ts)
+            e.advance(now_ns)
 
     def summary(self) -> dict[str, dict[str, float]]:
         return {p: e.calibration_stats() for p, e in self.estimators.items()}

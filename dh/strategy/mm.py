@@ -63,7 +63,7 @@ from dh.core.market import MarketSpec
 from dh.core.strategy import IdGen
 from dh.core.units import NS_PER_MS, NS_PER_S, PX_SCALE, QTY_SCALE
 from dh.execution.order_manager import ORPHAN_ATTACHED, OrderManager
-from dh.execution.queue import QueueEstimator
+from dh.execution.queue import POLICY_LETTER, QueueCalibrator, QueueEstimator, trade_maker_book
 from dh.models.fairvalue import digital
 from dh.models.fvmodel import FairValueModel, load_recommended_config
 from dh.models.tails import GAUSS, make_tail
@@ -133,6 +133,7 @@ class MarketMaker:
         id_prefix: str | None = None,
         log_fv_every_ns: int = NS_PER_S,
         requote_move_sigma: float = 2.0,
+        queue_diagnostics: bool = False,
     ) -> None:
         self.cfg = cfg
         legacy = FairValueCfg()
@@ -158,6 +159,15 @@ class MarketMaker:
             self._resolve_fee(t, s)
         self.om = OrderManager()
         self.queue = QueueEstimator("realistic", level_qty=self._level_qty, book_includes_own=book_includes_own)
+        # queue diagnostics (logging only, never read by a decision): the optimistic (A) and
+        # conservative (C) estimators shadow the strategy's realistic (B) one on the same stream,
+        # so live queue positions and fills show which cancel policy matches the exchange. The
+        # runner records the flag in session_start; replay rebuilds the same logs from it.
+        self.queue_diagnostics = queue_diagnostics
+        self.queue_shadow: QueueCalibrator | None = (
+            QueueCalibrator(self._level_qty, book_includes_own=book_includes_own,
+                            policies=("optimistic", "conservative")) if queue_diagnostics else None)
+        self._diag_logs: list[Log] = []
         # live book (contains our orders): an order joins the queue when our own positive book
         # delta shows it; if that delta beat the ack it is remembered here (coid -> ts)
         self.book_includes_own = book_includes_own
@@ -302,6 +312,8 @@ class MarketMaker:
             if b is not None:
                 b.apply_snapshot(ev)
                 self.queue.on_snapshot(ev)
+                if self.queue_shadow is not None:
+                    self._shadow(lambda sh: sh.on_snapshot(ev))
         elif isinstance(ev, KalshiBookDelta):
             b = self.books.get(ev.ticker)
             if b is not None:
@@ -315,9 +327,14 @@ class MarketMaker:
                         else:
                             self._own_delta_seen[own] = ev.ts  # our delta beat the ack
                     self.queue.on_book_delta(ev)
+                    if self.queue_shadow is not None:
+                        self._shadow(lambda sh: sh.on_book_delta(ev))
         elif isinstance(ev, KalshiTrade):
             if ev.ticker in self.books:
-                self.queue.on_trade(ev)
+                if self.queue_diagnostics:
+                    out += self._queue_trade_diag(ev)
+                else:
+                    self.queue.on_trade(ev)
                 self.last_trade_px[ev.ticker] = int(ev.yes_px)
         elif isinstance(ev, IndexTick):
             out += self._on_index(ev)
@@ -367,7 +384,62 @@ class MarketMaker:
             out += self._on_settlement(ev)
         elif isinstance(ev, Timer):
             out += self._on_timer(ev.ts)
+        if self._diag_logs:
+            out += self._diag_logs
+            self._diag_logs = []
         return out
+
+    # ================================================================== queue diagnostics
+    def _shadow(self, fn) -> None:
+        """Apply fn to the shadow estimators; a diagnostics failure disables them (logged once)
+        instead of stopping the strategy."""
+        sh = self.queue_shadow
+        if sh is None:
+            return
+        try:
+            fn(sh)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never stop trading
+            self.queue_shadow = None
+            self.stats.bump("queue_diag_error")
+            self._diag_logs.append(Log("queue_diag", {"event": "disabled", "error": f"{type(exc).__name__}: {exc}"[:300]}))
+
+    def _queue_state(self, coid: str) -> dict[str, int | None]:
+        """Queue ahead of one of our orders under each policy (B = the strategy's estimator)."""
+        q: dict[str, int | None] = {"B": self.queue.queue_ahead(coid)}
+        sh = self.queue_shadow
+        if sh is not None:
+            for pol, v in sh.queue_ahead(coid).items():
+                q[POLICY_LETTER[pol]] = v
+        return q
+
+    def _queue_trade_diag(self, ev: KalshiTrade) -> list[Action]:
+        """Public print with queue logging: our orders the print could reach (queue ahead under
+        A/B/C before it) and each policy's predicted fills. Joined offline to our real fills by
+        trade_id; the taker's order size is the sum of prints sharing (ticker, ts_exch, side)."""
+        book, p = trade_maker_book(ev)
+        # classify expired depletions first (on_trade does this itself as its first step), so
+        # the logged queue state is the one this print actually meets
+        self.queue.advance(ev.ts)
+        self._shadow(lambda s: s.advance(ev.ts))
+        rows = []
+        if not ev.is_block and ev.qty > 0:
+            for o in self.queue.orders_at_or_better(ev.ticker, book, p):
+                rows.append({"coid": o.key, "px": o.px, "rem": o.remaining, "q": self._queue_state(o.key),
+                             "joined": o.joined_queue, "age_ms": (ev.ts - o.arrival_ts) // NS_PER_MS})
+        level = int(self._level_qty(ev.ticker, book, p)) if rows else 0
+        pred = {"B": self.queue.on_trade(ev)}
+        sh = self.queue_shadow
+        if sh is not None:
+            res: dict = {}
+            self._shadow(lambda s: res.update(s.on_trade(ev)))
+            for pol, fills in res.items():
+                pred[POLICY_LETTER[pol]] = fills
+        if not rows:
+            return []
+        return [Log("queue_trade", {"ticker": ev.ticker, "trade_id": ev.trade_id, "book": book, "px": p,
+                                    "yes_px": ev.yes_px, "qty": ev.qty, "taker_side": ev.taker_side,
+                                    "ts_exch": ev.ts_exch, "level_qty": level, "orders": rows,
+                                    "pred": {k: [list(f) for f in v] for k, v in pred.items()}})]
 
     # ================================================================== handlers
     def _on_index(self, ev: IndexTick) -> list[Action]:
@@ -415,25 +487,36 @@ class MarketMaker:
                     pending = self.book_includes_own and self._own_delta_seen.pop(oe.client_order_id, None) is None
                     self.queue.add_order(oe.client_order_id, w.ticker, w.book_side, w.px, w.remaining_qty, oe.ts,
                                          pending=pending)
+                    if self.queue_shadow is not None:
+                        self._shadow(lambda sh: sh.add_order(oe.client_order_id, w.ticker, w.book_side, w.px,
+                                                             w.remaining_qty, oe.ts, pending=pending))
                     if pending:
                         self._queue_pending_since[oe.client_order_id] = oe.ts
             elif k in ("fill", "orphan_fill"):
+                qdiag = self._fill_queue_diag(oe) if self.queue_diagnostics else None
                 if oe.client_order_id in self.queue.orders:
                     self.queue.on_own_fill(oe.client_order_id, oe.qty)
+                if self.queue_shadow is not None:
+                    self._shadow(lambda sh: sh.on_own_fill(oe.client_order_id, oe.qty))
                 if oe.detail == ORPHAN_ATTACHED:
                     continue  # logged and counted once, as the orphan_fill (review L1)
                 self.stats.fills += 1
                 fv = self.fvc.get(oe.ticker)
-                out.append(Log("fill", {"ticker": oe.ticker, "coid": oe.client_order_id, "side": oe.book_side,
-                                        "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
-                                        "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id,
-                                        "ts_recv": oe.ts, "ts_exch": getattr(fill_source, "ts_exch", 0),
-                                        "fv_ts": None if fv is None else fv.ts}))
+                rec = {"ticker": oe.ticker, "coid": oe.client_order_id, "side": oe.book_side,
+                       "px": oe.px, "qty": oe.qty, "taker": oe.is_taker, "fee": oe.fee_micros,
+                       "F": None if fv is None else round(fv.F, 6), "trade_id": oe.trade_id,
+                       "ts_recv": oe.ts, "ts_exch": getattr(fill_source, "ts_exch", 0),
+                       "fv_ts": None if fv is None else fv.ts}
+                if qdiag is not None:
+                    rec.update(qdiag)
+                out.append(Log("fill", rec))
             elif k in ("filled", "canceled", "rejected"):
                 self._queue_pending_since.pop(oe.client_order_id, None)
                 self._own_delta_seen.pop(oe.client_order_id, None)
                 if oe.client_order_id in self.queue.orders:
                     self.queue.remove_order(oe.client_order_id)
+                if self.queue_shadow is not None:
+                    self._shadow(lambda sh: sh.remove_order(oe.client_order_id))
             elif k == "cancel_ready":
                 w = self.om.order(oe.client_order_id)
                 if w is not None and w.order_id:
@@ -472,6 +555,16 @@ class MarketMaker:
                 self.group_reset_sent_at = 0
                 self.risk.on_feed_status(FeedStatus(ts=oe.ts, ts_exch=0, stream=f"kalshi.order_group:{oe.client_order_id or self.ORDER_GROUP_ID}", status="resynced"))
         return out
+
+    def _fill_queue_diag(self, oe) -> dict:
+        """Queue state of the filled order just BEFORE this fill (queue diagnostics)."""
+        coid = oe.client_order_id
+        o = self.queue.orders.get(coid)
+        if o is None:
+            return {"q_ahead": None, "q_joined": None, "level_qty": None, "rem_before": None, "age_ms": None}
+        return {"q_ahead": self._queue_state(coid), "q_joined": o.joined_queue,
+                "level_qty": self.queue.level_others(coid), "rem_before": o.remaining,
+                "age_ms": (oe.ts - o.arrival_ts) // NS_PER_MS}
 
     def _on_settlement(self, ev) -> list[Action]:
         if isinstance(ev, KalshiMarketLifecycle):
@@ -614,7 +707,10 @@ class MarketMaker:
                 del self._queue_pending_since[coid]
                 o = self.queue.orders.get(coid)
                 if o is not None and o.pending:
-                    self.queue.activate(coid, queue_ahead=int(self._level_qty(*o.level)))
+                    qa = int(self._level_qty(*o.level))
+                    self.queue.activate(coid, queue_ahead=qa)
+                    if self.queue_shadow is not None:
+                        self._shadow(lambda sh: sh.activate(coid, queue_ahead=qa))
                     self.stats.bump("queue_own_delta_timeout")
         for coid, t in list(self._own_delta_seen.items()):
             if now - t >= 30 * NS_PER_S:

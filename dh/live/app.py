@@ -607,7 +607,7 @@ class LiveApp:
 
         # 8. strategy
         mm = MarketMaker(scfg, specs, fv_model=fv, fee_engine=fee_engine, book_includes_own=(mode == "live"),
-                         id_prefix=self.id_prefix)
+                         id_prefix=self.id_prefix, queue_diagnostics=True)
 
         # 9. execution
         sim = paper_fees = None
@@ -686,7 +686,8 @@ class LiveApp:
                    id_prefix=self.id_prefix, session_token=self.token, subaccount=lcfg.venue.sub, series=list(series),
                    own_id_prefix=self.own_id_prefix if mode == "live" else "",
                    exchange_indexes=list(shards), shared_account=lcfg.venue.shared_account,
-                   key_restricted_to_subaccount=lcfg.venue.key_restricted_to_subaccount)
+                   key_restricted_to_subaccount=lcfg.venue.key_restricted_to_subaccount,
+                   queue_diagnostics=mm.queue_diagnostics)
         self._meta("fv_warmup", source=bf.source, points=bf.points)
         self._log("startup", universe=[s.ticker for s in specs], skipped=sel.skipped, backfill=bf.summary(), info=self.info)
         self.runner = runner

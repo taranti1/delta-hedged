@@ -2381,7 +2381,11 @@ class LiveRunner:
             return
         by_oid = {w.order_id: w.client_order_id for w in om.working() if w.order_id}
         resync = bool(self.cfg.venue.queue_positions_resync)
+        from dh.execution.queue import POLICY_LETTER
+
+        shadow = getattr(self.strategy, "queue_shadow", None)  # A / C estimators (queue diagnostics)
         applied = []
+        by_policy: dict[str, dict[str, int]] = {}
         for oid, ticker, qty in rows:
             coid = by_oid.get(oid)
             if coid is None:
@@ -2392,8 +2396,17 @@ class LiveRunner:
                 continue
             self.metrics.observe("dh_queue_error_contracts", abs(s.estimated - s.reported) / 100.0)
             applied.append((coid, ticker, int(qty), est))
+            if shadow is not None:
+                try:
+                    ests = shadow.ingest_exchange_queue_position(coid, int(qty), ts)
+                except Exception:  # noqa: BLE001 - diagnostics must never stop the runner
+                    ests = {}
+                for pol, e in ests.items():
+                    by_policy.setdefault(POLICY_LETTER[pol], {})[coid] = e
+                    self.metrics.observe("dh_queue_shadow_error_contracts", abs(e - int(qty)) / 100.0, policy=pol)
         if applied:
-            self.jlog("queue_positions", ts, rows=applied, resync=resync)
+            extra = {"shadow": by_policy} if shadow is not None else {}
+            self.jlog("queue_positions", ts, rows=applied, resync=resync, **extra)
             if resync:
                 self.meta("queue_resync", ts, rows=applied)
 
