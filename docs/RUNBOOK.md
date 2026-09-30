@@ -518,6 +518,50 @@ upper bound must be >= 0 in the segments you intend to trade; otherwise stop.
 ---------------------------------------------------------------------------------------------
 ## 5. Promotion to live at M1 size (M1.5)
 
+### 5.0 The first live experiment: `config/m1_live.yaml` (user decision 2026-09-30)
+The first live sessions run `config/m1_live.yaml`, not `config/m1.yaml`. It is `m1_small` with
+five changes:
+
+| Setting | Value | Reason |
+|---|---|---|
+| `quoting.min_tau_s` | 150 | final window |
+| `quoting.max_market_disagreement_c` | 10 | no new order where \|F − Kalshi mid\| > 10¢ |
+| `risk.abnormal_pause_s` | 0 | 6σ kill switch off; moves are logged only, and replays evaluate it |
+| `risk.max_event_worst_loss` | $10 | |
+| `risk.tail_budget` | $10 | |
+
+Unchanged: $15 total worst case, $15 daily-loss halt, 5-contract clips. The evidence is in
+`docs/research/RULE_SCREEN_2026_09_30.md` (script: `dh/research/rule_screen_20260930.py`).
+
+Known deviations from 5.1, accepted by the user:
+- This digest had only a short paper smoke run, not 7 days of paper.
+- The kill switch is off.
+
+Everything else in 5.1 still applies, in particular: restricted keys, the watchdog, funding and
+the declared transfer.
+
+**Funding.** Start-up and the running balance gate need shard-2 funds >= max(total worst case,
+daily halt) + margin = $15 + $10 = **$25**. Funds are available balance + positions at cost +
+resting collateral, so collateral in use does not count against them, but realized losses do.
+The deposit decides how much loss the account can absorb before trading stops:
+
+| Deposit | New orders blocked after about | Resulting behaviour |
+|---|---|---|
+| $30 | $5 of losses | the balance gate, not the $15 daily-loss halt, stops trading |
+| $40 | $15 of losses | the daily-loss halt is the binding stop |
+| $75 (recommended) | $15 of losses (daily halt) | Kalshi can still collateralize a busy hour after a full losing day |
+
+Peak collateral on m1_small paper was $21 at p99 and $33 at the maximum (positions at $1 per
+contract); the doubled event cap can raise it.
+
+Start command (watchdog running first, 5.2 step 2):
+```sh
+caffeinate -i python scripts/run_live.py --config config/m1_live.yaml --live-config config/live.yaml \
+    --mode live --i-understand-this-sends-real-orders --duration 3600
+```
+Check funds with `python -m dh.live.tools balance --config config/m1_live.yaml`. Without
+`--config`, the tool compares against m1.yaml's $60.
+
 ### 5.1 Checklist (every item true, written down with the date)
 - [ ] Pre-flight checks of section 2 pass on this host, with this key.
 - [ ] 7+ days of paper: CI criterion met; `replay` identical on sampled sessions.

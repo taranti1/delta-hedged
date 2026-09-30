@@ -1,0 +1,88 @@
+# M1-live: the configuration of the first LIVE execution experiment (user decision 2026-09-30,
+# after 20.5 h of m1_small paper and the quick rule screen docs/research/RULE_SCREEN_2026_09_30.md).
+# m1_small plus, per the user:
+#   quoting.min_tau_s 150 (was 90)            final window: no near-strike (|z| < 2.5) quotes < 150 s
+#   quoting.max_market_disagreement_c 10      no new order where |F - Kalshi mid| > 10c
+#   risk.abnormal_pause_s 0 (was 120)         6-sigma kill switch off (logged only; replays evaluate it)
+#   risk.max_event_worst_loss 10 (was 5)      per hourly event
+#   risk.tail_budget 10 (was 5)
+# NOTE: this digest was never paper-traded for the RUNBOOK 5.1 "same digest since paper" period;
+# the user chose to go live without it (only a short paper smoke run of this file).
+# Loaded by dh.strategy.config.load_config. Every key maps 1:1 to a dataclass field.
+run_prefix: "dhm1"         # same prefix: the venue/own-order filters key on it
+fair_value:
+  tail: "gauss"            # replaced by the calibration study's recommendation (docs/research/01)
+  vol_half_life_s: 1800.0
+  vol_floor_ann: 0.15
+  use_seasonality: true
+  band_sigma_lo_mult: 0.85
+  band_sigma_hi_mult: 1.20
+  band_tail_alt: "gauss"
+  nowcast: "brti_last"     # Experiment 2 decides whether a composite nowcast replaces it
+  max_benchmark_age_s: 3.0
+quoting:
+  enabled_series: ["KXBTCD"]
+  max_ticks_from_touch: 3
+  clip_contracts: 5.0      # m1 clip: per-order fee rounding amortized over 5 contracts
+  v_min_dollars: 0.002     # 0.2c minimum modeled net value per contract
+  kappa_replace_per_s: 0.0002
+  min_tau_s: 150.0          # final window (m1_small: 90)
+  z_min_final: 2.5
+  max_market_disagreement_c: 10.0  # no new order where |F - Kalshi mid| > 10c (0 = off)
+  max_tau_s: 3900.0
+  price_floor_px: 300      # no quotes below 3c / above 97c YES until tail calibration is done
+  price_cap_px: 9700
+  requote_min_interval_ms: 500
+  post_only: true
+  order_expiry_s: 120.0     # exchange-side dead-man: a quote outlives a lost host by <= 2 min
+                           # (orders are replaced about this often anyway; E4 prices priority)
+fill:
+  taker_rate_per_s: 0.3
+  taker_size_mean: 20.0
+  taker_size_cv: 2.0
+  improve_rate_mult: 1.0
+  behind_rate_mult: 0.15
+  provenance:              # look-ahead guard (docs/research/EXPERIMENTS_RUNBOOK.md s.2a): these values are
+    status: "prior"        # [ESTIMATE] placeholders never fitted on data -> out-of-sample for every window,
+    fitted_from_utc: ""    # labelled "prior". A refit sets status "fitted", the UTC fitting window
+    fitted_to_utc: ""      # (every datum before fitted_to_utc), the dataset id/hash and the method
+    dataset_id: ""         # (dh.research.calibrate_flow writes them into flow_segments.json meta.provenance)
+    method: "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
+adverse:
+  a0: 0.003
+  b_momentum: 0.5
+  c_final: 0.01
+  horizon_s: 60.0
+  lookback_s: 2.0
+  behind_mult: 2.0
+  provenance:              # as for fill: [ESTIMATE] priors until Experiment 3 fits them on real fills
+    status: "prior"
+    fitted_from_utc: ""
+    fitted_to_utc: ""
+    dataset_id: ""
+    method: "M1 parametric placeholder (docs/BUILD_PLAN.md D: [ESTIMATE])"
+risk:
+  risk_capital: 150.0
+  kelly_fraction: 0.25
+  lambda_tail: 1.0
+  tail_budget: 10.0         # m1_small: 5
+  max_pos_per_market: 10.0
+  max_event_worst_loss: 10.0  # per hourly event (m1_small: 5)
+  max_total_worst_loss: 15.0
+  max_abs_delta_btc: 0.02
+  max_hedge_notional: 0.0
+  daily_loss_halt: 15.0
+  settlement_loss_halt: 10.0
+  near_expiry_s: 300.0
+  near_expiry_limit_mult: 0.5
+  abnormal_move_sigma: 6.0
+  abnormal_pause_s: 0.0     # kill switch off: 6-sigma moves are logged only (m1_small: 120)
+  stale_ext_s: 2.0
+  stale_brti_cancel_near_s: 3.0
+  stale_brti_cancel_all_s: 10.0
+  order_group_limit_contracts: 20.0
+hedge:
+  enabled: false           # Experiment 5: no hedge at M1 scale is optimal at every fee tier
+timers:
+  quote_period_ms: 200
+  risk_period_ms: 1000

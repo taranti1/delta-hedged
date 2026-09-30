@@ -149,6 +149,11 @@ class QuotingCfg:
     expected_rounding_per_order: float = 0.005
     min_tau_s: float = 90.0  # no new near-strike quotes after T - min_tau_s
     z_min_final: float = 2.5  # |z| required to quote inside min_tau_s
+    # market-disagreement cap (quick screen 2026-09-30): no NEW order or replacement in a market
+    # whose fair value F differs from the Kalshi mid (others' best bid/ask, our own resting orders
+    # excluded) by more than this many cents; resting orders are left to the normal EV logic.
+    # 0 = off. A one-sided book has no mid: not capped.
+    max_market_disagreement_c: float = 0.0
     # a BRTI print of the settlement window is missing (WindowState.n_missing > 0): incomplete
     # data resolves No, so only markets whose fair-value band stays at or below this YES
     # probability are still quoted (dh.settlement.window module doc)
@@ -202,7 +207,7 @@ class RiskCfg:
     near_expiry_limit_mult: float = 0.5
     stress_move_frac: float = 0.15  # +/- range of A for worst-case with linear hedge
     abnormal_move_sigma: float = 6.0
-    abnormal_pause_s: float = 120.0
+    abnormal_pause_s: float = 120.0  # 0 = kill switch off: the move is logged, nothing cancelled or paused
     stale_ext_s: float = 2.0
     stale_brti_cancel_near_s: float = 3.0
     stale_brti_cancel_all_s: float = 10.0
@@ -259,8 +264,19 @@ class StrategyConfig:
         return 1.0 / (self.risk.kelly_fraction * self.risk.risk_capital)
 
     def digest(self) -> str:
-        blob = json.dumps(asdict(self), sort_keys=True, default=str).encode()
+        d = asdict(self)
+        for section, key, default in _DIGEST_NEUTRAL_DEFAULTS:  # fields added later: at their
+            if d.get(section, {}).get(key) == default:          # default they leave older configs'
+                d[section].pop(key)                               # digests (and replays) unchanged
+        blob = json.dumps(d, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
+
+
+# (section, field, default) of fields added after sessions were recorded: omitted from the digest
+# while at the default, so the digest of every earlier config stays what its sessions logged
+_DIGEST_NEUTRAL_DEFAULTS: tuple[tuple[str, str, Any], ...] = (
+    ("quoting", "max_market_disagreement_c", 0.0),
+)
 
 
 def _build(cls: type, data: dict[str, Any]) -> Any:

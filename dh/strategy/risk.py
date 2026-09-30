@@ -293,6 +293,9 @@ class RiskEngine:
         return []
 
     def on_abnormal_move(self, now_ns: int, move_sigma: float) -> list[Action]:
+        if abs(move_sigma) >= self.cfg.abnormal_move_sigma and self.cfg.abnormal_pause_s <= 0:
+            # kill switch off (evaluated in replays): record the move, keep quoting
+            return [Log("risk", {"event": "abnormal_move", "sigma": move_sigma, "action": "none"})]
         if abs(move_sigma) >= self.cfg.abnormal_move_sigma:
             self.pause_until_ns = max(self.pause_until_ns, now_ns + int(self.cfg.abnormal_pause_s * NS_PER_S))
             return [CancelAll(reason="abnormal_move"), Log("risk", {"event": "abnormal_move", "sigma": move_sigma})]

@@ -4,8 +4,9 @@
         test the CF Benchmarks passthrough call used for the fair-value warm-up
     python -m dh.live.tools orders    [--live-config ...]
         list resting orders of venue.subaccount (after a kill: must be empty)
-    python -m dh.live.tools balance   [--live-config ...]
+    python -m dh.live.tools balance   [--live-config ...] [--config config/m1_live.yaml]
         balance of venue.subaccount on every venue.exchange_indexes shard vs the start-up requirement
+        of that strategy config
     python -m dh.live.tools ledger    --log data/live_logs/<session>.jsonl [--data data/live]
         P&L attribution of a session from its JSON log (net c/contract CI, markouts)
     python -m dh.live.tools replay    --log <session log> [--data data/live] [--config config/m1.yaml]
@@ -228,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=("backfill", "orders", "balance", "ledger", "replay", "reconcile"))
     ap.add_argument("--live-config", default="config/live.yaml")
-    ap.add_argument("--config", default="config/m1.yaml", help="strategy config (replay)")
+    ap.add_argument("--config", default="config/m1.yaml", help="strategy config (replay; balance requirement)")
     ap.add_argument("--log", default="", help="session JSON log (data/live_logs/<session>.jsonl)")
     ap.add_argument("--outcomes-root", default="", help="ledger: join known settlements from downloaded Kalshi history")
     ap.add_argument("--logs-dir", default="", help="ledger: audit every paper session in this directory")
@@ -252,7 +253,9 @@ def main(argv: list[str] | None = None) -> int:
             if a.command == "orders":
                 return await cmd_orders(lcfg, rest)
             if a.command == "balance":
-                return await cmd_balance(lcfg, rest)
+                from dh.strategy.config import load_config
+
+                return await cmd_balance(lcfg, rest, scfg=load_config(a.config))
             return await cmd_reconcile(a.log, lcfg, rest)
         finally:
             await rest.close()

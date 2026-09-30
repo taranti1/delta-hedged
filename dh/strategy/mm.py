@@ -168,6 +168,7 @@ class MarketMaker:
             QueueCalibrator(self._level_qty, book_includes_own=book_includes_own,
                             policies=("optimistic", "conservative")) if queue_diagnostics else None)
         self._diag_logs: list[Log] = []
+        self._disagree_on: dict[str, bool] = {}  # market-disagreement gate state (logged on change)
         # live book (contains our orders): an order joins the queue when our own positive book
         # delta shows it; if that delta beat the ack it is remembered here (coid -> ts)
         self.book_includes_own = book_includes_own
@@ -952,6 +953,14 @@ class MarketMaker:
             price_cap_px=q.price_cap_px, rounding_per_order=q.expected_rounding_per_order,
             order_fee=lambda px, size, side, tk=t: self._order_fee(tk, px, size, side),
         )
+        disagree = self._market_disagreement(t, f.F) if q.max_market_disagreement_c > 0 else None
+        blocked_new = disagree is not None and disagree[0] > q.max_market_disagreement_c
+        if q.max_market_disagreement_c > 0 and blocked_new != self._disagree_on.get(t, False):
+            self._disagree_on[t] = blocked_new  # logged on each change only
+            out.append(Log("quote_gate", {"ticker": t, "gate": "market_disagreement", "on": blocked_new,
+                                          "F": round(f.F, 6), "mid": None if disagree is None else disagree[1],
+                                          "disagreement_c": None if disagree is None else round(disagree[0], 3),
+                                          "cap_c": q.max_market_disagreement_c}))
         for side in ("bid", "ask"):
             d = decide_side(ctx, side, self.flow, self.adverse, q.v_min_dollars, q.kappa_replace_per_s,
                             replace_rel=q.replace_rel, min_age_ns=q.min_order_age_ms * NS_PER_MS)
@@ -963,10 +972,29 @@ class MarketMaker:
                 if w is not None:
                     out += self._cancel(now, w, "ev")
             if d.place is not None:
+                if blocked_new:
+                    self.stats.bump("market_disagreement")
+                    continue
                 if now - self.last_place.get((t, side), -10**18) < q.requote_min_interval_ms * NS_PER_MS:
                     continue
                 props.append((d.place.score, s, side, d.place, f))
         return out, props
+
+    def _market_disagreement(self, ticker: str, F: float) -> tuple[float, float] | None:
+        """(|F - mid| in cents, mid) against OTHERS' best YES bid / ask; None for a one-sided
+        book. In live mode the book contains our joined orders: their qty is removed first."""
+        b = self.books[ticker]
+        own: dict[tuple[str, int], int] = {}
+        if self.book_includes_own:
+            for o in self.queue.orders.values():
+                if o.ticker == ticker and not o.pending:
+                    own[(o.book, o.px)] = own.get((o.book, o.px), 0) + o.remaining
+        bid = next((px for px, qty in reversed(b.yes_bids.items()) if qty - own.get(("yes", px), 0) > 0), None)
+        no = next((px for px, qty in reversed(b.no_bids.items()) if qty - own.get(("no", px), 0) > 0), None)
+        if bid is None or no is None:
+            return None
+        mid = (bid + PX_SCALE - no) / 2 / PX_SCALE
+        return abs(F - mid) * 100.0, mid
 
     @staticmethod
     def _settlement_key(spec: MarketSpec) -> str:
