@@ -22,6 +22,7 @@ data/results/
 # Host-local copies of the config examples (may point at host secrets files).
 config/kalshi.yaml
 config/kalshi.admin.yaml
+config/kalshi.history.yaml
 config/kalshi.demo.yaml
 config/live.yaml
 config/paper.yaml

@@ -290,6 +290,12 @@ class BackfillCfg:
     recent_delay_s: float = 1800.0  # an EMPTY chunk ending this close to now is skipped, not fatal
     extra_params: dict[str, Any] = field(default_factory=dict)
     min_coverage: float = 0.9  # fraction of the requested grid that must be present
+    # Fallback when the passthrough is refused (a key restricted to a subaccount gets HTTP 403 on
+    # /cfbenchmarks/*): the history saved by `python -m dh.live.tools warmfile` with a separate,
+    # read-only key, so the order-sending process never holds that key. Used only if its newest
+    # point is at most warm_file_max_age_s old and it covers min_coverage of the window.
+    warm_file: str = ""
+    warm_file_max_age_s: float = 900.0
 
 
 @dataclass(frozen=True)

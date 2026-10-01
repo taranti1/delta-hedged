@@ -554,6 +554,16 @@ The deposit decides how much loss the account can absorb before trading stops:
 Peak collateral on m1_small paper was $21 at p99 and $33 at the maximum (positions at $1 per
 contract); the doubled event cap can raise it.
 
+**Fair-value warm-up with a restricted key.** Kalshi refuses `/cfbenchmarks/*` to a key restricted
+to a subaccount (HTTP 403, seen live 2026-09-30), so the runner's own download fails. Run this
+first, within 15 minutes of the start (takes about 2 minutes):
+```sh
+python -m dh.live.tools warmfile --kalshi-config config/kalshi.history.yaml
+```
+- It saves the history to `backfill.warm_file`, and the runner warms from that file.
+- `config/kalshi.history.yaml` is host-local: the read-only, unrestricted key, read in place.
+  Only the tool uses it, so the order-sending runner never holds that key.
+
 Start command (watchdog running first, 5.2 step 2):
 ```sh
 caffeinate -i python scripts/run_live.py --config config/m1_live.yaml --live-config config/live.yaml \

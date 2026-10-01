@@ -2,6 +2,9 @@
 
     python -m dh.live.tools backfill  [--live-config config/live.yaml]
         test the CF Benchmarks passthrough call used for the fair-value warm-up
+    python -m dh.live.tools warmfile  --kalshi-config config/kalshi.history.yaml [--out data/live/brti_warm.json]
+        save the fair-value warm-up history for a runner whose restricted key cannot read the
+        CF passthrough (backfill.warm_file); the read-only key never enters the live runner
     python -m dh.live.tools orders    [--live-config ...]
         list resting orders of venue.subaccount (after a kill: must be empty)
     python -m dh.live.tools balance   [--live-config ...] [--config config/m1_live.yaml]
@@ -45,15 +48,45 @@ def _live_cfg(path: str) -> Any:
     return load_live_config(p)
 
 
-def make_rest(lcfg: Any) -> Any:
+def make_rest(lcfg: Any, kalshi_config: str = "") -> Any:
     from dh.kalshi.config import load_config
     from dh.kalshi.rest import KalshiRest
 
-    kc = load_config(_resolve(lcfg.kalshi_config) if lcfg.kalshi_config else None, env=lcfg.kalshi_env or None)
+    path = kalshi_config or lcfg.kalshi_config
+    kc = load_config(_resolve(path) if path else None, env=lcfg.kalshi_env or None)
     return KalshiRest(kc.rest_url, kc.signer(), kc.limiter(), read_only=True, **kc.rest_kwargs())  # tools never write
 
 
 # ============================================================================ commands
+async def cmd_warmfile(lcfg: Any, rest: Any, out_path: str, out: Any = print) -> int:
+    """Download the benchmark history the live warm-up needs and save it for
+    ``backfill.warm_file`` (read-only; for a runner whose restricted key gets 403 on the CF
+    passthrough). Run it with a key that may read /cfbenchmarks (--kalshi-config)."""
+    from dh.live.startup import fetch_benchmark_history, resample, write_warm_file
+
+    cfg = lcfg.backfill
+    path = out_path or cfg.warm_file
+    if not path:
+        out("no output: pass --out or set backfill.warm_file in the live config")
+        return 2
+    now = time.time_ns()
+    start = now - int(cfg.days * 86400 * NS_PER_S)
+    ticks, n_req, errors = await fetch_benchmark_history(rest, now, cfg)
+    points = resample(ticks, start, now, cfg.step_s)
+    requested = max(1, (now - start) // (int(cfg.step_s) * NS_PER_S))
+    coverage = len(points) / requested
+    for e in errors:
+        out(f"  {e}")
+    if not points or coverage < cfg.min_coverage:
+        out(f"NOT written: coverage {coverage:.1%} < {cfg.min_coverage:.0%} ({len(points)} points, {n_req} requests)")
+        return 1
+    write_warm_file(_resolve(path), points, now, cfg)
+    age = (now - points[-1][0]) / NS_PER_S
+    out(f"wrote {path}: {len(points)} points, coverage {coverage:.1%}, newest {age:.0f} s old; "
+        f"the runner accepts it for {cfg.warm_file_max_age_s:.0f} s after that point")
+    return 0
+
+
 async def cmd_backfill(lcfg: Any, rest: Any, out: Any = print) -> int:
     from dh.live.startup import fetch_benchmark_history, resample
 
@@ -227,7 +260,7 @@ def _session_of(log: str) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m dh.live.tools", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=("backfill", "orders", "balance", "ledger", "replay", "reconcile"))
+    ap.add_argument("command", choices=("backfill", "warmfile", "orders", "balance", "ledger", "replay", "reconcile"))
     ap.add_argument("--live-config", default="config/live.yaml")
     ap.add_argument("--config", default="config/m1.yaml", help="strategy config (replay; balance requirement)")
     ap.add_argument("--log", default="", help="session JSON log (data/live_logs/<session>.jsonl)")
@@ -235,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--logs-dir", default="", help="ledger: audit every paper session in this directory")
     ap.add_argument("--data", default="", help="session store (default: live config paths.data_root)")
     ap.add_argument("--streams", default="", help="replay: extra recorded event streams (comma list)")
+    ap.add_argument("--kalshi-config", default="", help="warmfile: Kalshi config whose key may read /cfbenchmarks")
+    ap.add_argument("--out", default="", help="warmfile: output (default backfill.warm_file)")
     a = ap.parse_args(argv)
     lcfg = _live_cfg(a.live_config)
     data = a.data or lcfg.paths.data_root
@@ -246,8 +281,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_replay(a.log, data, a.config, extra_streams=tuple(x for x in a.streams.split(",") if x))
 
     async def run() -> int:
-        rest = make_rest(lcfg)
+        rest = make_rest(lcfg, a.kalshi_config if a.command == "warmfile" else "")
         try:
+            if a.command == "warmfile":
+                return await cmd_warmfile(lcfg, rest, a.out)
             if a.command == "backfill":
                 return await cmd_backfill(lcfg, rest)
             if a.command == "orders":

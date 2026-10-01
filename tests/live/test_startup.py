@@ -306,3 +306,34 @@ def test_ledger_from_log(tmp_path):
     s = ledger_from_log(tmp_path / "s.jsonl", [spec]).summary()
     assert s["fills"] == 1 and s["contracts"] == 2.0
     assert abs(s["net_usd"] - (2 * (1.0 - 0.45) - 0.01)) < 1e-9  # bought 2 YES at 45c, settled YES, 1c fee
+
+
+def _warm_points(end_ns: int, days: float = 2.0, step_s: int = 60) -> list[tuple[int, float]]:
+    n = int(days * 86400 // step_s)
+    return [(end_ns - (n - i) * step_s * NS_PER_S, 84_000.0 + (i % 7)) for i in range(n + 1)]
+
+
+async def test_restricted_key_falls_back_to_a_fresh_warm_file(tmp_path):
+    """A subaccount-restricted key gets 403 on the CF passthrough (live 2026-09-30): the history
+    saved by `tools warmfile` warms the model instead, and is what the session records."""
+    from dh.live.startup import write_warm_file
+
+    cfg = BackfillCfg(warm_file=str(tmp_path / "warm.json"))
+    write_warm_file(cfg.warm_file, _warm_points(T0 - 30 * NS_PER_S), T0, cfg)
+    fv = FairValueModel.from_config(load_recommended_config())
+    res = await backfill_fair_value(FakeRest(), fv, T0, cfg)  # passthrough refused
+    assert res.ready and fv.ready and res.source == "warm_file" and res.coverage > 0.99
+    assert res.points[-1][0] == T0 - 30 * NS_PER_S and res.errors  # the REST refusal stays logged
+
+
+async def test_stale_or_foreign_warm_file_is_refused(tmp_path):
+    from dh.live.startup import load_warm_file, write_warm_file
+
+    cfg = BackfillCfg(warm_file=str(tmp_path / "warm.json"))
+    write_warm_file(cfg.warm_file, _warm_points(T0 - 3600 * NS_PER_S), T0, cfg)  # newest point 1 h old
+    fv = FairValueModel.from_config(load_recommended_config())
+    res = await backfill_fair_value(FakeRest(), fv, T0, cfg)
+    assert res.source == "none" and not fv.ready and any("old" in e for e in res.errors)
+    write_warm_file(cfg.warm_file, _warm_points(T0), T0, BackfillCfg(step_s=30))
+    assert load_warm_file(cfg.warm_file, T0, cfg)[1].endswith("wrong format / index / step")
+    assert load_warm_file(tmp_path / "missing.json", T0, cfg)[0] == []

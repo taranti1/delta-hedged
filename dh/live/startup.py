@@ -22,9 +22,11 @@ warmed it (>= 1 day): the runner never substitutes a guess.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from dh.core.events import IndexTick
@@ -530,15 +532,54 @@ async def backfill_fair_value(
     ticks, n_req, errors = await fetch_benchmark_history(rest, now_ns, cfg, clock_ns=clock_ns)
     points = resample(ticks, start, now_ns, cfg.step_s)
     coverage = len(points) / requested
+    source = "cfbenchmarks_rest"
+    if not (points and coverage >= cfg.min_coverage) and getattr(cfg, "warm_file", ""):
+        if points:
+            errors.append(f"coverage {coverage:.2%} < {cfg.min_coverage:.0%}: REST history not used")
+        fpoints, ferr = load_warm_file(cfg.warm_file, now_ns, cfg)
+        if ferr:
+            errors.append(ferr)
+        else:
+            points, coverage, source = fpoints, len(fpoints) / requested, "warm_file"
     if points and coverage >= cfg.min_coverage:
         warm_fv(fv, points)
-        source = "cfbenchmarks_rest"
     else:
         if points:
             errors.append(f"coverage {coverage:.2%} < {cfg.min_coverage:.0%}: history not used")
         points = []
         source = "none"
     return BackfillResult(points, requested, coverage, bool(getattr(fv, "ready", False)), source, n_req, errors)
+
+
+def write_warm_file(path: str | Path, points: list[tuple[int, float]], created_ns: int, cfg: BackfillCfg) -> None:
+    """Save resampled benchmark points (``dh.live.tools warmfile``), atomically."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = {"format": "dh-brti-warm/1", "index_id": cfg.index_id, "step_s": int(cfg.step_s),
+            "created_ns": int(created_ns), "points": [[int(t), float(v)] for t, v in points]}
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(body))
+    tmp.replace(p)
+
+
+def load_warm_file(path: str | Path, now_ns: int, cfg: BackfillCfg) -> tuple[list[tuple[int, float]], str]:
+    """(points in [now - days, now], '') from a warm file, or ([], why it is not usable)."""
+    p = Path(path)
+    try:
+        body = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        return [], f"warm file {p}: unreadable ({type(exc).__name__})"
+    if body.get("format") != "dh-brti-warm/1" or body.get("index_id") != cfg.index_id \
+            or int(body.get("step_s", 0)) != int(cfg.step_s):
+        return [], f"warm file {p}: wrong format / index / step"
+    start = now_ns - int(cfg.days * 86400 * NS_PER_S)
+    pts = sorted((int(t), float(v)) for t, v in body.get("points") or [] if start <= int(t) <= now_ns)
+    if not pts:
+        return [], f"warm file {p}: no point in the window"
+    age_s = (now_ns - pts[-1][0]) / NS_PER_S
+    if age_s > cfg.warm_file_max_age_s:
+        return [], f"warm file {p}: newest point {age_s:.0f} s old > {cfg.warm_file_max_age_s:.0f} s (re-run tools warmfile)"
+    return pts, ""
 
 
 # ============================================================================ paper simulator
