@@ -691,7 +691,8 @@ async def test_orders_closing_a_held_position_are_not_counted_as_collateral():
     v, _ = _shared_venue(rest)
     f = (await v.fetch_shard_funds())[2]
     assert f["resting"] == pytest.approx(2.0 + 4.5)  # was 4.0 + 2.0 + 4.5
-    assert f["funds"] == pytest.approx(20.0 + 4.5 + 6.5)
+    # Kalshi's balance does not deduct resting orders (live 2026-09-30): funds = balance + positions
+    assert f["funds"] == pytest.approx(20.0 + 4.5)
 
 
 async def test_failed_balance_reads_close_the_gate():

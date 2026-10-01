@@ -1424,7 +1424,8 @@ class KalshiVenue:
     async def fetch_shard_funds(self) -> dict[int, dict[str, Any]]:
         """Funds of our subaccount on every configured shard, at cost:
             available  GET /portfolio/balance?subaccount&exchange_index (``balance``: cash not
-                       tied up in positions or reserved for resting orders)
+                       tied up in positions; VERIFIED LIVE 2026-09-30: resting orders are NOT
+                       deducted from it, i.e. $75.00 with $19.10 of orders resting)
             positions  the cost of the open positions (``market_exposure_dollars`` of
                        GET /portfolio/positions?subaccount&exchange_index)
             resting    the collateral of the resting orders (GET /portfolio/orders?status=
@@ -1433,8 +1434,11 @@ class KalshiVenue:
                        position (an ask against a long YES position, a bid against a short
                        one): Kalshi reserves nothing for it, so counting it would overstate
                        the funds (review L2)
-            funds      their sum: what the shard holds for this system at cost, so our own
-                       quotes and fills never make it look defunded (a real loss lowers it)
+            funds      available + positions: what the shard holds for this system at cost, so
+                       our own fills never make it look defunded (a real loss lowers it).
+                       ``resting`` is reported but NOT added: the balance already contains it
+                       (adding it overstated the funds by the resting collateral, live
+                       2026-09-30)
         {shard: {..., "body": GetBalanceResponse}}; ``funds`` None when the balance is
         unreadable. Raises on a failed read."""
         from dh.core.units import PX_SCALE, px_from_dollars
@@ -1479,7 +1483,7 @@ class KalshiVenue:
                 per = px if bid else PX_SCALE - px
                 reserved += per * (rem - closing) / 1e6  # px (1e-4 $) x qty (1e-2) = 1e-6 $
             out[sh] = {"available": avail, "positions": round(cost, 6), "resting": round(reserved, 6),
-                       "funds": None if avail is None else round(avail + cost + reserved, 6), "body": body}
+                       "funds": None if avail is None else round(avail + cost, 6), "body": body}
         return out
 
     async def fetch_user_data_ns(self) -> int | None:

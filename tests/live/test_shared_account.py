@@ -615,9 +615,10 @@ async def test_runner_blocks_new_orders_when_the_balance_drops_and_reopens():
 
 
 async def test_our_own_positions_and_quotes_never_make_a_funded_shard_look_empty():
-    """Kalshi's ``balance`` is the AVAILABLE cash: our positions (paid for) and resting quotes
-    (reserved collateral) lower it. The shard's funds add them back at cost, so quoting on a
-    $60-funded shard does not flap the balance gate; a real transfer out still does."""
+    """Kalshi's ``balance`` is the cash not spent on positions; resting quotes do NOT lower it
+    (verified live 2026-09-30: $75.00 with $19.10 resting). The shard's funds add the positions
+    back at cost (so our own fills never flap the balance gate) but not the resting collateral,
+    which the balance already contains; a real transfer out or a loss still lowers them."""
     rest = FakeRest()
     rest.balances = {2: "20.0000"}
     rest.positions = {TK: "10.00"}
@@ -627,7 +628,7 @@ async def test_our_own_positions_and_quotes_never_make_a_funded_shard_look_empty
                                    exchange_index=2)  # 40 x 40c = $16, a market not in our universe
     v, _, _, _ = venue(rest)
     f = (await v.fetch_shard_funds())[2]
-    assert (f["available"], f["positions"], f["resting"]) == (20.0, 4.5, 38.5) and f["funds"] == pytest.approx(63.0)
+    assert (f["available"], f["positions"], f["resting"]) == (20.0, 4.5, 38.5) and f["funds"] == pytest.approx(24.5)
     assert v.cancel_shard("KXBTCD-OLD-T2", "o-2") == 2  # the resting rows' shards were learned on the way
 
 
