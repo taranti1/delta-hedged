@@ -473,7 +473,8 @@ def render(state: State, health: dict | None, met: dict[str, float], hb: dict | 
     tone = pt.green if frac < 0.5 else pt.amber if frac < 0.8 else pt.red
     L.append("")
     L.append(f" {pt.bold('TODAY')}  P&L {pt.bold(money(day))}  "
-             + pt.dim(f"(realized {money(real)}, open {money(mark)})"))
+             + pt.dim(f"(trade cash in YES terms {money(real)} + open positions at Kalshi prices {money(mark)}; "
+                      "nothing is final until settlement)"))
     L.append(f"        loss used {tone(bar(frac, 16))} {money(loss_used, plus=False)} of ${lim.daily_loss_halt:.0f} halt")
     funds = next((v for k, v in met.items() if k.startswith("dh_shard_funds_dollars")), None)
     need = met.get("dh_balance_required_dollars")
