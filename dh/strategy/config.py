@@ -208,6 +208,11 @@ class RiskCfg:
     stress_move_frac: float = 0.15  # +/- range of A for worst-case with linear hedge
     abnormal_move_sigma: float = 6.0
     abnormal_pause_s: float = 120.0  # 0 = kill switch off: the move is logged, nothing cancelled or paused
+    # neighbouring-strike rule (first live hour, 2026-09-30): no new order that opens or adds a
+    # YES position OPPOSITE in sign to one we hold on another 'greater' strike of the same
+    # settlement within this many $ (short 83,400 + long 83,500 = lose everything if the
+    # benchmark lands between them). Reducing a position is never blocked. 0 = off.
+    block_opposite_neighbor_usd: float = 0.0
     stale_ext_s: float = 2.0
     stale_brti_cancel_near_s: float = 3.0
     stale_brti_cancel_all_s: float = 10.0
@@ -276,6 +281,7 @@ class StrategyConfig:
 # while at the default, so the digest of every earlier config stays what its sessions logged
 _DIGEST_NEUTRAL_DEFAULTS: tuple[tuple[str, str, Any], ...] = (
     ("quoting", "max_market_disagreement_c", 0.0),
+    ("risk", "block_opposite_neighbor_usd", 0.0),
 )
 
 

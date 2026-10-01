@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from dh.backtest.kat import default_kat_config
 from dh.core.actions import CancelAll, Log, PlaceOrder
-from dh.core.events import FeedStatus, KalshiBookDelta, KalshiBookSnapshot, OrderAck
+from dh.core.events import FeedStatus, KalshiBookDelta, KalshiBookSnapshot, KalshiFill, OrderAck
 from dh.core.units import NS_PER_S
 from dh.strategy.config import RiskCfg, load_config
 from dh.strategy.risk import RiskEngine
@@ -94,3 +94,38 @@ def test_new_field_leaves_older_config_digests_unchanged():
     assert live.quoting.max_market_disagreement_c == 10.0 and live.quoting.min_tau_s == 150.0
     assert live.risk.max_event_worst_loss == 10.0 and live.risk.tail_budget == 10.0
     assert live.risk.abnormal_pause_s == 0.0 and live.digest() != load_config("config/m1_small.yaml").digest()
+
+
+# ---------------------------------------------------------------- neighbouring-strike rule
+def _neighbors(gap: float):
+    base = default_kat_config()
+    cfg = replace(base, risk=replace(base.risk, block_opposite_neighbor_usd=gap))
+    lo, hi, far = (spec(ticker=f"KXBTCD-TEST-T{k}", K=float(k)) for k in (84000, 84100, 84500))
+    d = Driver([lo, hi, far], cfg=cfg)
+    d.feed(FeedStatus(T0, 0, "kalshi.ws", "connected"))
+    for s in (lo, hi, far):
+        d.feed(KalshiBookSnapshot(T0, 0, s.ticker, 1, 1, ((4500, 10000),), ((4500, 10000),)))
+    d.inputs(T0)
+    # we are SHORT 5 YES on the 84,000 strike (a fill of an order this session does not know)
+    d.feed(KalshiFill(T0, 0, lo.ticker, "t-1", "oid-1", "", "ask", 5000, 500, False, 21875, -500, True))  # fee = the model's
+    return d, lo, hi, far
+
+
+def test_neighbor_rule_blocks_only_opposite_orders_on_close_strikes():
+    d, lo, hi, far = _neighbors(100.0)
+    assert d.mm._contracts(lo.ticker) == -5
+    assert d.mm._opposite_neighbor(hi, "bid") == lo.ticker  # long 84,100 vs short 84,000: blocked
+    assert d.mm._opposite_neighbor(hi, "ask") == ""  # same direction: allowed
+    assert d.mm._opposite_neighbor(far, "bid") == ""  # $500 away: allowed
+    assert d.mm._opposite_neighbor(lo, "bid") == ""  # reduces our own short: allowed
+
+
+def test_neighbor_rule_stops_bids_next_to_a_short_and_is_off_by_default():
+    d, lo, hi, _ = _neighbors(100.0)
+    acts = d.advance(T0 + 6 * NS_PER_S)
+    assert not [a for a in acts if isinstance(a, PlaceOrder) and a.ticker == hi.ticker and a.book_side == "bid"]
+    assert d.mm.stats.reasons.get("blocked:opposite_neighbor", 0) > 0
+    off, _, hi_off, _ = _neighbors(0.0)
+    acts = off.advance(T0 + 6 * NS_PER_S)
+    assert [a for a in acts if isinstance(a, PlaceOrder) and a.ticker == hi_off.ticker and a.book_side == "bid"]
+    assert off.mm.stats.reasons.get("blocked:opposite_neighbor", 0) == 0

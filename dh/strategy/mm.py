@@ -980,6 +980,26 @@ class MarketMaker:
                 props.append((d.place.score, s, side, d.place, f))
         return out, props
 
+    def _opposite_neighbor(self, s: MarketSpec, side: str) -> str:
+        """Ticker of a held position on a 'greater' strike of the same settlement within
+        risk.block_opposite_neighbor_usd whose YES sign is opposite to this order's
+        (bid = +), else ''. An order that reduces our own position here is never blocked."""
+        if s.strike_type != "greater" or s.floor_strike is None:
+            return ""
+        d = 1.0 if side == "bid" else -1.0
+        own = self._contracts(s.ticker)
+        if own * d < 0:
+            return ""  # reduces this market's position
+        gap = self.cfg.risk.block_opposite_neighbor_usd + 0.01
+        key = self._settlement_key(s)
+        for t2, s2 in self.specs.items():
+            if (t2 == s.ticker or t2 in self.settled or s2.strike_type != "greater" or s2.floor_strike is None
+                    or abs(s2.floor_strike - s.floor_strike) > gap or self._settlement_key(s2) != key):
+                continue
+            if self._contracts(t2) * d < 0:
+                return t2
+        return ""
+
     def _market_disagreement(self, ticker: str, F: float) -> tuple[float, float] | None:
         """(|F - mid| in cents, mid) against OTHERS' best YES bid / ask; None for a one-sided
         book. In live mode the book contains our joined orders: their qty is removed first."""
@@ -1089,6 +1109,8 @@ class MarketMaker:
             reason = ""
             if collateral + added_collateral > cfg.risk.risk_capital + 1e-9:
                 reason = "collateral"
+            elif cfg.risk.block_opposite_neighbor_usd > 0 and self._opposite_neighbor(s, side):
+                reason = "opposite_neighbor"
             elif not self.risk.loss_limits_ok(event_worst_loss=new_loss, total_worst_loss=new_total):
                 reason = "loss_limit"
             elif not self.risk.delta_ok(abs(base + c), abs(base)):
