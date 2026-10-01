@@ -520,6 +520,15 @@ async def test_upgrade_tier_skips_when_already_advanced(tmp_path: Path):
     assert h.rest.writes == [] and h.prompts == []
 
 
+async def test_upgrade_tier_sends_a_json_body(tmp_path: Path):
+    """Kalshi answers a body-less POST to the upgrade path with 400 invalid_content_type (live
+    2026-09-30): the request must carry a JSON body ({}), hence Content-Type: application/json."""
+    h = Harness(tmp_path, FakeRest(tier="basic"))
+    assert await h("upgrade-tier", "--to", "advanced", "--execute", answer="advanced") == 0
+    [(method, path, body)] = [(w[0], w[1], w[2]) for w in h.rest.writes]
+    assert (method, path, body) == ("POST", "/account/api_usage_level/upgrade", {})
+
+
 async def test_restricted_admin_key_is_refused(tmp_path: Path):
     rest = FakeRest(api_keys=[{"api_key_id": ADMIN_KEY, "name": "runner", "scopes": ["read", "write"], "subaccount": 1}])
     h = Harness(tmp_path, rest)
@@ -617,8 +626,8 @@ async def test_request_bodies_and_paths_match_openapi(tmp_path: Path, rsa_pem_te
         for method, path, body, params in h.rest.writes:
             op = SPEC["paths"][_template(path)][method.lower()]
             rb = op.get("requestBody")
-            if rb is None:
-                assert body is None, (method, path)
+            if rb is None:  # no fields; the upgrade still sends {} (Kalshi requires the JSON content type)
+                assert body is None or (path == "/account/api_usage_level/upgrade" and body == {}), (method, path)
             else:
                 _validate(rb["content"]["application/json"]["schema"], body, f"{method} {path}")
             assert params == []

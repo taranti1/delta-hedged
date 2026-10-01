@@ -164,7 +164,10 @@ ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # API paths relative to /trade-api/v2 (openapi 3.31.0 operationId)
 P_LIMITS = "/account/limits"  # GET GetAccountApiLimits
-P_UPGRADE = "/account/api_usage_level/upgrade"  # POST UpgradeAccountApiUsageLevel: no body, 201, 30 write tokens
+P_UPGRADE = "/account/api_usage_level/upgrade"  # POST UpgradeAccountApiUsageLevel: no fields, 201, 30 write tokens
+# Kalshi refuses a body-less POST here with HTTP 400 invalid_content_type (seen live 2026-09-30):
+# send an empty JSON object, which carries Content-Type: application/json
+UPGRADE_BODY: dict = {}
 P_BALANCE = "/portfolio/balance"  # GET GetBalance: no subaccount = primary, all shards
 P_SUBACCOUNTS = "/portfolio/subaccounts"  # POST CreateSubaccount {exchange_index}
 P_SUB_BALANCES = "/portfolio/subaccounts/balances"  # GET GetSubaccountBalances
@@ -1018,7 +1021,7 @@ async def cmd_upgrade_tier(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.out("Grants a permanent Advanced usage-level grant to the WHOLE account (System 2 shares it; budgets only go up:\n"
             "Basic read 200 / write 100 tokens/s -> Advanced 300 / 300). Kalshi's criterion: at least 1 of the\n"
             "account's last 100 Predictions orders was created via the API. Costs 30 write tokens.")
-    oc = await confirm_and_send(ctx, command="upgrade-tier", method="POST", path=P_UPGRADE, body=None,
+    oc = await confirm_and_send(ctx, command="upgrade-tier", method="POST", path=P_UPGRADE, body=UPGRADE_BODY,
                                 execute=args.execute, prompt="Type 'advanced' to send the upgrade request: ",
                                 matches=lambda s: s.strip() == "advanced")
     if oc.kind == "ok":
