@@ -569,6 +569,19 @@ Start command (watchdog running first, 5.2 step 2):
 caffeinate -i python scripts/run_live.py --config config/m1_live.yaml --live-config config/live.yaml \
     --mode live --i-understand-this-sends-real-orders --duration 3600
 ```
+**Watching it.** In a third terminal run `python scripts/live_view.py` (or `--paper` for the paper runner).
+
+It is a read-only pinned screen, modelled on System 2's watch view:
+- header with heartbeat, Kalshi, BRTI and clock status
+- today's P&L against the daily-loss halt
+- a red banner listing every block or halt in words
+- positions with mark and worst case
+- a 15-minute activity rollup
+- an event list of fills, settlements and blocks
+
+It alerts once per new problem with a macOS notification; add `--notify-fills` for fills. It
+never sends or cancels anything: stop trading in the runner's terminal.
+
 Check funds with `python -m dh.live.tools balance --config config/m1_live.yaml`. Without
 `--config`, the tool compares against m1.yaml's $60.
 
