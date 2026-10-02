@@ -525,7 +525,7 @@ five changes:
 | Setting | Value | Reason |
 |---|---|---|
 | `quoting.min_tau_s` | 150 | final window |
-| `quoting.max_market_disagreement_c` | 10 | no new order where \|F − Kalshi mid\| > 10¢ |
+| `quoting.max_market_disagreement_c` | 10 | no new order where \|F − Kalshi mid\| > 10¢; a resting order now on the wrong side of F is pulled |
 | `risk.abnormal_pause_s` | 0 | 6σ kill switch off; moves are logged only, and replays evaluate it |
 | `risk.max_event_worst_loss` | $10 | |
 | `risk.tail_budget` | $10 | |

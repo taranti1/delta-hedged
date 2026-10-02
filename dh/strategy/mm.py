@@ -921,6 +921,23 @@ class MarketMaker:
             return self._cancel_market(now, t, reason), props
         sched = self.fee_sched[t]
         pos = self._contracts(t)
+        disagree = self._market_disagreement(t, f.F) if q.max_market_disagreement_c > 0 else None
+        blocked_new = disagree is not None and disagree[0] > q.max_market_disagreement_c
+        if q.max_market_disagreement_c > 0 and blocked_new != self._disagree_on.get(t, False):
+            self._disagree_on[t] = blocked_new  # logged on each change only
+            out.append(Log("quote_gate", {"ticker": t, "gate": "market_disagreement", "on": blocked_new,
+                                          "F": round(f.F, 6), "mid": None if disagree is None else disagree[1],
+                                          "disagreement_c": None if disagree is None else round(disagree[0], 3),
+                                          "cap_c": q.max_market_disagreement_c}))
+        if blocked_new:
+            # no new order, and pull a resting one already on the wrong side of fair value: it is
+            # the quote that gets filled while the market disagrees (live 2026-10-02: a bid filled
+            # at -16.6c edge). Quotes still at a non-negative edge keep their queue place, since
+            # the gate flickers (82% of gate-ons cleared within 2 s that day).
+            for w in self.om.working(t):
+                edge = (f.F - w.px / PX_SCALE) if w.book_side == "bid" else (w.px / PX_SCALE - f.F)
+                if edge < 0:
+                    out += self._cancel(now, w, "market_disagreement")
         existing: dict[str, list[ExistingOrder]] = {"bid": [], "ask": []}
         for w in self.om.working(t):
             if w.cancel_requested or w.remaining_qty <= 0 or w.state.name not in ("RESTING", "PENDING_NEW"):
@@ -955,14 +972,6 @@ class MarketMaker:
             price_cap_px=q.price_cap_px, rounding_per_order=q.expected_rounding_per_order,
             order_fee=lambda px, size, side, tk=t: self._order_fee(tk, px, size, side),
         )
-        disagree = self._market_disagreement(t, f.F) if q.max_market_disagreement_c > 0 else None
-        blocked_new = disagree is not None and disagree[0] > q.max_market_disagreement_c
-        if q.max_market_disagreement_c > 0 and blocked_new != self._disagree_on.get(t, False):
-            self._disagree_on[t] = blocked_new  # logged on each change only
-            out.append(Log("quote_gate", {"ticker": t, "gate": "market_disagreement", "on": blocked_new,
-                                          "F": round(f.F, 6), "mid": None if disagree is None else disagree[1],
-                                          "disagreement_c": None if disagree is None else round(disagree[0], 3),
-                                          "cap_c": q.max_market_disagreement_c}))
         for side in ("bid", "ask"):
             d = decide_side(ctx, side, self.flow, self.adverse, q.v_min_dollars, q.kappa_replace_per_s,
                             replace_rel=q.replace_rel, min_age_ns=q.min_order_age_ms * NS_PER_MS)

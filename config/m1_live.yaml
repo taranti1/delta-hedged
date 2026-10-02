@@ -2,7 +2,7 @@
 # after 20.5 h of m1_small paper and the quick rule screen docs/research/RULE_SCREEN_2026_09_30.md).
 # m1_small plus, per the user:
 #   quoting.min_tau_s 150 (was 90)            final window: no near-strike (|z| < 2.5) quotes < 150 s
-#   quoting.max_market_disagreement_c 10      no new order where |F - Kalshi mid| > 10c
+#   quoting.max_market_disagreement_c 10      no new order where |F - Kalshi mid| > 10c; resting orders priced past F pulled
 #   risk.abnormal_pause_s 0 (was 120)         6-sigma kill switch off (logged only; replays evaluate it)
 #   risk.max_event_worst_loss 10 (was 5)      per hourly event
 #   risk.tail_budget 10 (was 5)
@@ -28,7 +28,7 @@ quoting:
   kappa_replace_per_s: 0.0002
   min_tau_s: 150.0          # final window (m1_small: 90)
   z_min_final: 2.5
-  max_market_disagreement_c: 10.0  # no new order where |F - Kalshi mid| > 10c (0 = off)
+  max_market_disagreement_c: 10.0  # no new order where |F - Kalshi mid| > 10c, and resting ones priced past F pulled (0 = off)
   max_tau_s: 3900.0
   price_floor_px: 300      # no quotes below 3c / above 97c YES until tail calibration is done
   price_cap_px: 9700

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from dh.backtest.kat import default_kat_config
-from dh.core.actions import CancelAll, Log, PlaceOrder
+from dh.core.actions import CancelAll, CancelOrder, Log, PlaceOrder
 from dh.core.events import FeedStatus, KalshiBookDelta, KalshiBookSnapshot, KalshiFill, OrderAck
 from dh.core.units import NS_PER_S
 from dh.strategy.config import RiskCfg, load_config
@@ -48,6 +48,28 @@ def test_market_far_from_fair_value_gets_no_new_orders():
     gates = [a.payload for a in acts if isinstance(a, Log) and a.kind == "quote_gate"]
     assert len(gates) == 1 and gates[0]["on"] is True and gates[0]["mid"] == 0.15  # logged once
     assert abs(gates[0]["disagreement_c"] - 100 * abs(d.mm.fvc[TICK].F - 0.15)) < 1e-2
+
+
+def test_gate_pulls_only_resting_quotes_on_the_wrong_side_of_fair_value():
+    # live 2026-10-02: BTC dropped, the market lagged, and our bid left resting while the gate was
+    # on was filled at -16.6c edge. The ask, still above fair value, keeps its queue place.
+    cfg = _cfg(10.0)
+    cfg = replace(cfg, risk=replace(cfg.risk, abnormal_pause_s=0.0))  # as m1_live: the jump does not pause
+    d = Driver([spec()], cfg=cfg)
+    _ready(d, bid=4500, no_bid=4500)  # others 45c / 55c, mid 0.50 ~ F: quoted both sides
+    ps = _places(d.advance(T0 + 6 * NS_PER_S))
+    bids = {p.client_order_id for p in ps if p.book_side == "bid"}
+    asks = {p.client_order_id for p in ps if p.book_side == "ask"}
+    assert bids and asks
+    for p in ps:
+        d.feed(OrderAck(d.now, 0, p.client_order_id, "X" + p.client_order_id, p.ticker, 0, p.qty, "create"))
+    d.S -= 100  # fair value falls below the bids; the market's mid stays at 0.50
+    acts = d.advance(d.now + 2 * NS_PER_S)
+    F = d.mm.fvc[TICK].F
+    assert 100 * (0.5 - F) > 10 and all(F < p.px / 10_000 for p in ps if p.client_order_id in bids)
+    gated = {a.client_order_id for a in acts if isinstance(a, CancelOrder) and a.reason == "market_disagreement"}
+    assert gated == bids  # the asks, still above F, are not pulled by the gate
+    assert not _places(acts)
 
 
 def test_cap_off_quotes_the_same_disagreeing_market():
