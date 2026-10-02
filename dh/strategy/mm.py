@@ -519,12 +519,14 @@ class MarketMaker:
                 if self.queue_shadow is not None:
                     self._shadow(lambda sh: sh.remove_order(oe.client_order_id))
             elif k == "cancel_ready":
+                # the order manager already holds this order PENDING_CANCEL (and re-armed its
+                # cancel timer on the ack): send the deferred cancel as is. request_cancel would
+                # refuse a PENDING_CANCEL order and drop it (live 2026-10-02: every such cancel
+                # went out only as a cancel_retry 10 s later)
                 w = self.om.order(oe.client_order_id)
                 if w is not None and w.order_id:
-                    a = CancelOrder(client_order_id=w.client_order_id, ticker=w.ticker, order_id=w.order_id,
-                                    reason="deferred")
-                    if self.om.request_cancel(a, oe.ts):
-                        out.append(a)
+                    out.append(CancelOrder(client_order_id=w.client_order_id, ticker=w.ticker, order_id=w.order_id,
+                                           reason="deferred"))
             elif k == "position_mismatch":  # confirmed snapshot mismatch (REST / forwarded WS)
                 for a in self.risk.on_reconciliation_mismatch(oe.ts, oe.detail or oe.ticker):
                     out += self._apply_risk_action(oe.ts, a)

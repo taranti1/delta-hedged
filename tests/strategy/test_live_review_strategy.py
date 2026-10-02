@@ -143,6 +143,28 @@ def test_cancel_without_answer_is_resent_until_it_resolves():
     assert not [a for a in acts if isinstance(a, CancelOrder) and a.reason == "cancel_retry"]
 
 
+def test_cancel_wanted_before_the_ack_is_sent_on_the_ack():
+    """A cancel requested before the create ack is deferred (no order_id yet); the ack must send
+    it at once. Live 2026-10-02: it was dropped and only went out as a cancel_retry 10 s later,
+    leaving the quote resting (one stale bid filled at -16.6c edge)."""
+    d = Driver([spec()])
+    _ready(d)
+    ps = _places(d.advance(T0 + 6 * NS_PER_S))  # not acked yet
+    assert ps
+    acts = d.feed(FeedStatus(d.now + 1, 0, "runner.lag", "stale"))  # pulls every quote
+    assert not [a for a in acts if isinstance(a, CancelOrder)]  # deferred: no order_id to cancel by
+    sent = {}
+    for p in ps:
+        for a in d.feed(OrderAck(d.now + 2, 0, p.client_order_id, "X" + p.client_order_id, p.ticker, 0, p.qty)):
+            if isinstance(a, CancelOrder):
+                sent[a.client_order_id] = (a.order_id, a.reason)
+    assert sent == {p.client_order_id: ("X" + p.client_order_id, "deferred") for p in ps}
+    for c, (oid, _) in sent.items():
+        d.feed(CancelAck(d.now + 3, 0, c, oid, TICK, 0))
+    acts = d.advance(d.now + 11 * NS_PER_S)
+    assert not [a for a in acts if isinstance(a, CancelOrder) and a.reason == "cancel_retry"]
+
+
 # ---------------------------------------------------------------------------------- m6
 def test_declared_missing_order_found_resting_is_pulled():
     d = Driver([spec()])
